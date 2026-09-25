@@ -773,6 +773,17 @@ static void raiseWindowForEntry(RingEntry *entry, uint64_t generation) {
     if (generation != atomic_load(&g_gestureGeneration)) return;
     if (!entry.application || entry.application.isTerminated) return;
 
+    // Chrome profiles are separate windows in one app. Activating Chrome keeps
+    // the last used profile in front unless that window is made index 1.
+    if (generation == atomic_load(&g_gestureGeneration) && entry.isTab &&
+        entry.chromeWindowID.length) {
+        BOOL switched = setChromeActiveTabWithIndex(entry.chromeWindowID, entry.chromeTabID,
+                                                    entry.tabIndex + 1);
+        if (switched) return;
+        NSLog(@"[Chrome tabs] could not activate window %@ tab %@ index %lu",
+              entry.chromeWindowID, entry.chromeTabID, (unsigned long)(entry.tabIndex + 1));
+    }
+
     AXUIElementRef bestWindow = NULL;
     if (entry.accessibilityWindowObject) {
         bestWindow = (AXUIElementRef)CFRetain((__bridge AXUIElementRef)entry.accessibilityWindowObject);
@@ -847,15 +858,6 @@ static void raiseWindowForEntry(RingEntry *entry, uint64_t generation) {
             AXUIElementRef cachedTab = (__bridge AXUIElementRef)entry.accessibilityTabObject;
             AXUIElementSetMessagingTimeout(cachedTab, 0.2f);
             AXUIElementPerformAction(cachedTab, kAXPressAction);
-        } else if (entry.chromeWindowID.length && (entry.chromeTabID.length || entry.isTab)) {
-            // Chrome window/tab ids are text. Compare them as text, then fall
-            // back to the 1-based tab index from the last AppleScript scan.
-            BOOL switched = setChromeActiveTabWithIndex(entry.chromeWindowID, entry.chromeTabID,
-                                                        entry.isTab ? (entry.tabIndex + 1) : 0);
-            if (!switched) {
-                NSLog(@"[Chrome tabs] could not activate window %@ tab %@ index %lu",
-                      entry.chromeWindowID, entry.chromeTabID, (unsigned long)(entry.tabIndex + 1));
-            }
         } else if (bestWindow && entry.tabTitle.length) {
             // If Apple Events are denied, AppleScript rows still fall back to an
             // exact AX title match in the mapped Chrome window.
@@ -1775,7 +1777,8 @@ static BOOL setChromeActiveTabWithIndex(NSString *windowID, NSString *tabID, NSU
     NSMutableString *source = [NSMutableString stringWithFormat:
         @"tell application \"Google Chrome\"\n"
          "try\n"
-         "set targetWindow to first window whose id is \"%@\"\n", windowID];
+         "set targetWindow to first window whose id is \"%@\"\n"
+         "set index of targetWindow to 1\n", windowID];
     if (haveTabID) {
         [source appendFormat:
          @"repeat with tabIndex from 1 to count of tabs of targetWindow\n"
@@ -1794,7 +1797,8 @@ static BOOL setChromeActiveTabWithIndex(NSString *windowID, NSString *tabID, NSU
           "end if\n", @(tabIndex1Based), @(tabIndex1Based)];
     }
     [source appendString:
-         @"end try\n"
+         @"return true\n"
+          "end try\n"
           "end tell\n"
           "return false"];
     return runChromeSwitchScript(source);
