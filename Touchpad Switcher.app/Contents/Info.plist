@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>touchpad_ring_test</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.milev.touchpad-switcher</string>
+	<key>CFBundleName</key>
+	<string>Touchpad Switcher</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Touchpad Switcher uses Automation to switch to the Chrome tab you select.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Touchpad Switcher captures app window thumbnails for switcher previews.</string>
+</dict>
+</plist>

@@ -1,0 +1,10 @@
+{
+  "zones": {
+    "left": "Finder",
+    "middle": "Terminal",
+    "right": "Google Chrome"
+  },
+  "top_zone_threshold": 0.90,
+  "cooldown_seconds": 0.0,
+  "debug": false
+}
