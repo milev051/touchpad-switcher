@@ -507,6 +507,7 @@ static _Atomic(bool) g_isScanning = false;
 static _Atomic(bool) g_chromePrefetchActive = false;
 static _Atomic(int) g_activeTouchCount = 0;
 static NSTimeInterval g_chromePrefetchRetryAfter = 0;
+static NSTimeInterval g_chromePrefetchHoldUntil = 0;
 static os_unfair_lock g_selectionLock = OS_UNFAIR_LOCK_INIT;
 static NSInteger g_pendingSelection = -1;
 static uint64_t g_pendingSelectionGeneration = 0;
@@ -812,6 +813,7 @@ static void showRing(uint64_t generation) {
 
 static AXUIElementRef findTabButton(AXUIElementRef parent, NSString *title, int depth);
 static BOOL setChromeActiveTab(NSString *windowID, NSString *tabID);
+static BOOL setChromeActiveTabWithIndex(NSString *windowID, NSString *tabID, NSUInteger tabIndex1Based);
 
 static void raiseWindowForEntry(RingEntry *entry, uint64_t generation) {
     if (generation != atomic_load(&g_gestureGeneration)) return;
@@ -891,10 +893,15 @@ static void raiseWindowForEntry(RingEntry *entry, uint64_t generation) {
             AXUIElementRef cachedTab = (__bridge AXUIElementRef)entry.accessibilityTabObject;
             AXUIElementSetMessagingTimeout(cachedTab, 0.2f);
             AXUIElementPerformAction(cachedTab, kAXPressAction);
-        } else if (entry.chromeWindowID.length && entry.chromeTabID.length) {
-            // Stable Chrome IDs survive window reordering and tab insertion.
-            // A closed tab must not fall through to a title match on another tab.
-            setChromeActiveTab(entry.chromeWindowID, entry.chromeTabID);
+        } else if (entry.chromeWindowID.length && (entry.chromeTabID.length || entry.isTab)) {
+            // Chrome window/tab ids are text. Compare them as text, then fall
+            // back to the 1-based tab index from the last AppleScript scan.
+            BOOL switched = setChromeActiveTabWithIndex(entry.chromeWindowID, entry.chromeTabID,
+                                                        entry.isTab ? (entry.tabIndex + 1) : 0);
+            if (!switched) {
+                NSLog(@"[Chrome tabs] could not activate window %@ tab %@ index %lu",
+                      entry.chromeWindowID, entry.chromeTabID, (unsigned long)(entry.tabIndex + 1));
+            }
         } else if (bestWindow && entry.tabTitle.length) {
             // If Apple Events are denied, AppleScript rows still fall back to an
             // exact AX title match in the mapped Chrome window.
@@ -941,8 +948,24 @@ static void scheduleSelectionUpdate(uint64_t generation, NSInteger selection) {
 
 static void finishGesture(uint64_t generation, NSInteger selection);
 
+static void holdChromePrefetch(NSTimeInterval seconds) {
+    @synchronized ([NSMutableDictionary class]) {
+        NSTimeInterval until = NSProcessInfo.processInfo.systemUptime + seconds;
+        if (until > g_chromePrefetchHoldUntil) g_chromePrefetchHoldUntil = until;
+    }
+}
+
+static BOOL chromePrefetchIsHeld(void) {
+    @synchronized ([NSMutableDictionary class]) {
+        return NSProcessInfo.processInfo.systemUptime < g_chromePrefetchHoldUntil;
+    }
+}
+
 static void finishGesture(uint64_t generation, NSInteger selection) {
     if (generation != atomic_load(&g_gestureGeneration)) return;
+    // Block background Chrome tab cycling before the overlay goes away.
+    // Prefetch that started on an inactive tab must not undo the user's pick.
+    holdChromePrefetch(2.5);
 
     // Main-queue work can arrive out of order around a short touch sequence.
     // Present this generation synchronously before any finish can hide it.
@@ -1676,28 +1699,57 @@ static BOOL ensureChromeAutomation(BOOL askUser) {
     return NO;
 }
 
-static BOOL setChromeActiveTab(NSString *windowID, NSString *tabID) {
-    if (!validChromeID(windowID) || !validChromeID(tabID)) return NO;
-    NSString *source = [NSString stringWithFormat:
-        @"tell application \"Google Chrome\"\n"
-         "try\n"
-         "set targetWindow to first window whose id is %@\n"
-         "repeat with tabIndex from 1 to count of tabs of targetWindow\n"
-         "if (id of tab tabIndex of targetWindow) is %@ then\n"
-         "set active tab index of targetWindow to tabIndex\n"
-         "return true\n"
-         "end if\n"
-         "end repeat\n"
-         "end try\n"
-         "end tell\n"
-         "return false", windowID, tabID];
+static BOOL runChromeSwitchScript(NSString *source) {
     NSAppleScript *script = [[NSAppleScript alloc] initWithSource:source];
     NSDictionary *error = nil;
     NSAppleEventDescriptor *result = nil;
     @synchronized ([NSAppleScript class]) {
         result = [script executeAndReturnError:&error];
     }
-    return result != nil && error == nil && result.booleanValue;
+    if (error) {
+        NSLog(@"[Chrome tabs] switch script failed: %@", error[NSAppleScriptErrorMessage] ?: error);
+        return NO;
+    }
+    return result.booleanValue || [result.stringValue isEqualToString:@"true"];
+}
+
+static BOOL setChromeActiveTabWithIndex(NSString *windowID, NSString *tabID, NSUInteger tabIndex1Based) {
+    if (!validChromeID(windowID)) return NO;
+    BOOL haveTabID = validChromeID(tabID);
+    if (!haveTabID && tabIndex1Based == 0) return NO;
+    // Chrome exposes window and tab ids as text, not integers. Comparing a
+    // text id with an unquoted number never matches, so the previously
+    // selected tab (often YouTube) stayed in front for every card.
+    NSMutableString *source = [NSMutableString stringWithFormat:
+        @"tell application \"Google Chrome\"\n"
+         "try\n"
+         "set targetWindow to first window whose id is \"%@\"\n", windowID];
+    if (haveTabID) {
+        [source appendFormat:
+         @"repeat with tabIndex from 1 to count of tabs of targetWindow\n"
+          "if (id of tab tabIndex of targetWindow) as text is \"%@\" then\n"
+          "set active tab index of targetWindow to tabIndex\n"
+          "return true\n"
+          "end if\n"
+          "end repeat\n", tabID];
+    }
+    if (tabIndex1Based > 0) {
+        [source appendFormat:
+         @"set tabCount to count of tabs of targetWindow\n"
+          "if %@ <= tabCount then\n"
+          "set active tab index of targetWindow to %@\n"
+          "return true\n"
+          "end if\n", @(tabIndex1Based), @(tabIndex1Based)];
+    }
+    [source appendString:
+         @"end try\n"
+          "end tell\n"
+          "return false"];
+    return runChromeSwitchScript(source);
+}
+
+static BOOL setChromeActiveTab(NSString *windowID, NSString *tabID) {
+    return setChromeActiveTabWithIndex(windowID, tabID, 0);
 }
 
 static NSArray<RingEntry *> *collectOpenWindows(void) {
@@ -2110,7 +2162,7 @@ static NSString *chromeActiveTabID(NSString *windowID) {
     if (!validChromeID(windowID)) return nil;
     NSString *source = [NSString stringWithFormat:
         @"tell application \"Google Chrome\"\n"
-         "set targetWindow to first window whose id is %@\n"
+         "set targetWindow to first window whose id is \"%@\"\n"
          "return (id of active tab of targetWindow) as text\n"
          "end tell", windowID];
     NSAppleScript *script = [[NSAppleScript alloc] initWithSource:source];
@@ -2191,7 +2243,8 @@ static void scheduleChromeTabArtwork(NSArray<RingEntry *> *entries) {
 
 static void scheduleChromeBackgroundPrefetch(NSArray<RingEntry *> *entries) {
     if (atomic_load(&g_gestureActive) || atomic_load(&g_activeTouchCount) != 0 ||
-        atomic_load(&g_chromePrefetchActive) || !CGPreflightScreenCaptureAccess()) return;
+        atomic_load(&g_chromePrefetchActive) || chromePrefetchIsHeld() ||
+        !CGPreflightScreenCaptureAccess()) return;
 
     RingEntry *target = nil;
     @synchronized ([NSMutableDictionary class]) {
@@ -2238,7 +2291,7 @@ static void scheduleChromeBackgroundPrefetch(NSArray<RingEntry *> *entries) {
                 BOOL switched = NO;
                 @synchronized ([NSAppleScript class]) {
                     if (!chrome.isActive && !atomic_load(&g_gestureActive) &&
-                        atomic_load(&g_activeTouchCount) == 0) {
+                        atomic_load(&g_activeTouchCount) == 0 && !chromePrefetchIsHeld()) {
                         originalTabID = chromeActiveTabID(windowID);
                         if (originalTabID.length && ![originalTabID isEqualToString:tabID]) {
                             switched = setChromeActiveTab(windowID, tabID);
@@ -2247,6 +2300,7 @@ static void scheduleChromeBackgroundPrefetch(NSArray<RingEntry *> *entries) {
                                     usleep(250000); // Let Chrome render the newly selected tab.
                                     if (!chrome.isActive && !atomic_load(&g_gestureActive) &&
                                         atomic_load(&g_activeTouchCount) == 0 &&
+                                        !chromePrefetchIsHeld() &&
                                         [chromeActiveTabID(windowID) isEqualToString:tabID]) {
                                         CGImageRef image = captureWindowImage(windowToCapture);
                                         if (image) {
@@ -2258,9 +2312,11 @@ static void scheduleChromeBackgroundPrefetch(NSArray<RingEntry *> *entries) {
                                     }
                                 }
                             } @finally {
-                                // Preserve a user-initiated change if another tab became
-                                // active while the asynchronous capture was running.
-                                if ([chromeActiveTabID(windowID) isEqualToString:tabID]) {
+                                // Never restore if the user picked a tab while this
+                                // capture was in flight. That restore was sending
+                                // every card back to the previously active tab.
+                                if (!chromePrefetchIsHeld() &&
+                                    [chromeActiveTabID(windowID) isEqualToString:tabID]) {
                                     if (!setChromeActiveTab(windowID, originalTabID)) {
                                         NSLog(@"[Chrome thumbnails] Could not restore tab in window %@", windowID);
                                     }
