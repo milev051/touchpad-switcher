@@ -3,7 +3,7 @@
 
 CC = clang
 CFLAGS = -fobjc-arc -O2
-FRAMEWORKS = -framework Cocoa -framework ApplicationServices -framework ScreenCaptureKit -framework QuartzCore -F/System/Library/PrivateFrameworks -framework MultitouchSupport
+FRAMEWORKS = -framework Cocoa -framework ApplicationServices -framework ScreenCaptureKit -framework QuartzCore -framework ImageIO -framework UniformTypeIdentifiers -F/System/Library/PrivateFrameworks -framework MultitouchSupport
 TARGET = touchpad_switcher
 SRC = touchpad_switcher.m
 RING_APP = Touchpad Switcher.app

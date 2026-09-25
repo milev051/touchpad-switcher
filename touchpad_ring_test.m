@@ -4,7 +4,9 @@
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <CoreFoundation/CoreFoundation.h>
+#import <ImageIO/ImageIO.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <math.h>
 #include <float.h>
 #include <os/lock.h>
@@ -72,6 +74,7 @@ extern void MTUnregisterContactFrameCallback(MTDeviceRef, MTContactCallbackFunct
 @property(nonatomic, copy) NSString *chromeWindowID;
 @property(nonatomic, copy) NSString *chromeTabID;
 @property(nonatomic, strong) NSImage *icon;
+@property(nonatomic, strong) NSData *thumbnailData;
 @property(nonatomic, strong) NSImage *thumbnail;
 @property(nonatomic, strong) id accessibilityWindowObject;
 @property(nonatomic, strong) id accessibilityTabObject;
@@ -86,6 +89,9 @@ static NSString *chromeHostFromEntry(RingEntry *entry);
 static NSString *youtubeVideoIDFromURL(NSString *urlString);
 static NSString *cardLabelText(RingEntry *entry);
 static void drawCardLabel(NSString *text, NSRect cardRect, BOOL truncateMiddle);
+static NSImage *resolvedThumbnail(RingEntry *entry);
+static void applyThumbnailDataToEntry(RingEntry *entry, NSData *data);
+static void releaseDecodedThumbnails(void);
 static NSString *tabThumbnailKey(RingEntry *entry);
 static BOOL ensureChromeAutomation(BOOL askUser);
 static void schedulePendingThumbnailCapture(NSArray<RingEntry *> *entries);
@@ -238,7 +244,8 @@ static CGFloat visualItemAngle(NSInteger i, NSUInteger count) {
                                          center.y + sin(rawAngle) * radiusY);
         BOOL selected = ((NSInteger)i == self.selectedIndex);
         RingEntry *entry = self.entries[i];
-        if (entry.thumbnail) {
+        NSImage *thumbnail = resolvedThumbnail(entry);
+        if (thumbnail) {
             CGFloat itemPreviewWidth = previewWidth;
             CGFloat previewHeight = itemPreviewWidth * 0.60;
             CGFloat previewY = itemCenter.y - previewHeight / 2;
@@ -262,10 +269,10 @@ static CGFloat visualItemAngle(NSInteger i, NSUInteger count) {
             [NSGraphicsContext saveGraphicsState];
             NSBezierPath *clipPath = [NSBezierPath bezierPathWithRoundedRect:previewRect xRadius:8.0 yRadius:8.0];
             [clipPath addClip];
-            [entry.thumbnail drawInRect:previewRect
-                               fromRect:NSZeroRect
-                              operation:NSCompositingOperationSourceOver
-                               fraction:1.0];
+            [thumbnail drawInRect:previewRect
+                         fromRect:NSZeroRect
+                        operation:NSCompositingOperationSourceOver
+                         fraction:1.0];
             [NSGraphicsContext restoreGraphicsState];
 
             BOOL isFinderEntry = [entry.application.bundleIdentifier isEqualToString:@"com.apple.finder"];
@@ -422,8 +429,8 @@ static CGPoint g_cursorAtGestureStart = {0, 0};
 static CFMachPortRef g_scrollEventTap = NULL;
 static dispatch_semaphore_t g_scrollTapReady;
 static _Atomic(bool) g_scrollTapActive = false;
-static NSMutableDictionary<NSNumber *, NSImage *> *g_thumbnailCache;
-static NSMutableDictionary<NSString *, NSImage *> *g_tabThumbnailCache;
+static NSMutableDictionary<NSNumber *, NSData *> *g_thumbnailCache;
+static NSMutableDictionary<NSString *, NSData *> *g_tabThumbnailCache;
 static NSMutableDictionary<NSNumber *, NSNumber *> *g_windowLastSeen;
 static NSMutableDictionary<NSString *, NSNumber *> *g_tabLastSeen;
 static NSMutableDictionary<NSNumber *, NSNumber *> *g_windowPIDMap;
@@ -435,8 +442,8 @@ static NSMutableDictionary<NSNumber *, NSString *> *g_chromeCaptureTabKeys;
 static NSMutableSet<NSNumber *> *g_thumbnailRequests;
 static NSMutableSet<NSString *> *g_tabThumbnailRequests;
 static NSMutableDictionary<NSString *, NSNumber *> *g_tabLastCaptured;
-static NSMutableDictionary<NSString *, NSImage *> *g_tabArtworkCache;
-static NSMutableDictionary<NSString *, NSImage *> *g_urlArtworkCache;
+static NSMutableDictionary<NSString *, NSData *> *g_tabArtworkCache;
+static NSMutableDictionary<NSString *, NSData *> *g_urlArtworkCache;
 static NSMutableDictionary<NSString *, NSString *> *g_tabCachedURL;
 static NSMutableDictionary<NSNumber *, NSString *> *g_chromeCaptureURLs;
 static NSMutableSet<NSString *> *g_tabArtworkRequests;
@@ -740,6 +747,7 @@ static void showRing(uint64_t generation) {
     g_ringView.selectedIndex = -1;
     g_ringView.anchorPoint = anchor;
     g_ringView.ringRadius = fittedRadius;
+    for (RingEntry *entry in g_windowEntries) (void)resolvedThumbnail(entry);
     [g_ringView setNeedsDisplay:YES];
     // Avoid forcing a synchronous draw before the panel is ordered onscreen.
     [g_panel setFrame:screen.frame display:NO];
@@ -930,6 +938,7 @@ static void finishGesture(uint64_t generation, NSInteger selection) {
     atomic_store(&g_gestureEnding, false);
     if (g_panel) [g_panel orderOut:nil];
     atomic_store(&g_ringOverlayVisible, false);
+    releaseDecodedThumbnails();
     if (selection < 0 || selection >= (NSInteger)g_windowEntries.count) {
         return;
     }
@@ -1331,15 +1340,16 @@ static void syncChromeTabMediaWithCurrentURL(RingEntry *entry) {
         [g_tabLastCaptured removeObjectForKey:tabKey];
         [g_tabArtworkRequests removeObject:tabKey];
         if (entry.windowID != kCGNullWindowID) g_chromeWindowLastCapture[@(entry.windowID)] = @0;
+        entry.thumbnailData = nil;
         entry.thumbnail = nil;
     }
     g_tabCachedURL[tabKey] = url ?: @"";
-    if (!entry.thumbnail) {
+    if (!entry.thumbnailData) {
         NSString *artKey = chromeArtworkCacheKey(entry.tabURL);
-        NSImage *shared = (artKey.length && g_urlArtworkCache) ? g_urlArtworkCache[artKey] : nil;
+        NSData *shared = (artKey.length && g_urlArtworkCache) ? g_urlArtworkCache[artKey] : nil;
         if (shared) {
             g_tabArtworkCache[tabKey] = shared;
-            entry.thumbnail = shared;
+            applyThumbnailDataToEntry(entry, shared);
         }
     }
 }
@@ -1367,17 +1377,17 @@ static void populateThumbnailsFromCache(NSArray<RingEntry *> *entries) {
                 // real capture and fall back to a site preview for the new URL.
                 syncChromeTabMediaWithCurrentURL(entry);
                 NSString *tabKey = tabThumbnailKey(entry);
-                if (!entry.thumbnail) {
-                    entry.thumbnail = g_tabThumbnailCache[tabKey] ?: g_tabArtworkCache[tabKey];
+                if (!entry.thumbnailData) {
+                    applyThumbnailDataToEntry(entry, g_tabThumbnailCache[tabKey] ?: g_tabArtworkCache[tabKey]);
                 }
-            } else if (!entry.thumbnail) {
+            } else if (!entry.thumbnailData) {
                 NSString *tabKey = tabThumbnailKey(entry);
                 if (g_tabThumbnailCache && g_tabThumbnailCache[tabKey]) {
-                    entry.thumbnail = g_tabThumbnailCache[tabKey];
+                    applyThumbnailDataToEntry(entry, g_tabThumbnailCache[tabKey]);
                 }
             }
-        } else if (!entry.thumbnail && entry.windowID != kCGNullWindowID && g_thumbnailCache) {
-            entry.thumbnail = g_thumbnailCache[@(entry.windowID)];
+        } else if (!entry.thumbnailData && entry.windowID != kCGNullWindowID && g_thumbnailCache) {
+            applyThumbnailDataToEntry(entry, g_thumbnailCache[@(entry.windowID)]);
         }
     }
     }
@@ -2093,6 +2103,7 @@ static NSArray<RingEntry *> *collectOpenWindows(void) {
         RingEntry *discarded = preferCandidate ? existing : candidate;
         if (!winner.accessibilityWindowObject) winner.accessibilityWindowObject = discarded.accessibilityWindowObject;
         if (!winner.accessibilityTabObject) winner.accessibilityTabObject = discarded.accessibilityTabObject;
+        if (!winner.thumbnailData) winner.thumbnailData = discarded.thumbnailData;
         if (!winner.thumbnail) winner.thumbnail = discarded.thumbnail;
         if (!winner.folderPath.length) winner.folderPath = discarded.folderPath;
         if (!winner.windowTitle.length) winner.windowTitle = discarded.windowTitle;
@@ -2175,11 +2186,65 @@ static void recordThumbnailCaptureSuccess(NSNumber *windowKey) {
     }
 }
 
+static const size_t kThumbnailPixelWidth = 640;
+static const size_t kThumbnailPixelHeight = 384;
+
+static NSData *encodedThumbnailFromCGImage(CGImageRef image) {
+    if (!image) return nil;
+    NSMutableData *data = [NSMutableData data];
+    CFStringRef type = (__bridge CFStringRef)UTTypeWebP.identifier;
+    CGImageDestinationRef dest = CGImageDestinationCreateWithData((__bridge CFMutableDataRef)data, type, 1, NULL);
+    if (!dest) {
+        data = [NSMutableData data];
+        dest = CGImageDestinationCreateWithData((__bridge CFMutableDataRef)data,
+                                               (__bridge CFStringRef)@"public.jpeg", 1, NULL);
+    }
+    if (!dest) return nil;
+    NSDictionary *props = @{
+        (id)kCGImageDestinationLossyCompressionQuality: @0.72
+    };
+    CGImageDestinationAddImage(dest, image, (__bridge CFDictionaryRef)props);
+    BOOL ok = CGImageDestinationFinalize(dest);
+    CFRelease(dest);
+    return (ok && data.length > 64) ? data : nil;
+}
+
+static NSImage *thumbnailImageFromData(NSData *data) {
+    if (!data.length) return nil;
+    NSImage *image = [[NSImage alloc] initWithData:data];
+    if (!image || image.size.width < 8) return nil;
+    image.cacheMode = NSImageCacheNever;
+    return image;
+}
+
+static NSImage *resolvedThumbnail(RingEntry *entry) {
+    if (entry.thumbnail) return entry.thumbnail;
+    if (!entry.thumbnailData.length) return nil;
+    entry.thumbnail = thumbnailImageFromData(entry.thumbnailData);
+    return entry.thumbnail;
+}
+
+static void applyThumbnailDataToEntry(RingEntry *entry, NSData *data) {
+    if (!entry) return;
+    entry.thumbnailData = data;
+    if (data.length && atomic_load(&g_ringOverlayVisible)) {
+        entry.thumbnail = thumbnailImageFromData(data);
+    } else {
+        entry.thumbnail = nil;
+    }
+}
+
+static void releaseDecodedThumbnails(void) {
+    for (RingEntry *entry in g_windowEntries) {
+        entry.thumbnail = nil;
+    }
+}
+
 static CGImageRef captureWindowImage(SCWindow *window) {
     SCContentFilter *filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:window];
     SCStreamConfiguration *configuration = [SCStreamConfiguration new];
-    configuration.width = 800;
-    configuration.height = 480;
+    configuration.width = kThumbnailPixelWidth;
+    configuration.height = kThumbnailPixelHeight;
     configuration.showsCursor = NO;
     configuration.ignoreShadowsSingleWindow = YES;
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
@@ -2243,10 +2308,10 @@ static void scheduleChromeTabArtwork(NSArray<RingEntry *> *entries) {
         NSString *artKey = chromeArtworkCacheKey(entry.tabURL);
         NSString *requestURL = normalizedTabURL(entry.tabURL);
         @synchronized ([NSMutableDictionary class]) {
-            NSImage *shared = (artKey.length && g_urlArtworkCache) ? g_urlArtworkCache[artKey] : nil;
+            NSData *shared = (artKey.length && g_urlArtworkCache) ? g_urlArtworkCache[artKey] : nil;
             if (shared && !g_tabArtworkCache[tabKey] && !g_tabThumbnailCache[tabKey]) {
                 g_tabArtworkCache[tabKey] = shared;
-                entry.thumbnail = shared;
+                applyThumbnailDataToEntry(entry, shared);
             }
             if (g_tabThumbnailCache[tabKey] || g_tabArtworkCache[tabKey] ||
                 [g_tabArtworkRequests containsObject:tabKey]) continue;
@@ -2261,19 +2326,20 @@ static void scheduleChromeTabArtwork(NSArray<RingEntry *> *entries) {
             NSURLSessionDataTask *task =
                 [[NSURLSession sharedSession] dataTaskWithRequest:request
                                                 completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-                NSImage *image = nil;
+                NSData *stored = nil;
                 NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]]
                     ? (NSHTTPURLResponse *)response : nil;
                 if (!error && data.length && http.statusCode == 200) {
-                    image = [[NSImage alloc] initWithData:data];
+                    NSImage *probe = [[NSImage alloc] initWithData:data];
+                    if (probe && probe.size.width >= 16) stored = data;
                 }
                 dispatch_async(dispatch_get_main_queue(), ^{
                     @synchronized ([NSMutableDictionary class]) {
                         [g_tabArtworkRequests removeObject:requestKey];
-                        if (image && image.size.width >= 16) {
+                        if (stored.length) {
                             if (requestArtKey.length) {
                                 if (!g_urlArtworkCache) g_urlArtworkCache = [NSMutableDictionary dictionary];
-                                g_urlArtworkCache[requestArtKey] = image;
+                                g_urlArtworkCache[requestArtKey] = stored;
                             }
                             BOOL urlStillMatches = NO;
                             for (RingEntry *current in g_windowEntries) {
@@ -2281,8 +2347,8 @@ static void scheduleChromeTabArtwork(NSArray<RingEntry *> *entries) {
                                 if (![normalizedTabURL(current.tabURL) isEqualToString:requestURL]) continue;
                                 urlStillMatches = YES;
                                 if (!g_tabThumbnailCache[requestKey]) {
-                                    g_tabArtworkCache[requestKey] = image;
-                                    current.thumbnail = image;
+                                    g_tabArtworkCache[requestKey] = stored;
+                                    applyThumbnailDataToEntry(current, stored);
                                 }
                             }
                             if (urlStillMatches && g_ringView) {
@@ -2344,7 +2410,7 @@ static void scheduleChromeBackgroundPrefetch(NSArray<RingEntry *> *entries) {
         SCWindow *windowToCapture = shareableWindow;
         dispatch_async(g_chromePrefetchQueue, ^{
             @autoreleasepool {
-                NSImage *thumbnail = nil;
+                NSData *thumbnailData = nil;
                 NSString *originalTabID = nil;
                 BOOL switched = NO;
                 @synchronized ([NSAppleScript class]) {
@@ -2363,7 +2429,7 @@ static void scheduleChromeBackgroundPrefetch(NSArray<RingEntry *> *entries) {
                                         CGImageRef image = captureWindowImage(windowToCapture);
                                         if (image) {
                                             if ([chromeActiveTabID(windowID) isEqualToString:tabID]) {
-                                                thumbnail = [[NSImage alloc] initWithCGImage:image size:NSZeroSize];
+                                                thumbnailData = encodedThumbnailFromCGImage(image);
                                             }
                                             CGImageRelease(image);
                                         }
@@ -2383,15 +2449,15 @@ static void scheduleChromeBackgroundPrefetch(NSArray<RingEntry *> *entries) {
                         }
                     }
                 }
-                if (thumbnail) {
+                if (thumbnailData) {
                     dispatch_async(dispatch_get_main_queue(), ^{
                         BOOL didCache = NO;
                         @synchronized ([NSMutableDictionary class]) {
                             for (RingEntry *entry in g_windowEntries) {
                                 if ([tabThumbnailKey(entry) isEqualToString:tabKey]) {
-                                    g_tabThumbnailCache[tabKey] = thumbnail;
+                                    g_tabThumbnailCache[tabKey] = thumbnailData;
                                     g_tabLastCaptured[tabKey] = @(NSProcessInfo.processInfo.systemUptime);
-                                    entry.thumbnail = thumbnail;
+                                    applyThumbnailDataToEntry(entry, thumbnailData);
                                     didCache = YES;
                                 }
                             }
@@ -2456,10 +2522,11 @@ static void captureTabThumbnails(NSArray<SCWindow *> *shareableWindows, NSArray<
                 continue;
             }
 
-            NSMutableDictionary<NSString *, NSImage *> *capturedThumbnails = [NSMutableDictionary dictionary];
+            NSMutableDictionary<NSString *, NSData *> *capturedThumbnails = [NSMutableDictionary dictionary];
             CGImageRef capturedImage = captureWindowImage(shareableWindow);
             if (capturedImage) {
-                capturedThumbnails[tabThumbnailKey(selectedEntry)] = [[NSImage alloc] initWithCGImage:capturedImage size:NSZeroSize];
+                NSData *encoded = encodedThumbnailFromCGImage(capturedImage);
+                if (encoded) capturedThumbnails[tabThumbnailKey(selectedEntry)] = encoded;
                 CGImageRelease(capturedImage);
             }
 
@@ -2468,13 +2535,13 @@ static void captureTabThumbnails(NSArray<SCWindow *> *shareableWindows, NSArray<
                 if (capturedThumbnails.count) {
                     recordThumbnailCaptureSuccess(windowID);
                     for (NSString *key in capturedThumbnails) {
-                        NSImage *thumbnail = capturedThumbnails[key];
+                        NSData *thumbnail = capturedThumbnails[key];
                         g_tabThumbnailCache[key] = thumbnail;
                         if (!g_tabLastCaptured) g_tabLastCaptured = [NSMutableDictionary dictionary];
                         g_tabLastCaptured[key] = @(NSProcessInfo.processInfo.systemUptime);
                         for (RingEntry *current in g_windowEntries) {
                             if (current.isTab && [tabThumbnailKey(current) isEqualToString:key]) {
-                                current.thumbnail = thumbnail;
+                                applyThumbnailDataToEntry(current, thumbnail);
                             }
                         }
                     }
@@ -2495,8 +2562,8 @@ static void captureTabThumbnails(NSArray<SCWindow *> *shareableWindows, NSArray<
 }
 
 static void capturePendingThumbnails(NSArray<RingEntry *> *entries,
-                                    NSDictionary<NSNumber *, NSImage *> *thumbnailSnapshot,
-                                    NSDictionary<NSString *, NSImage *> *tabThumbnailSnapshot,
+                                    NSDictionary<NSNumber *, NSData *> *thumbnailSnapshot,
+                                    NSDictionary<NSString *, NSData *> *tabThumbnailSnapshot,
                                     NSDictionary<NSString *, NSNumber *> *tabLastCapturedSnapshot,
                                     NSTimeInterval retryAfter) {
     if (atomic_load(&g_gestureActive)) return;
@@ -2522,7 +2589,7 @@ static void capturePendingThumbnails(NSArray<RingEntry *> *entries,
                 NSString *tabKey = tabThumbnailKey(entry);
                 NSTimeInterval lastAttempt = g_chromeWindowLastCapture[key].doubleValue;
                 NSTimeInterval lastCaptured = tabLastCapturedSnapshot[tabKey].doubleValue;
-                BOOL captureDue = !tabThumbnailSnapshot[tabKey] || (now - lastCaptured >= 2.0);
+                BOOL captureDue = !tabThumbnailSnapshot[tabKey] || (now - lastCaptured >= 8.0);
                 if (entry.windowID != kCGNullWindowID && captureDue &&
                     now - lastAttempt >= 0.5 &&
                     !thumbnailCaptureIsCoolingDown(key) &&
@@ -2625,8 +2692,8 @@ static void capturePendingThumbnails(NSArray<RingEntry *> *entries,
             if (![wantedIDs containsObject:windowKey]) continue;
             [foundIDs addObject:windowKey];
             SCStreamConfiguration *configuration = [SCStreamConfiguration new];
-            configuration.width = 800;
-            configuration.height = 480;
+            configuration.width = kThumbnailPixelWidth;
+            configuration.height = kThumbnailPixelHeight;
             configuration.showsCursor = NO;
             configuration.ignoreShadowsSingleWindow = YES;
             [SCScreenshotManager captureImageWithFilter:[[SCContentFilter alloc] initWithDesktopIndependentWindow:window]
@@ -2643,7 +2710,18 @@ static void capturePendingThumbnails(NSArray<RingEntry *> *entries,
                     });
                     return;
                 }
-                NSImage *thumbnail = [[NSImage alloc] initWithCGImage:image size:NSZeroSize];
+                NSData *thumbnail = encodedThumbnailFromCGImage(image);
+                if (!thumbnail) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                    @synchronized ([NSMutableDictionary class]) {
+                    recordThumbnailCaptureFailure(windowKey);
+                    [g_thumbnailRequests removeObject:windowKey];
+                    [g_chromeCaptureTabKeys removeObjectForKey:windowKey];
+                    [g_chromeCaptureURLs removeObjectForKey:windowKey];
+                    }
+                    });
+                    return;
+                }
                 dispatch_async(dispatch_get_main_queue(), ^{
                     @synchronized ([NSMutableDictionary class]) {
                     NSString *chromeTabKey = g_chromeCaptureTabKeys[windowKey];
@@ -2683,7 +2761,7 @@ static void capturePendingThumbnails(NSArray<RingEntry *> *entries,
                         BOOL chromeTabMatchesCapture = isChromeTab && chromeTabKey.length &&
                             [tabThumbnailKey(entry) isEqualToString:chromeTabKey];
                         if (entry.windowID == window.windowID && (!entry.isTab || chromeTabMatchesCapture)) {
-                            entry.thumbnail = thumbnail;
+                            applyThumbnailDataToEntry(entry, thumbnail);
                         }
                     }
                     if (g_ringView) {
@@ -2716,8 +2794,8 @@ static void schedulePendingThumbnailCapture(NSArray<RingEntry *> *entries) {
     NSArray<RingEntry *> *entrySnapshot = [entries copy];
     dispatch_async(g_thumbnailPlanningQueue, ^{
         if (atomic_load(&g_gestureActive)) return;
-        NSDictionary<NSNumber *, NSImage *> *thumbnailSnapshot = nil;
-        NSDictionary<NSString *, NSImage *> *tabThumbnailSnapshot = nil;
+        NSDictionary<NSNumber *, NSData *> *thumbnailSnapshot = nil;
+        NSDictionary<NSString *, NSData *> *tabThumbnailSnapshot = nil;
         NSDictionary<NSString *, NSNumber *> *tabLastCapturedSnapshot = nil;
         NSTimeInterval retryAfter = 0;
         @synchronized ([NSMutableDictionary class]) {
@@ -3103,9 +3181,9 @@ int main(int argc, const char *argv[]) {
         }
         g_scanTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_windowScanQueue);
         dispatch_source_set_timer(g_scanTimer,
-                                  dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                                  (uint64_t)(0.5 * NSEC_PER_SEC),
-                                  (uint64_t)(50 * NSEC_PER_MSEC));
+                                  dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                                  (uint64_t)(2.0 * NSEC_PER_SEC),
+                                  (uint64_t)(100 * NSEC_PER_MSEC));
         dispatch_source_set_event_handler(g_scanTimer, ^{
             // Skip this tick if the user is gesturing or a previous scan has
             // not completed; never start a full AX/AppleScript pass mid-gesture.
