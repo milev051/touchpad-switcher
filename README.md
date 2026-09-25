@@ -187,14 +187,18 @@ nešto različiti među verzijama macOS-a. Dok je meni otvoren, test dodatno
 presreće scroll događaje. Sam meni preuzima događaje miša i skrola kao dodatnu
 zaštitu za aplikaciju ispod kursora. Ako sistem ne dozvoli aktivni filter unosa,
 meni i dalje preuzima ulaz dok je prikazan, bez ponavljajućeg upozorenja pri
-pokretanju. Chrome tabovi se čitaju preko AppleScript-a; kratka greška
-se ponovo pokušava, a izbor taba koristi Chrome ID prozora i taba. Ekran je blago
-zatamnjen iza ikonica i thumbnailova.
+pokretanju. Chrome tabovi se čitaju preko AppleScript-a; aplikacija pri startu
+traži Automation dozvolu za Google Chrome. Bez te dozvole tabovi se ne vide kao
+odvojene kartice. Putanja: System Settings -> Privacy & Security -> Automation
+-> Touchpad Switcher -> Google Chrome. Kratka greška se ponovo pokušava, a izbor
+taba koristi numerički Chrome ID prozora i taba. Ekran je blago zatamnjen iza
+ikonica i thumbnailova.
 Thumbnailovi se snimaju u smanjenoj rezoluciji ako aplikacija koja pokreće test
 ima dozvolu za Screen Recording. Čuvaju se privremeno u memoriji dok su prozori
 otvoreni i uklanjaju se iz keša kada se prozori zatvore. Za Chrome se slika
-čuva zasebno za svaki tab. Kada Chrome nije aktivna aplikacija i nema dodira
-na trackpadu, Touchpad Switcher kratko otvori jedan tab bez slike, snimi ga i
-vrati prethodni tab. Dok je Chrome aktivan, tabovi bez snimka imaju karticu sa
-naslovom i domenom sajta; pozadinsko snimanje se nastavlja kada Chrome pređe
-u pozadinu.
+čuva zasebno za svaki tab. YouTube tabovi odmah dobijaju sliku videa iz URL-a,
+bez prebacivanja taba. Aktivni tab se snima sa ekrana. Kad korisnik izabere tab
+u meniju, snimak se radi posle prelaska na taj tab. Kada Chrome nije aktivna
+aplikacija i nema dodira na trackpadu, Touchpad Switcher kratko otvori jedan tab
+bez slike, snimi ga i vrati prethodni tab. Dok je Chrome aktivan, tabovi bez
+snimka imaju karticu sa naslovom i domenom sajta.

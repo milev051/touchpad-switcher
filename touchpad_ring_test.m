@@ -81,6 +81,14 @@ extern void MTUnregisterContactFrameCallback(MTDeviceRef, MTContactCallbackFunct
 @implementation RingEntry
 @end
 
+static NSString *chromeDisplayTitle(RingEntry *entry);
+static NSString *chromeHostFromEntry(RingEntry *entry);
+static NSString *tabThumbnailKey(RingEntry *entry);
+static BOOL ensureChromeAutomation(BOOL askUser);
+static void schedulePendingThumbnailCapture(NSArray<RingEntry *> *entries);
+static void scheduleChromeBackgroundPrefetch(NSArray<RingEntry *> *entries);
+static void scheduleChromeTabArtwork(NSArray<RingEntry *> *entries);
+
 @interface RingView : NSView
 @property(nonatomic, copy) NSArray<RingEntry *> *entries;
 @property(nonatomic) NSInteger selectedIndex;
@@ -262,7 +270,7 @@ static CGFloat visualItemAngle(NSInteger i, NSUInteger count) {
             BOOL isChromeEntry = [entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"];
             BOOL isLabeledTabEntry = entry.isTab && entry.tabTitle.length > 0;
             NSString *badgeText = isChromeEntry
-                ? (entry.tabTitle.length > 0 ? entry.tabTitle : entry.windowTitle)
+                ? chromeDisplayTitle(entry)
                 : (isLabeledTabEntry ? entry.tabTitle
                                      : (entry.folderPath.length > 0 ? entry.folderPath
                                                                     : (entry.tabTitle.length > 0 ? entry.tabTitle : entry.windowTitle)));
@@ -310,16 +318,15 @@ static CGFloat visualItemAngle(NSInteger i, NSUInteger count) {
                 [borderPath stroke];
             }
             [NSGraphicsContext restoreGraphicsState];
-        } else if ([entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"] && entry.isTab) {
-            // An inactive Chrome tab has no separate window for ScreenCaptureKit.
-            // Show its identity at the same card size until a real capture exists.
+        } else if ([entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"]) {
+            // Chrome tabs share one CG window, so inactive tabs often have no
+            // screenshot. Keep the same card size and show title + site instead
+            // of a bare Chrome icon.
             CGFloat cardHeight = previewWidth * 0.60;
             NSRect cardRect = NSMakeRect(itemCenter.x - previewWidth / 2,
                                          itemCenter.y - cardHeight / 2,
                                          previewWidth, cardHeight);
-            NSURLComponents *parts = [NSURLComponents componentsWithString:entry.tabURL ?: @""];
-            NSString *host = parts.host.length ? parts.host : (parts.scheme.length ? parts.scheme : @"Google Chrome");
-            if ([host hasPrefix:@"www."]) host = [host substringFromIndex:4];
+            NSString *host = chromeHostFromEntry(entry);
             CGFloat hue = (CGFloat)(host.hash % 360) / 360.0;
             NSColor *topColor = [NSColor colorWithCalibratedHue:hue saturation:0.48 brightness:0.27 alpha:1.0];
             NSColor *bottomColor = [NSColor colorWithCalibratedHue:hue saturation:0.37 brightness:0.13 alpha:1.0];
@@ -348,7 +355,7 @@ static CGFloat visualItemAngle(NSInteger i, NSUInteger count) {
                 NSForegroundColorAttributeName: NSColor.whiteColor,
                 NSParagraphStyleAttributeName: titleStyle
             };
-            NSString *title = entry.tabTitle.length ? entry.tabTitle : (entry.windowTitle ?: @"Chrome tab");
+            NSString *title = chromeDisplayTitle(entry);
             [title drawInRect:NSMakeRect(NSMinX(cardRect) + inset,
                                          NSMinY(cardRect) + cardHeight * 0.28,
                                          previewWidth - inset * 2,
@@ -485,6 +492,9 @@ static NSMutableDictionary<NSNumber *, NSString *> *g_chromeCaptureTabKeys;
 static NSMutableSet<NSNumber *> *g_thumbnailRequests;
 static NSMutableSet<NSString *> *g_tabThumbnailRequests;
 static NSMutableDictionary<NSString *, NSNumber *> *g_tabLastCaptured;
+static NSMutableDictionary<NSString *, NSImage *> *g_tabArtworkCache;
+static NSMutableSet<NSString *> *g_tabArtworkRequests;
+static dispatch_queue_t g_tabArtworkQueue;
 static NSTimeInterval g_shareableContentRetryAfter = 0;
 static NSUInteger g_shareableContentFailureCount = 0;
 static dispatch_queue_t g_tabCaptureQueue;
@@ -966,8 +976,28 @@ static void finishGesture(uint64_t generation, NSInteger selection) {
     // window that owns the selected tab.
     [entry.application activateWithOptions:NSApplicationActivateIgnoringOtherApps];
 #pragma clang diagnostic pop
+    BOOL captureChromeAfterRaise =
+        [entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"] &&
+        entry.windowID != kCGNullWindowID;
+    NSString *chromeTabKey = captureChromeAfterRaise ? [tabThumbnailKey(entry) copy] : nil;
+    CGWindowID chromeWindowID = entry.windowID;
     dispatch_async(g_windowActivationQueue, ^{
         raiseWindowForEntry(entry, generation);
+        if (!chromeTabKey.length) return;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 450 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            if (atomic_load(&g_gestureActive)) return;
+            @synchronized ([NSMutableDictionary class]) {
+                g_chromeWindowLastCapture[@(chromeWindowID)] = @0;
+                g_chromeCaptureTabKeys[@(chromeWindowID)] = chromeTabKey;
+                for (RingEntry *current in g_windowEntries) {
+                    if (![current.application.bundleIdentifier isEqualToString:@"com.google.Chrome"] ||
+                        current.windowID != chromeWindowID) continue;
+                    current.isSelectedTab = [tabThumbnailKey(current) isEqualToString:chromeTabKey];
+                }
+            }
+            schedulePendingThumbnailCapture(g_windowEntries);
+        });
     });
 }
 
@@ -985,9 +1015,58 @@ static NSString *visibleTabTitle(NSString *title) {
     return title;
 }
 
+static NSString *chromeDisplayTitle(RingEntry *entry) {
+    NSString *title = entry.tabTitle.length ? entry.tabTitle : (entry.windowTitle ?: @"");
+    NSRange chromeMarker = [title rangeOfString:@" - Google Chrome"];
+    if (chromeMarker.location != NSNotFound) {
+        title = [title substringToIndex:chromeMarker.location];
+    }
+    title = visibleTabTitle(title);
+    return title.length ? title : @"Chrome tab";
+}
+
+static NSString *chromeHostFromEntry(RingEntry *entry) {
+    NSURLComponents *parts = [NSURLComponents componentsWithString:entry.tabURL ?: @""];
+    NSString *host = parts.host.length ? parts.host : (parts.scheme.length ? parts.scheme : @"");
+    if ([host hasPrefix:@"www."]) host = [host substringFromIndex:4];
+    if (host.length) return host;
+    NSString *title = chromeDisplayTitle(entry);
+    if ([title localizedCaseInsensitiveContainsString:@"youtube"]) return @"youtube.com";
+    return @"Google Chrome";
+}
+
+static NSString *youtubeVideoIDFromURL(NSString *urlString) {
+    if (!urlString.length) return nil;
+    NSURLComponents *parts = [NSURLComponents componentsWithString:urlString];
+    NSString *host = parts.host.lowercaseString ?: @"";
+    NSString *path = parts.path ?: @"";
+    if ([host isEqualToString:@"youtu.be"] || [host hasSuffix:@".youtu.be"]) {
+        NSString *videoID = path.lastPathComponent;
+        return videoID.length >= 11 ? [videoID substringToIndex:11] : nil;
+    }
+    BOOL isYouTube = [host containsString:@"youtube.com"] || [host containsString:@"youtube-nocookie.com"];
+    if (!isYouTube) return nil;
+    for (NSURLQueryItem *item in parts.queryItems) {
+        if ([item.name isEqualToString:@"v"] && item.value.length >= 11) {
+            NSString *videoID = item.value;
+            NSRange separator = [videoID rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"&?#"]];
+            if (separator.location != NSNotFound) videoID = [videoID substringToIndex:separator.location];
+            return videoID.length >= 11 ? [videoID substringToIndex:11] : videoID;
+        }
+    }
+    for (NSString *prefix in @[@"/shorts/", @"/embed/", @"/live/", @"/v/"]) {
+        NSRange range = [path rangeOfString:prefix];
+        if (range.location == NSNotFound) continue;
+        NSString *rest = [path substringFromIndex:NSMaxRange(range)];
+        NSString *videoID = [rest componentsSeparatedByString:@"/"].firstObject;
+        if (videoID.length >= 11) return [videoID substringToIndex:11];
+    }
+    return nil;
+}
+
 static void collectTabButtons(AXUIElementRef parent, NSMutableArray<NSDictionary *> *tabs, int depth) {
     if (!parent || depth > 8) return;
-    AXUIElementSetMessagingTimeout(parent, 0.010f);
+    AXUIElementSetMessagingTimeout(parent, 0.080f);
     CFTypeRef childrenValue = NULL;
     if (AXUIElementCopyAttributeValue(parent, kAXChildrenAttribute, &childrenValue) != kAXErrorSuccess ||
         !childrenValue || CFGetTypeID(childrenValue) != CFArrayGetTypeID()) {
@@ -1000,7 +1079,10 @@ static void collectTabButtons(AXUIElementRef parent, NSMutableArray<NSDictionary
         AXUIElementSetMessagingTimeout(child, 0.2f);
         NSString *subrole = axStringAttribute(child, kAXSubroleAttribute);
         NSString *role = axStringAttribute(child, kAXRoleAttribute);
-        if ([subrole isEqualToString:@"AXTabButton"] || [role isEqualToString:@"AXTabButton"]) {
+        BOOL isTabControl = [subrole isEqualToString:@"AXTabButton"] ||
+            [role isEqualToString:@"AXTabButton"] ||
+            [role isEqualToString:@"AXRadioButton"];
+        if (isTabControl) {
             NSString *title = axStringAttribute(child, kAXTitleAttribute);
             if (!title.length) title = axStringAttribute(child, kAXDescriptionAttribute);
             BOOL selected = NO;
@@ -1084,7 +1166,10 @@ static AXUIElementRef findTabButton(AXUIElementRef parent, NSString *title, int 
         AXUIElementRef child = (AXUIElementRef)CFArrayGetValueAtIndex(children, i);
         NSString *subrole = axStringAttribute(child, kAXSubroleAttribute);
         NSString *role = axStringAttribute(child, kAXRoleAttribute);
-        if ([subrole isEqualToString:@"AXTabButton"] || [role isEqualToString:@"AXTabButton"]) {
+        BOOL isTabControl = [subrole isEqualToString:@"AXTabButton"] ||
+            [role isEqualToString:@"AXTabButton"] ||
+            [role isEqualToString:@"AXRadioButton"];
+        if (isTabControl) {
             NSString *tabTitle = axStringAttribute(child, kAXTitleAttribute);
             if (!tabTitle.length) tabTitle = axStringAttribute(child, kAXDescriptionAttribute);
             if (tabTitle.length > 0 && [tabTitle localizedCaseInsensitiveCompare:title] == NSOrderedSame) {
@@ -1217,9 +1302,10 @@ static void populateThumbnailsFromCache(NSArray<RingEntry *> *entries) {
         if (entry.isTab) {
             BOOL isChromeTab = [entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"];
             if (isChromeTab) {
-                // Chrome tabs share one window ID. Keep the last screenshot of
-                // each visited tab under its stable Chrome tab ID.
-                entry.thumbnail = g_tabThumbnailCache[tabThumbnailKey(entry)];
+                // Chrome tabs share one window ID. Prefer a real screenshot,
+                // then a site preview (YouTube thumbnail, etc.).
+                NSString *tabKey = tabThumbnailKey(entry);
+                entry.thumbnail = g_tabThumbnailCache[tabKey] ?: g_tabArtworkCache[tabKey];
             } else if (!entry.thumbnail) {
                 NSString *tabKey = tabThumbnailKey(entry);
                 if (g_tabThumbnailCache && g_tabThumbnailCache[tabKey]) {
@@ -1348,6 +1434,7 @@ static void pruneDeadWindowEntriesLive(void) {
             if (g_tabThumbnailCache) {
                 for (NSString *tKey in deadTabKeys) {
                     [g_tabThumbnailCache removeObjectForKey:tKey];
+                    [g_tabArtworkCache removeObjectForKey:tKey];
                     [g_tabLastSeen removeObjectForKey:tKey];
                     [g_tabPIDMap removeObjectForKey:tKey];
                 }
@@ -1433,7 +1520,9 @@ static NSArray<NSDictionary *> *fetchChromeTabRows(void) {
                          "    try\n"
                          "      set chromeWindow to window windowIndex\n"
                          "      set windowID to (id of chromeWindow) as text\n"
-                         "      set {xPos, yPos, winWidth, winHeight} to bounds of chromeWindow\n"
+                         "      set {xPos, yPos, x2, y2} to bounds of chromeWindow\n"
+                         "      set winWidth to (x2 - xPos)\n"
+                         "      set winHeight to (y2 - yPos)\n"
                          "      set activeIndex to active tab index of chromeWindow\n"
                          "      set activeTitle to (title of active tab of chromeWindow) as text\n"
                          "      set AppleScript's text item delimiters to {return, linefeed, fieldSep}\n"
@@ -1475,6 +1564,10 @@ static NSArray<NSDictionary *> *fetchChromeTabRows(void) {
     });
     if (!s_chromeScript) return @[];
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    if (!ensureChromeAutomation(YES)) {
+        s_retryAfter = now + 5.0;
+        return now - s_lastSuccess < 3.0 ? s_lastRows ?: @[] : @[];
+    }
     if (now < s_retryAfter) return now - s_lastSuccess < 3.0 ? s_lastRows ?: @[] : @[];
 
     NSDictionary *error = nil;
@@ -1536,17 +1629,66 @@ static BOOL validChromeID(NSString *identifier) {
         [identifier rangeOfCharacterFromSet:NSCharacterSet.decimalDigitCharacterSet.invertedSet].location == NSNotFound;
 }
 
+static BOOL ensureChromeAutomation(BOOL askUser) {
+    static NSTimeInterval s_nextCheck = 0;
+    static int s_cached = -1; // 1 granted, 0 denied, -1 unknown, -2 waiting for prompt
+    static BOOL s_didAsk = NO;
+    static BOOL s_loggedDenial = NO;
+    if (s_cached == 1) return YES;
+
+    BOOL chromeRunning = NO;
+    for (NSRunningApplication *app in NSWorkspace.sharedWorkspace.runningApplications) {
+        if ([app.bundleIdentifier isEqualToString:@"com.google.Chrome"]) {
+            chromeRunning = YES;
+            break;
+        }
+    }
+    if (!chromeRunning) return NO;
+
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    if ((s_cached == 0 || s_cached == -2) && now < s_nextCheck) return NO;
+
+    BOOL shouldAsk = askUser && !s_didAsk && [NSThread isMainThread];
+    if (shouldAsk) s_didAsk = YES;
+
+    NSAppleEventDescriptor *target =
+        [NSAppleEventDescriptor descriptorWithBundleIdentifier:@"com.google.Chrome"];
+    OSStatus status = AEDeterminePermissionToAutomateTarget(target.aeDesc, typeWildCard, typeWildCard, shouldAsk);
+    if (status == noErr) {
+        s_cached = 1;
+        s_loggedDenial = NO;
+        return YES;
+    }
+    if (status == procNotFound || status == -600) return NO;
+    if (status == -1744) { // errAEEventWouldRequireUserConsent
+        s_cached = -2;
+        s_nextCheck = now + 2.0;
+        return NO;
+    }
+    s_cached = 0;
+    s_nextCheck = now + 8.0;
+    if (!s_loggedDenial) {
+        fprintf(stderr,
+                "[Chrome tabs] Automation denied (status=%d). Enable Touchpad Switcher -> Google Chrome in System Settings -> Privacy & Security -> Automation.\n",
+                (int)status);
+        s_loggedDenial = YES;
+    }
+    return NO;
+}
+
 static BOOL setChromeActiveTab(NSString *windowID, NSString *tabID) {
     if (!validChromeID(windowID) || !validChromeID(tabID)) return NO;
     NSString *source = [NSString stringWithFormat:
         @"tell application \"Google Chrome\"\n"
-         "set targetWindow to first window whose id is \"%@\"\n"
+         "try\n"
+         "set targetWindow to first window whose id is %@\n"
          "repeat with tabIndex from 1 to count of tabs of targetWindow\n"
-         "if (id of tab tabIndex of targetWindow) as text is \"%@\" then\n"
+         "if (id of tab tabIndex of targetWindow) is %@ then\n"
          "set active tab index of targetWindow to tabIndex\n"
          "return true\n"
          "end if\n"
          "end repeat\n"
+         "end try\n"
          "end tell\n"
          "return false", windowID, tabID];
     NSAppleScript *script = [[NSAppleScript alloc] initWithSource:source];
@@ -1635,6 +1777,11 @@ static NSArray<RingEntry *> *collectOpenWindows(void) {
                     entry.windowID = windowID;
                     entry.windowBounds = bounds;
                     [entries addObject:entry];
+                }
+                static NSUInteger s_lastChromeTabLogCount = NSUIntegerMax;
+                if (chromeTabs.count != s_lastChromeTabLogCount) {
+                    s_lastChromeTabLogCount = chromeTabs.count;
+                    NSLog(@"[Chrome tabs] AppleScript listed %lu tabs", (unsigned long)chromeTabs.count);
                 }
                 continue;
             }
@@ -1963,7 +2110,7 @@ static NSString *chromeActiveTabID(NSString *windowID) {
     if (!validChromeID(windowID)) return nil;
     NSString *source = [NSString stringWithFormat:
         @"tell application \"Google Chrome\"\n"
-         "set targetWindow to first window whose id is \"%@\"\n"
+         "set targetWindow to first window whose id is %@\n"
          "return (id of active tab of targetWindow) as text\n"
          "end tell", windowID];
     NSAppleScript *script = [[NSAppleScript alloc] initWithSource:source];
@@ -1979,6 +2126,69 @@ static void finishChromePrefetch(BOOL succeeded) {
     atomic_store(&g_chromePrefetchActive, false);
 }
 
+static NSURL *chromeArtworkURL(NSString *tabURL) {
+    NSString *videoID = youtubeVideoIDFromURL(tabURL);
+    if (!videoID.length) return nil;
+    return [NSURL URLWithString:[NSString stringWithFormat:@"https://i.ytimg.com/vi/%@/hqdefault.jpg", videoID]];
+}
+
+static void scheduleChromeTabArtwork(NSArray<RingEntry *> *entries) {
+    if (!entries.count) return;
+    if (!g_tabArtworkQueue) {
+        g_tabArtworkQueue = dispatch_queue_create("touchpad.ring.chrome-artwork", DISPATCH_QUEUE_SERIAL);
+    }
+    @synchronized ([NSMutableDictionary class]) {
+        if (!g_tabArtworkCache) g_tabArtworkCache = [NSMutableDictionary dictionary];
+        if (!g_tabArtworkRequests) g_tabArtworkRequests = [NSMutableSet set];
+    }
+    for (RingEntry *entry in entries) {
+        if (![entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"]) continue;
+        NSString *tabKey = tabThumbnailKey(entry);
+        NSURL *artworkURL = chromeArtworkURL(entry.tabURL);
+        if (!artworkURL || !tabKey.length) continue;
+        @synchronized ([NSMutableDictionary class]) {
+            if (g_tabThumbnailCache[tabKey] || g_tabArtworkCache[tabKey] ||
+                [g_tabArtworkRequests containsObject:tabKey]) continue;
+            [g_tabArtworkRequests addObject:tabKey];
+        }
+        NSString *requestKey = [tabKey copy];
+        dispatch_async(g_tabArtworkQueue, ^{
+            NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:artworkURL];
+            request.timeoutInterval = 6.0;
+            request.cachePolicy = NSURLRequestReturnCacheDataElseLoad;
+            NSURLSessionDataTask *task =
+                [[NSURLSession sharedSession] dataTaskWithRequest:request
+                                                completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+                NSImage *image = nil;
+                NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]]
+                    ? (NSHTTPURLResponse *)response : nil;
+                if (!error && data.length && http.statusCode == 200) {
+                    image = [[NSImage alloc] initWithData:data];
+                }
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    @synchronized ([NSMutableDictionary class]) {
+                        [g_tabArtworkRequests removeObject:requestKey];
+                        if (image && image.size.width >= 16 && !g_tabThumbnailCache[requestKey]) {
+                            g_tabArtworkCache[requestKey] = image;
+                            for (RingEntry *current in g_windowEntries) {
+                                if ([tabThumbnailKey(current) isEqualToString:requestKey] && !current.thumbnail) {
+                                    current.thumbnail = image;
+                                }
+                            }
+                            if (g_ringView) {
+                                g_ringView.entries = g_windowEntries;
+                                [g_ringView setNeedsDisplay:YES];
+                            }
+                            NSLog(@"[Chrome thumbnails] artwork %@", requestKey);
+                        }
+                    }
+                });
+            }];
+            [task resume];
+        });
+    }
+}
+
 static void scheduleChromeBackgroundPrefetch(NSArray<RingEntry *> *entries) {
     if (atomic_load(&g_gestureActive) || atomic_load(&g_activeTouchCount) != 0 ||
         atomic_load(&g_chromePrefetchActive) || !CGPreflightScreenCaptureAccess()) return;
@@ -1986,18 +2196,12 @@ static void scheduleChromeBackgroundPrefetch(NSArray<RingEntry *> *entries) {
     RingEntry *target = nil;
     @synchronized ([NSMutableDictionary class]) {
         if (NSProcessInfo.processInfo.systemUptime < g_chromePrefetchRetryAfter) return;
-        NSMutableSet<NSString *> *readyWindows = [NSMutableSet set];
-        for (RingEntry *entry in entries) {
-            if (entry.isSelectedTab && entry.chromeWindowID.length &&
-                g_tabThumbnailCache[tabThumbnailKey(entry)]) {
-                [readyWindows addObject:entry.chromeWindowID];
-            }
-        }
         for (RingEntry *entry in entries) {
             if (!entry.isTab || !entry.chromeWindowID.length || !entry.chromeTabID.length ||
                 entry.isSelectedTab || entry.windowID == kCGNullWindowID ||
-                entry.application.isActive || ![readyWindows containsObject:entry.chromeWindowID] ||
-                g_tabThumbnailCache[tabThumbnailKey(entry)]) continue;
+                entry.application.isActive ||
+                g_tabThumbnailCache[tabThumbnailKey(entry)] ||
+                g_tabArtworkCache[tabThumbnailKey(entry)]) continue;
             target = entry;
             break;
         }
@@ -2507,6 +2711,7 @@ static void pruneThumbnailCaches(NSArray<RingEntry *> *entries) {
         }
         for (NSString *key in keysToRemove) {
             [g_tabThumbnailCache removeObjectForKey:key];
+            [g_tabArtworkCache removeObjectForKey:key];
             [g_tabLastSeen removeObjectForKey:key];
             [g_tabPIDMap removeObjectForKey:key];
             [g_tabLastCaptured removeObjectForKey:key];
@@ -2730,12 +2935,29 @@ int main(int argc, const char *argv[]) {
         g_thumbnailRequests = [NSMutableSet set];
         g_tabThumbnailRequests = [NSMutableSet set];
         g_tabLastCaptured = [NSMutableDictionary dictionary];
+        g_tabArtworkCache = [NSMutableDictionary dictionary];
+        g_tabArtworkRequests = [NSMutableSet set];
         g_windowActivationQueue = dispatch_queue_create("touchpad.ring.window-activation", DISPATCH_QUEUE_SERIAL);
         g_windowEntries = collectOpenWindows();
         populateThumbnailsFromCache(g_windowEntries);
         atomic_store(&g_windowEntryCount, (int)g_windowEntries.count);
         if (g_thumbnailPreviewsEnabled) schedulePendingThumbnailCapture(g_windowEntries);
         if (g_thumbnailPreviewsEnabled) scheduleChromeBackgroundPrefetch(g_windowEntries);
+        scheduleChromeTabArtwork(g_windowEntries);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (ensureChromeAutomation(YES)) {
+                NSArray<RingEntry *> *entries = collectOpenWindows();
+                populateThumbnailsFromCache(entries);
+                g_windowEntries = entries;
+                atomic_store(&g_windowEntryCount, (int)entries.count);
+                if (g_ringView) g_ringView.entries = entries;
+                if (g_thumbnailPreviewsEnabled) schedulePendingThumbnailCapture(entries);
+                if (g_thumbnailPreviewsEnabled) scheduleChromeBackgroundPrefetch(entries);
+                scheduleChromeTabArtwork(entries);
+                printf("Chrome Automation granted. Entries: %d\n", atomic_load(&g_windowEntryCount));
+                fflush(stdout);
+            }
+        });
         printf("Touchpad Switcher: %d entries.\n", atomic_load(&g_windowEntryCount));
         for (RingEntry *entry in g_windowEntries) {
             NSString *desc = entry.folderPath.length ? entry.folderPath : (entry.tabTitle.length ? entry.tabTitle : entry.windowTitle);
@@ -2784,6 +3006,7 @@ int main(int argc, const char *argv[]) {
                         }
                         if (g_thumbnailPreviewsEnabled) schedulePendingThumbnailCapture(entries);
                         if (g_thumbnailPreviewsEnabled) scheduleChromeBackgroundPrefetch(entries);
+                        scheduleChromeTabArtwork(entries);
                     }
                     atomic_store(&g_isScanning, false);
                 });
