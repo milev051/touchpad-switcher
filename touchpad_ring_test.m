@@ -2946,16 +2946,12 @@ static NSInteger stableDirectionIndex(double dx, double dy, NSInteger count, NSI
     if (candidate < 0 || currentIndex < 0 || candidate == currentIndex) return candidate;
     double movementAngle = atan2(dy, dx);
     double currentAngle = (double)visualItemAngle(currentIndex, (NSUInteger)count);
-    double candidateAngle = (double)visualItemAngle(candidate, (NSUInteger)count);
     double angularDistance = fabs(remainder(movementAngle - currentAngle, 2.0 * M_PI));
-    // Stay on the current card until the swipe clearly leaves its sector.
-    // Extra ~26 degrees on top of half-spacing makes neighboring cards sticky.
-    double switchBoundary = M_PI / (double)count + M_PI / 7.0;
-    if (angularDistance <= switchBoundary) return currentIndex;
-    double currentAlign = cos(movementAngle - currentAngle);
-    double candidateAlign = cos(movementAngle - candidateAngle);
-    if (candidateAlign < currentAlign + 0.12) return currentIndex;
-    return candidate;
+    // Sticky through a bit past the midpoint, but never wider than the gap to
+    // the next card. A fixed extra angle blocked neighbors when N was large.
+    double halfSector = M_PI / (double)MAX(count, 1);
+    double switchBoundary = halfSector * 1.18;
+    return angularDistance <= switchBoundary ? currentIndex : candidate;
 }
 
 static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouches, double timestamp, int frame) {
@@ -3070,12 +3066,12 @@ static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouche
                 g_motionAccumY += y - g_previousY;
                 g_previousX = x;
                 g_previousY = y;
-                const double kFirstSelectTravel = 0.012;
-                const double kChangeSelectTravel = 0.034;
-                const double kSelectionBias = 0.010;
+                NSInteger count = atomic_load(&g_windowEntryCount);
+                const double kFirstSelectTravel = count >= 8 ? 0.014 : 0.012;
+                const double kChangeSelectTravel = count <= 5 ? 0.028 : (count <= 8 ? 0.018 : 0.012);
+                const double kSelectionBias = count >= 8 ? 0.003 : 0.007;
                 const double kAccumClamp = 0.050;
                 double motionLength = hypot(g_motionAccumX, g_motionAccumY);
-                NSInteger count = atomic_load(&g_windowEntryCount);
                 NSInteger candidate = motionLength >= kFirstSelectTravel
                     ? stableDirectionIndex(g_motionAccumX, g_motionAccumY, count, g_selectedIndex) : -1;
                 double requiredLength = g_selectedIndex < 0 ? kFirstSelectTravel : kChangeSelectTravel;
