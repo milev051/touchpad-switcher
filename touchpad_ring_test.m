@@ -83,6 +83,7 @@ extern void MTUnregisterContactFrameCallback(MTDeviceRef, MTContactCallbackFunct
 
 static NSString *chromeDisplayTitle(RingEntry *entry);
 static NSString *chromeHostFromEntry(RingEntry *entry);
+static NSString *youtubeVideoIDFromURL(NSString *urlString);
 static NSString *cardLabelText(RingEntry *entry);
 static void drawCardLabel(NSString *text, NSRect cardRect, BOOL truncateMiddle);
 static NSString *tabThumbnailKey(RingEntry *entry);
@@ -435,6 +436,9 @@ static NSMutableSet<NSNumber *> *g_thumbnailRequests;
 static NSMutableSet<NSString *> *g_tabThumbnailRequests;
 static NSMutableDictionary<NSString *, NSNumber *> *g_tabLastCaptured;
 static NSMutableDictionary<NSString *, NSImage *> *g_tabArtworkCache;
+static NSMutableDictionary<NSString *, NSImage *> *g_urlArtworkCache;
+static NSMutableDictionary<NSString *, NSString *> *g_tabCachedURL;
+static NSMutableDictionary<NSNumber *, NSString *> *g_chromeCaptureURLs;
 static NSMutableSet<NSString *> *g_tabArtworkRequests;
 static dispatch_queue_t g_tabArtworkQueue;
 static NSTimeInterval g_shareableContentRetryAfter = 0;
@@ -1292,6 +1296,54 @@ static CGWindowID matchingTabCGWindowID(pid_t pid, CGRect bounds, NSString *tabT
     return bestID;
 }
 
+static NSString *normalizedTabURL(NSString *urlString) {
+    if (!urlString.length) return @"";
+    NSURLComponents *parts = [NSURLComponents componentsWithString:urlString];
+    if (!parts) return urlString;
+    parts.fragment = nil;
+    NSString *host = parts.host.lowercaseString;
+    if ([host hasPrefix:@"www."]) host = [host substringFromIndex:4];
+    parts.host = host;
+    NSString *path = parts.path;
+    if (path.length > 1 && [path hasSuffix:@"/"]) {
+        parts.path = [path substringToIndex:path.length - 1];
+    }
+    return parts.string ?: urlString;
+}
+
+static NSString *chromeArtworkCacheKey(NSString *tabURL) {
+    NSString *videoID = youtubeVideoIDFromURL(tabURL);
+    if (videoID.length) return [NSString stringWithFormat:@"yt:%@", videoID];
+    NSString *norm = normalizedTabURL(tabURL);
+    return norm.length ? [NSString stringWithFormat:@"url:%@", norm] : nil;
+}
+
+static void syncChromeTabMediaWithCurrentURL(RingEntry *entry) {
+    if (![entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"]) return;
+    NSString *tabKey = tabThumbnailKey(entry);
+    if (!tabKey.length) return;
+    if (!g_tabCachedURL) g_tabCachedURL = [NSMutableDictionary dictionary];
+    NSString *url = normalizedTabURL(entry.tabURL);
+    NSString *previous = g_tabCachedURL[tabKey];
+    if (previous && ![previous isEqualToString:url]) {
+        [g_tabThumbnailCache removeObjectForKey:tabKey];
+        [g_tabArtworkCache removeObjectForKey:tabKey];
+        [g_tabLastCaptured removeObjectForKey:tabKey];
+        [g_tabArtworkRequests removeObject:tabKey];
+        if (entry.windowID != kCGNullWindowID) g_chromeWindowLastCapture[@(entry.windowID)] = @0;
+        entry.thumbnail = nil;
+    }
+    g_tabCachedURL[tabKey] = url ?: @"";
+    if (!entry.thumbnail) {
+        NSString *artKey = chromeArtworkCacheKey(entry.tabURL);
+        NSImage *shared = (artKey.length && g_urlArtworkCache) ? g_urlArtworkCache[artKey] : nil;
+        if (shared) {
+            g_tabArtworkCache[tabKey] = shared;
+            entry.thumbnail = shared;
+        }
+    }
+}
+
 static NSString *tabThumbnailKey(RingEntry *entry) {
     if (entry.chromeWindowID.length && entry.chromeTabID.length) {
         return [NSString stringWithFormat:@"%d:chrome:%@:%@", entry.application.processIdentifier,
@@ -1311,10 +1363,13 @@ static void populateThumbnailsFromCache(NSArray<RingEntry *> *entries) {
         if (entry.isTab) {
             BOOL isChromeTab = [entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"];
             if (isChromeTab) {
-                // Chrome tabs share one window ID. Prefer a real screenshot,
-                // then a site preview (YouTube thumbnail, etc.).
+                // Drop stale screenshots when the tab navigates, then prefer a
+                // real capture and fall back to a site preview for the new URL.
+                syncChromeTabMediaWithCurrentURL(entry);
                 NSString *tabKey = tabThumbnailKey(entry);
-                entry.thumbnail = g_tabThumbnailCache[tabKey] ?: g_tabArtworkCache[tabKey];
+                if (!entry.thumbnail) {
+                    entry.thumbnail = g_tabThumbnailCache[tabKey] ?: g_tabArtworkCache[tabKey];
+                }
             } else if (!entry.thumbnail) {
                 NSString *tabKey = tabThumbnailKey(entry);
                 if (g_tabThumbnailCache && g_tabThumbnailCache[tabKey]) {
@@ -1444,6 +1499,7 @@ static void pruneDeadWindowEntriesLive(void) {
                 for (NSString *tKey in deadTabKeys) {
                     [g_tabThumbnailCache removeObjectForKey:tKey];
                     [g_tabArtworkCache removeObjectForKey:tKey];
+                    [g_tabCachedURL removeObjectForKey:tKey];
                     [g_tabLastSeen removeObjectForKey:tKey];
                     [g_tabPIDMap removeObjectForKey:tKey];
                 }
@@ -2184,12 +2240,20 @@ static void scheduleChromeTabArtwork(NSArray<RingEntry *> *entries) {
         NSString *tabKey = tabThumbnailKey(entry);
         NSURL *artworkURL = chromeArtworkURL(entry.tabURL);
         if (!artworkURL || !tabKey.length) continue;
+        NSString *artKey = chromeArtworkCacheKey(entry.tabURL);
+        NSString *requestURL = normalizedTabURL(entry.tabURL);
         @synchronized ([NSMutableDictionary class]) {
+            NSImage *shared = (artKey.length && g_urlArtworkCache) ? g_urlArtworkCache[artKey] : nil;
+            if (shared && !g_tabArtworkCache[tabKey] && !g_tabThumbnailCache[tabKey]) {
+                g_tabArtworkCache[tabKey] = shared;
+                entry.thumbnail = shared;
+            }
             if (g_tabThumbnailCache[tabKey] || g_tabArtworkCache[tabKey] ||
                 [g_tabArtworkRequests containsObject:tabKey]) continue;
             [g_tabArtworkRequests addObject:tabKey];
         }
         NSString *requestKey = [tabKey copy];
+        NSString *requestArtKey = [artKey copy];
         dispatch_async(g_tabArtworkQueue, ^{
             NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:artworkURL];
             request.timeoutInterval = 6.0;
@@ -2206,18 +2270,26 @@ static void scheduleChromeTabArtwork(NSArray<RingEntry *> *entries) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     @synchronized ([NSMutableDictionary class]) {
                         [g_tabArtworkRequests removeObject:requestKey];
-                        if (image && image.size.width >= 16 && !g_tabThumbnailCache[requestKey]) {
-                            g_tabArtworkCache[requestKey] = image;
+                        if (image && image.size.width >= 16) {
+                            if (requestArtKey.length) {
+                                if (!g_urlArtworkCache) g_urlArtworkCache = [NSMutableDictionary dictionary];
+                                g_urlArtworkCache[requestArtKey] = image;
+                            }
+                            BOOL urlStillMatches = NO;
                             for (RingEntry *current in g_windowEntries) {
-                                if ([tabThumbnailKey(current) isEqualToString:requestKey] && !current.thumbnail) {
+                                if (![tabThumbnailKey(current) isEqualToString:requestKey]) continue;
+                                if (![normalizedTabURL(current.tabURL) isEqualToString:requestURL]) continue;
+                                urlStillMatches = YES;
+                                if (!g_tabThumbnailCache[requestKey]) {
+                                    g_tabArtworkCache[requestKey] = image;
                                     current.thumbnail = image;
                                 }
                             }
-                            if (g_ringView) {
+                            if (urlStillMatches && g_ringView) {
                                 g_ringView.entries = g_windowEntries;
                                 [g_ringView setNeedsDisplay:YES];
                             }
-                            NSLog(@"[Chrome thumbnails] artwork %@", requestKey);
+                            if (urlStillMatches) NSLog(@"[Chrome thumbnails] artwork %@", requestKey);
                         }
                     }
                 });
@@ -2450,7 +2522,7 @@ static void capturePendingThumbnails(NSArray<RingEntry *> *entries,
                 NSString *tabKey = tabThumbnailKey(entry);
                 NSTimeInterval lastAttempt = g_chromeWindowLastCapture[key].doubleValue;
                 NSTimeInterval lastCaptured = tabLastCapturedSnapshot[tabKey].doubleValue;
-                BOOL captureDue = !tabThumbnailSnapshot[tabKey] || (now - lastCaptured >= 8.0);
+                BOOL captureDue = !tabThumbnailSnapshot[tabKey] || (now - lastCaptured >= 2.0);
                 if (entry.windowID != kCGNullWindowID && captureDue &&
                     now - lastAttempt >= 0.5 &&
                     !thumbnailCaptureIsCoolingDown(key) &&
@@ -2498,6 +2570,8 @@ static void capturePendingThumbnails(NSArray<RingEntry *> *entries,
             [entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"] &&
             [wantedChromeIDs containsObject:@(entry.windowID)]) {
             g_chromeCaptureTabKeys[@(entry.windowID)] = tabThumbnailKey(entry);
+            if (!g_chromeCaptureURLs) g_chromeCaptureURLs = [NSMutableDictionary dictionary];
+            g_chromeCaptureURLs[@(entry.windowID)] = normalizedTabURL(entry.tabURL);
         }
     }
     for (NSNumber *windowKey in wantedChromeIDs) {
@@ -2573,20 +2647,23 @@ static void capturePendingThumbnails(NSArray<RingEntry *> *entries,
                 dispatch_async(dispatch_get_main_queue(), ^{
                     @synchronized ([NSMutableDictionary class]) {
                     NSString *chromeTabKey = g_chromeCaptureTabKeys[windowKey];
+                    NSString *capturedURL = g_chromeCaptureURLs[windowKey];
                     [g_chromeCaptureTabKeys removeObjectForKey:windowKey];
+                    [g_chromeCaptureURLs removeObjectForKey:windowKey];
                     BOOL chromeTabStillSelected = NO;
+                    BOOL chromeURLStillMatches = capturedURL == nil;
                     if (chromeTabKey.length) {
                         for (RingEntry *current in g_windowEntries) {
                             if (current.isSelectedTab && current.windowID == window.windowID &&
                                 [tabThumbnailKey(current) isEqualToString:chromeTabKey]) {
                                 chromeTabStillSelected = YES;
+                                chromeURLStillMatches = [normalizedTabURL(current.tabURL) isEqualToString:capturedURL ?: @""];
                                 break;
                             }
                         }
                     }
-                    if (chromeTabKey.length && !chromeTabStillSelected) {
-                        // A tab changed during the asynchronous screenshot.
-                        // Do not attach its image to the previous tab's ID.
+                    if (chromeTabKey.length && (!chromeTabStillSelected || !chromeURLStillMatches)) {
+                        // A tab changed or navigated during the asynchronous screenshot.
                         [g_thumbnailRequests removeObject:windowKey];
                         g_chromeWindowLastCapture[windowKey] = @0;
                         return;
@@ -2747,13 +2824,14 @@ static void pruneThumbnailCaches(NSArray<RingEntry *> *entries) {
                 // Keep its last image briefly so the next scan can restore it.
                 BOOL isChromeTab = [key containsString:@":chrome:"];
                 NSTimeInterval lastSeen = g_tabLastSeen[key].doubleValue;
-                if (!isChromeTab || now - lastSeen > 10.0) [keysToRemove addObject:key];
+                if (!isChromeTab || now - lastSeen > 1.5) [keysToRemove addObject:key];
                 continue;
             }
         }
         for (NSString *key in keysToRemove) {
             [g_tabThumbnailCache removeObjectForKey:key];
             [g_tabArtworkCache removeObjectForKey:key];
+            [g_tabCachedURL removeObjectForKey:key];
             [g_tabLastSeen removeObjectForKey:key];
             [g_tabPIDMap removeObjectForKey:key];
             [g_tabLastCaptured removeObjectForKey:key];
@@ -2978,6 +3056,9 @@ int main(int argc, const char *argv[]) {
         g_tabThumbnailRequests = [NSMutableSet set];
         g_tabLastCaptured = [NSMutableDictionary dictionary];
         g_tabArtworkCache = [NSMutableDictionary dictionary];
+        g_urlArtworkCache = [NSMutableDictionary dictionary];
+        g_tabCachedURL = [NSMutableDictionary dictionary];
+        g_chromeCaptureURLs = [NSMutableDictionary dictionary];
         g_tabArtworkRequests = [NSMutableSet set];
         g_windowActivationQueue = dispatch_queue_create("touchpad.ring.window-activation", DISPATCH_QUEUE_SERIAL);
         g_windowEntries = collectOpenWindows();
