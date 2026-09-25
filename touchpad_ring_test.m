@@ -2946,9 +2946,16 @@ static NSInteger stableDirectionIndex(double dx, double dy, NSInteger count, NSI
     if (candidate < 0 || currentIndex < 0 || candidate == currentIndex) return candidate;
     double movementAngle = atan2(dy, dx);
     double currentAngle = (double)visualItemAngle(currentIndex, (NSUInteger)count);
+    double candidateAngle = (double)visualItemAngle(candidate, (NSUInteger)count);
     double angularDistance = fabs(remainder(movementAngle - currentAngle, 2.0 * M_PI));
-    double switchBoundary = M_PI / count + M_PI / 12.0;
-    return angularDistance <= switchBoundary ? currentIndex : candidate;
+    // Stay on the current card until the swipe clearly leaves its sector.
+    // Extra ~26 degrees on top of half-spacing makes neighboring cards sticky.
+    double switchBoundary = M_PI / (double)count + M_PI / 7.0;
+    if (angularDistance <= switchBoundary) return currentIndex;
+    double currentAlign = cos(movementAngle - currentAngle);
+    double candidateAlign = cos(movementAngle - candidateAngle);
+    if (candidateAlign < currentAlign + 0.12) return currentIndex;
+    return candidate;
 }
 
 static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouches, double timestamp, int frame) {
@@ -3063,18 +3070,28 @@ static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouche
                 g_motionAccumY += y - g_previousY;
                 g_previousX = x;
                 g_previousY = y;
+                const double kFirstSelectTravel = 0.012;
+                const double kChangeSelectTravel = 0.034;
+                const double kSelectionBias = 0.010;
+                const double kAccumClamp = 0.050;
                 double motionLength = hypot(g_motionAccumX, g_motionAccumY);
-                NSInteger candidate = motionLength >= 0.0030
-                    ? stableDirectionIndex(g_motionAccumX, g_motionAccumY, atomic_load(&g_windowEntryCount), g_selectedIndex) : -1;
-                double requiredLength = g_selectedIndex < 0 ? 0.0030 : 0.0045;
+                NSInteger count = atomic_load(&g_windowEntryCount);
+                NSInteger candidate = motionLength >= kFirstSelectTravel
+                    ? stableDirectionIndex(g_motionAccumX, g_motionAccumY, count, g_selectedIndex) : -1;
+                double requiredLength = g_selectedIndex < 0 ? kFirstSelectTravel : kChangeSelectTravel;
                 NSInteger selection = candidate >= 0 && (candidate == g_selectedIndex || motionLength >= requiredLength)
                     ? candidate : -1;
-                if (selection >= 0) {
-                    g_motionAccumX = 0.0;
-                    g_motionAccumY = 0.0;
-                }
-                if (selection >= 0 && selection != g_selectedIndex) {
+                if (selection >= 0 && selection == g_selectedIndex) {
+                    if (motionLength > kAccumClamp && motionLength > 0.0) {
+                        double scale = kAccumClamp / motionLength;
+                        g_motionAccumX *= scale;
+                        g_motionAccumY *= scale;
+                    }
+                } else if (selection >= 0 && selection != g_selectedIndex) {
                     g_selectedIndex = selection;
+                    double angle = (double)visualItemAngle(selection, (NSUInteger)MAX(count, 1));
+                    g_motionAccumX = cos(angle) * kSelectionBias;
+                    g_motionAccumY = sin(angle) * kSelectionBias;
                     fprintf(stderr, "[touch] selected entry %ld\n", (long)selection);
                     uint64_t generation = atomic_load(&g_gestureGeneration);
                     scheduleSelectionUpdate(generation, selection);
