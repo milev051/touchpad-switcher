@@ -170,9 +170,8 @@ make run-python
 
 Zaseban prototip prikazuje otvorene prozore oko centra ekrana kada detektuje tri
 prsta, bez obzira na položaj kursora. Tokom pokreta meni samo menja označenu
-stavku; podizanje prstiju aktivira izabrani prozor ili tab. Naslovi su sakriveni
-po podrazumevanom podešavanju, pa ostaju samo ikonice i thumbnailovi. Izgradi i
-pokreni ga ovako:
+stavku; podizanje prstiju aktivira izabrani prozor ili tab. Svaka kartica ima
+naslov prozora ili taba preko sličice. Izgradi i pokreni ga ovako:
 
 ```bash
 make touchpad_ring_test

@@ -83,6 +83,8 @@ extern void MTUnregisterContactFrameCallback(MTDeviceRef, MTContactCallbackFunct
 
 static NSString *chromeDisplayTitle(RingEntry *entry);
 static NSString *chromeHostFromEntry(RingEntry *entry);
+static NSString *cardLabelText(RingEntry *entry);
+static void drawCardLabel(NSString *text, NSRect cardRect, BOOL truncateMiddle);
 static NSString *tabThumbnailKey(RingEntry *entry);
 static BOOL ensureChromeAutomation(BOOL askUser);
 static void schedulePendingThumbnailCapture(NSArray<RingEntry *> *entries);
@@ -265,40 +267,8 @@ static CGFloat visualItemAngle(NSInteger i, NSUInteger count) {
                                fraction:1.0];
             [NSGraphicsContext restoreGraphicsState];
 
-            // 3. Finder folder path or tab title badge
             BOOL isFinderEntry = [entry.application.bundleIdentifier isEqualToString:@"com.apple.finder"];
-            BOOL isChromeEntry = [entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"];
-            BOOL isLabeledTabEntry = entry.isTab && entry.tabTitle.length > 0;
-            NSString *badgeText = isChromeEntry
-                ? chromeDisplayTitle(entry)
-                : (isLabeledTabEntry ? entry.tabTitle
-                                     : (entry.folderPath.length > 0 ? entry.folderPath
-                                                                    : (entry.tabTitle.length > 0 ? entry.tabTitle : entry.windowTitle)));
-            if (((isFinderEntry || isChromeEntry) && badgeText.length > 0) || isLabeledTabEntry) {
-                NSDictionary *badgeAttr = @{
-                    NSFontAttributeName: [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium],
-                    NSForegroundColorAttributeName: [NSColor colorWithCalibratedWhite:0.95 alpha:1.0]
-                };
-                NSSize textSize = [badgeText sizeWithAttributes:badgeAttr];
-                CGFloat maxBadgeW = itemPreviewWidth - 16;
-                CGFloat badgeW = MIN(maxBadgeW, textSize.width + 16);
-                CGFloat badgeH = 22.0;
-                NSRect badgeRect = NSMakeRect(previewRect.origin.x + 8, previewRect.origin.y + 8, badgeW, badgeH);
-
-                NSBezierPath *pill = [NSBezierPath bezierPathWithRoundedRect:badgeRect xRadius:5 yRadius:5];
-                [[NSColor colorWithCalibratedWhite:0.06 alpha:0.78] setFill];
-                [pill fill];
-
-                NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
-                style.lineBreakMode = NSLineBreakByTruncatingMiddle;
-                NSDictionary *drawAttr = @{
-                    NSFontAttributeName: [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium],
-                    NSForegroundColorAttributeName: [NSColor colorWithCalibratedWhite:0.95 alpha:1.0],
-                    NSParagraphStyleAttributeName: style
-                };
-                NSRect textRect = NSMakeRect(badgeRect.origin.x + 8, badgeRect.origin.y + 3, badgeW - 16, badgeH - 6);
-                [badgeText drawInRect:textRect withAttributes:drawAttr];
-            }
+            drawCardLabel(cardLabelText(entry), previewRect, isFinderEntry && entry.folderPath.length > 0);
 
             // 4. Draw clean border around the card
             [NSGraphicsContext saveGraphicsState];
@@ -396,36 +366,8 @@ static CGFloat visualItemAngle(NSInteger i, NSUInteger count) {
             [NSGraphicsContext restoreGraphicsState];
 
             [entry.icon drawInRect:iconRect];
-
-            if ([entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"]) {
-                NSString *badgeText = entry.tabTitle.length > 0 ? entry.tabTitle : entry.windowTitle;
-                if (badgeText.length > 0) {
-                    NSDictionary *badgeAttr = @{
-                        NSFontAttributeName: [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium],
-                        NSForegroundColorAttributeName: [NSColor colorWithCalibratedWhite:0.95 alpha:1.0]
-                    };
-                    NSSize textSize = [badgeText sizeWithAttributes:badgeAttr];
-                    CGFloat maxBadgeW = NSWidth(iconCardRect) - 16;
-                    CGFloat badgeW = MIN(maxBadgeW, textSize.width + 16);
-                    CGFloat badgeH = 22.0;
-                    NSRect badgeRect = NSMakeRect(iconCardRect.origin.x + 8,
-                                                  iconCardRect.origin.y + 8, badgeW, badgeH);
-                    NSBezierPath *pill = [NSBezierPath bezierPathWithRoundedRect:badgeRect xRadius:5 yRadius:5];
-                    [[NSColor colorWithCalibratedWhite:0.06 alpha:0.78] setFill];
-                    [pill fill];
-
-                    NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
-                    style.lineBreakMode = NSLineBreakByTruncatingMiddle;
-                    NSDictionary *drawAttr = @{
-                        NSFontAttributeName: [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium],
-                        NSForegroundColorAttributeName: [NSColor colorWithCalibratedWhite:0.95 alpha:1.0],
-                        NSParagraphStyleAttributeName: style
-                    };
-                    NSRect textRect = NSMakeRect(badgeRect.origin.x + 8, badgeRect.origin.y + 3,
-                                                 badgeW - 16, badgeH - 6);
-                    [badgeText drawInRect:textRect withAttributes:drawAttr];
-                }
-            }
+            BOOL isFinderIcon = [entry.application.bundleIdentifier isEqualToString:@"com.apple.finder"];
+            drawCardLabel(cardLabelText(entry), iconCardRect, isFinderIcon && entry.folderPath.length > 0);
 
             [NSGraphicsContext saveGraphicsState];
             NSBezierPath *iconBorderPath = [NSBezierPath bezierPathWithRoundedRect:iconCardRect xRadius:8.0 yRadius:8.0];
@@ -1046,6 +988,50 @@ static NSString *chromeDisplayTitle(RingEntry *entry) {
     }
     title = visibleTabTitle(title);
     return title.length ? title : @"Chrome tab";
+}
+
+static NSString *cardLabelText(RingEntry *entry) {
+    if ([entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"]) {
+        return chromeDisplayTitle(entry);
+    }
+    if (entry.folderPath.length) return entry.folderPath;
+    NSString *title = entry.tabTitle.length ? entry.tabTitle : (entry.windowTitle ?: @"");
+    title = visibleTabTitle(title);
+    NSString *appName = entry.application.localizedName;
+    if (appName.length && title.length) {
+        NSString *suffix = [NSString stringWithFormat:@" - %@", appName];
+        if ([title hasSuffix:suffix] && title.length > suffix.length) {
+            title = [title substringToIndex:title.length - suffix.length];
+        }
+    }
+    if (title.length) return title;
+    return appName.length ? appName : @"Window";
+}
+
+static void drawCardLabel(NSString *text, NSRect cardRect, BOOL truncateMiddle) {
+    if (!text.length) return;
+    NSDictionary *measure = @{
+        NSFontAttributeName: [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium],
+        NSForegroundColorAttributeName: [NSColor colorWithCalibratedWhite:0.95 alpha:1.0]
+    };
+    NSSize textSize = [text sizeWithAttributes:measure];
+    CGFloat maxBadgeW = MAX(24.0, NSWidth(cardRect) - 16.0);
+    CGFloat badgeW = MIN(maxBadgeW, textSize.width + 16.0);
+    CGFloat badgeH = 22.0;
+    NSRect badgeRect = NSMakeRect(NSMinX(cardRect) + 8.0, NSMinY(cardRect) + 8.0, badgeW, badgeH);
+    NSBezierPath *pill = [NSBezierPath bezierPathWithRoundedRect:badgeRect xRadius:5.0 yRadius:5.0];
+    [[NSColor colorWithCalibratedWhite:0.06 alpha:0.78] setFill];
+    [pill fill];
+    NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
+    style.lineBreakMode = truncateMiddle ? NSLineBreakByTruncatingMiddle : NSLineBreakByTruncatingTail;
+    NSDictionary *drawAttr = @{
+        NSFontAttributeName: [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium],
+        NSForegroundColorAttributeName: [NSColor colorWithCalibratedWhite:0.95 alpha:1.0],
+        NSParagraphStyleAttributeName: style
+    };
+    NSRect textRect = NSMakeRect(NSMinX(badgeRect) + 8.0, NSMinY(badgeRect) + 3.0,
+                                 badgeW - 16.0, badgeH - 6.0);
+    [text drawInRect:textRect withAttributes:drawAttr];
 }
 
 static NSString *chromeHostFromEntry(RingEntry *entry) {
