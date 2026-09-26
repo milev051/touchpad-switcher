@@ -6,7 +6,6 @@
 #import <CoreFoundation/CoreFoundation.h>
 #import <ImageIO/ImageIO.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
-#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <math.h>
 #include <float.h>
 #include <os/lock.h>
@@ -2196,13 +2195,9 @@ static const size_t kThumbnailPixelHeight = 384;
 static NSData *encodedThumbnailFromCGImage(CGImageRef image) {
     if (!image) return nil;
     NSMutableData *data = [NSMutableData data];
-    CFStringRef type = (__bridge CFStringRef)UTTypeWebP.identifier;
-    CGImageDestinationRef dest = CGImageDestinationCreateWithData((__bridge CFMutableDataRef)data, type, 1, NULL);
-    if (!dest) {
-        data = [NSMutableData data];
-        dest = CGImageDestinationCreateWithData((__bridge CFMutableDataRef)data,
-                                               (__bridge CFStringRef)@"public.jpeg", 1, NULL);
-    }
+    // This Mac cannot write WebP via ImageIO. JPEG keeps the cache small.
+    CGImageDestinationRef dest = CGImageDestinationCreateWithData(
+        (__bridge CFMutableDataRef)data, (__bridge CFStringRef)@"public.jpeg", 1, NULL);
     if (!dest) return nil;
     NSDictionary *props = @{
         (id)kCGImageDestinationLossyCompressionQuality: @0.72
@@ -2941,6 +2936,14 @@ static NSInteger directionIndex(double dx, double dy, NSInteger count) {
     return bestIndex;
 }
 
+static NSInteger selectionForLift(void) {
+    if (g_selectedIndex >= 0) return g_selectedIndex;
+    NSInteger count = atomic_load(&g_windowEntryCount);
+    double len = hypot(g_motionAccumX, g_motionAccumY);
+    if (count <= 0 || len < 0.005) return -1;
+    return directionIndex(g_motionAccumX, g_motionAccumY, count);
+}
+
 static NSInteger stableDirectionIndex(double dx, double dy, NSInteger count, NSInteger currentIndex) {
     NSInteger candidate = directionIndex(dx, dy, count);
     if (candidate < 0 || currentIndex < 0 || candidate == currentIndex) return candidate;
@@ -3027,7 +3030,7 @@ static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouche
                 CFRelease(cursorEvent);
             }
             uint64_t generation = atomic_fetch_add(&g_gestureGeneration, 1) + 1;
-            fprintf(stderr, "[touch] three-finger gesture started\n");
+            NSLog(@"[touch] three-finger gesture started");
             dispatch_async(dispatch_get_main_queue(), ^{ showRing(generation); });
         } else if (gestureActive && !atomic_load(&g_gestureEnding)) {
             // Keep the overlay and input suppression active while any of the
@@ -3044,7 +3047,7 @@ static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouche
                         if (generation != atomic_load(&g_gestureGeneration) ||
                             !atomic_load(&g_gestureActive) || atomic_load(&g_activeTouchCount) != 0 ||
                             atomic_exchange(&g_gestureEnding, true)) return;
-                        finishGesture(generation, g_selectedIndex);
+                        finishGesture(generation, selectionForLift());
                     });
                 }
             } else {
@@ -3054,7 +3057,7 @@ static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouche
 
             if (shouldEnd) {
                 atomic_store(&g_gestureEnding, true);
-                NSInteger selection = (activeCount == 0 || activeCount < 3) ? g_selectedIndex : -1;
+                NSInteger selection = (activeCount == 0 || activeCount < 3) ? selectionForLift() : -1;
                 uint64_t generation = atomic_load(&g_gestureGeneration);
                 dispatch_async(dispatch_get_main_queue(), ^{
                     NSInteger finalSelection = (fourFingerAbortGeneration == generation) ? -1 : selection;
@@ -3097,6 +3100,43 @@ static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouche
     }
     return 0;
 }
+
+static void startMultitouchDevices(void) {
+    if (g_devices) {
+        for (CFIndex i = 0; i < CFArrayGetCount(g_devices); i++) {
+            MTDeviceRef device = (MTDeviceRef)CFArrayGetValueAtIndex(g_devices, i);
+            MTDeviceStop(device);
+            MTUnregisterContactFrameCallback(device, ringTouchCallback);
+        }
+        CFRelease(g_devices);
+        g_devices = NULL;
+    }
+    g_devices = MTDeviceCreateList();
+    if (!g_devices || CFArrayGetCount(g_devices) == 0) {
+        NSLog(@"[touch] No Multitouch devices found");
+        return;
+    }
+    for (CFIndex i = 0; i < CFArrayGetCount(g_devices); i++) {
+        MTDeviceRef device = (MTDeviceRef)CFArrayGetValueAtIndex(g_devices, i);
+        MTRegisterContactFrameCallback(device, ringTouchCallback);
+        MTDeviceStart(device, 0);
+    }
+    NSLog(@"[touch] listening on %ld trackpad device(s)", (long)CFArrayGetCount(g_devices));
+}
+
+@interface TouchpadWakeObserver : NSObject
+@end
+@implementation TouchpadWakeObserver
+- (void)didWake:(NSNotification *)notification {
+    (void)notification;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSLog(@"[touch] wake: restarting trackpad listeners");
+        startMultitouchDevices();
+    });
+}
+@end
+
+static TouchpadWakeObserver *g_wakeObserver;
 
 static void handleSignal(int signalNumber) {
     (void)signalNumber;
@@ -3185,17 +3225,22 @@ int main(int argc, const char *argv[]) {
         printf("Place three fingers and move toward a direction to select. Lift to activate the selected window.\n");
         printf("Press Ctrl-C to stop. Three-finger drag should be disabled for a clean test.\n");
         fflush(stdout);
-        g_devices = MTDeviceCreateList();
+        startMultitouchDevices();
         if (!g_devices || CFArrayGetCount(g_devices) == 0) {
             fprintf(stderr, "[ERROR] No Multitouch devices found.\n");
             return 1;
         }
+        g_wakeObserver = [TouchpadWakeObserver new];
+        NSNotificationCenter *workspaceCenter = NSWorkspace.sharedWorkspace.notificationCenter;
+        [workspaceCenter addObserver:g_wakeObserver
+                            selector:@selector(didWake:)
+                                name:NSWorkspaceDidWakeNotification
+                              object:nil];
+        [workspaceCenter addObserver:g_wakeObserver
+                            selector:@selector(didWake:)
+                                name:NSWorkspaceScreensDidWakeNotification
+                              object:nil];
         g_windowScanQueue = dispatch_queue_create("touchpad.ring.window-scan", DISPATCH_QUEUE_SERIAL);
-        for (CFIndex i = 0; i < CFArrayGetCount(g_devices); i++) {
-            MTDeviceRef device = (MTDeviceRef)CFArrayGetValueAtIndex(g_devices, i);
-            MTRegisterContactFrameCallback(device, ringTouchCallback);
-            MTDeviceStart(device, 0);
-        }
         g_scanTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_windowScanQueue);
         dispatch_source_set_timer(g_scanTimer,
                                   dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
