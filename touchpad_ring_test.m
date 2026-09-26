@@ -96,6 +96,8 @@ static BOOL ensureChromeAutomation(BOOL askUser);
 static void schedulePendingThumbnailCapture(NSArray<RingEntry *> *entries);
 static void scheduleChromeBackgroundPrefetch(NSArray<RingEntry *> *entries);
 static void scheduleChromeTabArtwork(NSArray<RingEntry *> *entries);
+static void captureVisibleChromeTab(CGWindowID windowID, NSString *tabKey);
+static void noteChromeSelectionChanges(NSArray<RingEntry *> *entries);
 
 @interface RingView : NSView
 @property(nonatomic, copy) NSArray<RingEntry *> *entries;
@@ -438,6 +440,8 @@ static NSMutableDictionary<NSNumber *, NSNumber *> *g_thumbnailFailureUntil;
 static NSMutableDictionary<NSNumber *, NSNumber *> *g_thumbnailFailureCount;
 static NSMutableDictionary<NSNumber *, NSNumber *> *g_chromeWindowLastCapture;
 static NSMutableDictionary<NSNumber *, NSString *> *g_chromeCaptureTabKeys;
+static NSMutableDictionary<NSNumber *, NSString *> *g_lastSelectedChromeTabKeys;
+static NSMutableSet<NSString *> *g_chromeForceCaptureKeys;
 static NSMutableSet<NSNumber *> *g_thumbnailRequests;
 static NSMutableSet<NSString *> *g_tabThumbnailRequests;
 static NSMutableDictionary<NSString *, NSNumber *> *g_tabLastCaptured;
@@ -961,6 +965,24 @@ static void finishGesture(uint64_t generation, NSInteger selection) {
     NSString *chromeTabKey = captureChromeAfterRaise ? [tabThumbnailKey(entry) copy] : nil;
     CGWindowID chromeWindowID = entry.windowID;
     dispatch_async(g_windowActivationQueue, ^{
+        NSString *leavingKey = nil;
+        CGWindowID leavingWindow = kCGNullWindowID;
+        @synchronized ([NSMutableDictionary class]) {
+            NSRunningApplication *front = NSWorkspace.sharedWorkspace.frontmostApplication;
+            for (RingEntry *current in g_windowEntries) {
+                if (!current.isTab || !current.isSelectedTab) continue;
+                if (![current.application.bundleIdentifier isEqualToString:@"com.google.Chrome"]) continue;
+                if (front && current.application.processIdentifier != front.processIdentifier) continue;
+                NSString *key = tabThumbnailKey(current);
+                if (chromeTabKey.length && [key isEqualToString:chromeTabKey]) continue;
+                leavingKey = [key copy];
+                leavingWindow = current.windowID;
+                break;
+            }
+        }
+        if (leavingKey.length && leavingWindow != kCGNullWindowID) {
+            captureVisibleChromeTab(leavingWindow, leavingKey);
+        }
         raiseWindowForEntry(entry, generation);
         if (!chromeTabKey.length) return;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 450 * NSEC_PER_MSEC),
@@ -2264,6 +2286,75 @@ static CGImageRef captureWindowImage(SCWindow *window) {
     return result;
 }
 
+static void rememberChromeTabScreenshot(CGWindowID windowID, NSString *tabKey, NSData *data) {
+    if (!tabKey.length || !data.length) return;
+    @synchronized ([NSMutableDictionary class]) {
+        g_tabThumbnailCache[tabKey] = data;
+        if (!g_tabLastCaptured) g_tabLastCaptured = [NSMutableDictionary dictionary];
+        g_tabLastCaptured[tabKey] = @(NSProcessInfo.processInfo.systemUptime);
+        if (windowID != kCGNullWindowID) {
+            if (!g_chromeWindowLastCapture) g_chromeWindowLastCapture = [NSMutableDictionary dictionary];
+            g_chromeWindowLastCapture[@(windowID)] = @(NSProcessInfo.processInfo.systemUptime);
+        }
+        for (RingEntry *entry in g_windowEntries) {
+            if ([tabThumbnailKey(entry) isEqualToString:tabKey]) {
+                applyThumbnailDataToEntry(entry, data);
+            }
+        }
+    }
+}
+
+static void captureVisibleChromeTab(CGWindowID windowID, NSString *tabKey) {
+    if (windowID == kCGNullWindowID || !tabKey.length || !CGPreflightScreenCaptureAccess()) return;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    __block NSData *encoded = nil;
+    [SCShareableContent getShareableContentExcludingDesktopWindows:YES onScreenWindowsOnly:NO
+                                                completionHandler:^(SCShareableContent *content, NSError *error) {
+        if (content) {
+            for (SCWindow *window in content.windows) {
+                if (window.windowID != windowID) continue;
+                CGImageRef image = captureWindowImage(window);
+                if (image) {
+                    encoded = encodedThumbnailFromCGImage(image);
+                    CGImageRelease(image);
+                }
+                break;
+            }
+        } else if (error) {
+            NSLog(@"[Chrome thumbnails] leave-capture list failed: %@", error.localizedDescription);
+        }
+        dispatch_semaphore_signal(done);
+    }];
+    dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1200 * NSEC_PER_MSEC)));
+    if (encoded) {
+        rememberChromeTabScreenshot(windowID, tabKey, encoded);
+        NSLog(@"[Chrome thumbnails] saved last shot %@", tabKey);
+    }
+}
+
+static void noteChromeSelectionChanges(NSArray<RingEntry *> *entries) {
+    @synchronized ([NSMutableDictionary class]) {
+        if (!g_lastSelectedChromeTabKeys) g_lastSelectedChromeTabKeys = [NSMutableDictionary dictionary];
+        if (!g_chromeForceCaptureKeys) g_chromeForceCaptureKeys = [NSMutableSet set];
+        NSMutableDictionary<NSNumber *, NSString *> *latest = [NSMutableDictionary dictionary];
+        for (RingEntry *entry in entries) {
+            if (!entry.isTab || !entry.isSelectedTab) continue;
+            if (![entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"]) continue;
+            if (entry.windowID == kCGNullWindowID) continue;
+            NSNumber *windowKey = @(entry.windowID);
+            NSString *tabKey = tabThumbnailKey(entry);
+            latest[windowKey] = tabKey;
+            NSString *previous = g_lastSelectedChromeTabKeys[windowKey];
+            if (previous.length && ![previous isEqualToString:tabKey]) {
+                [g_chromeForceCaptureKeys addObject:tabKey];
+                g_chromeWindowLastCapture[windowKey] = @0;
+                [g_tabLastCaptured removeObjectForKey:tabKey];
+            }
+        }
+        g_lastSelectedChromeTabKeys = latest;
+    }
+}
+
 static NSString *chromeActiveTabID(NSString *windowID) {
     if (!validChromeID(windowID)) return nil;
     NSString *source = [NSString stringWithFormat:
@@ -2588,7 +2679,11 @@ static void capturePendingThumbnails(NSArray<RingEntry *> *entries,
                 NSString *tabKey = tabThumbnailKey(entry);
                 NSTimeInterval lastAttempt = g_chromeWindowLastCapture[key].doubleValue;
                 NSTimeInterval lastCaptured = tabLastCapturedSnapshot[tabKey].doubleValue;
-                BOOL captureDue = !tabThumbnailSnapshot[tabKey] || (now - lastCaptured >= 8.0);
+                BOOL justBecameSelected = [g_chromeForceCaptureKeys containsObject:tabKey];
+                if (justBecameSelected) [g_chromeForceCaptureKeys removeObject:tabKey];
+                NSTimeInterval refresh = entry.application.isActive ? 3.0 : 8.0;
+                BOOL captureDue = justBecameSelected || !tabThumbnailSnapshot[tabKey] ||
+                    (now - lastCaptured >= refresh);
                 if (entry.windowID != kCGNullWindowID && captureDue &&
                     now - lastAttempt >= 0.5 &&
                     !thumbnailCaptureIsCoolingDown(key) &&
@@ -3134,6 +3229,30 @@ static void startMultitouchDevices(void) {
         startMultitouchDevices();
     });
 }
+
+- (void)appearanceChanged:(NSNotification *)notification {
+    (void)notification;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSLog(@"[thumbnails] light/dark change; recapturing visible windows");
+        @synchronized ([NSMutableDictionary class]) {
+            [g_thumbnailCache removeAllObjects];
+            [g_tabThumbnailCache removeAllObjects];
+            [g_tabLastCaptured removeAllObjects];
+            [g_chromeWindowLastCapture removeAllObjects];
+            if (!g_chromeForceCaptureKeys) g_chromeForceCaptureKeys = [NSMutableSet set];
+            [g_chromeForceCaptureKeys removeAllObjects];
+            for (RingEntry *entry in g_windowEntries) {
+                entry.thumbnailData = nil;
+                entry.thumbnail = nil;
+                if (entry.isTab && entry.isSelectedTab &&
+                    [entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"]) {
+                    [g_chromeForceCaptureKeys addObject:tabThumbnailKey(entry)];
+                }
+            }
+        }
+        if (g_thumbnailPreviewsEnabled) schedulePendingThumbnailCapture(g_windowEntries);
+    });
+}
 @end
 
 static TouchpadWakeObserver *g_wakeObserver;
@@ -3187,6 +3306,8 @@ int main(int argc, const char *argv[]) {
         g_tabThumbnailCache = [NSMutableDictionary dictionary];
         g_chromeWindowLastCapture = [NSMutableDictionary dictionary];
         g_chromeCaptureTabKeys = [NSMutableDictionary dictionary];
+        g_lastSelectedChromeTabKeys = [NSMutableDictionary dictionary];
+        g_chromeForceCaptureKeys = [NSMutableSet set];
         g_thumbnailRequests = [NSMutableSet set];
         g_tabThumbnailRequests = [NSMutableSet set];
         g_tabLastCaptured = [NSMutableDictionary dictionary];
@@ -3240,6 +3361,10 @@ int main(int argc, const char *argv[]) {
                             selector:@selector(didWake:)
                                 name:NSWorkspaceScreensDidWakeNotification
                               object:nil];
+        [[NSDistributedNotificationCenter defaultCenter] addObserver:g_wakeObserver
+                                                            selector:@selector(appearanceChanged:)
+                                                                name:@"AppleInterfaceThemeChangedNotification"
+                                                              object:nil];
         g_windowScanQueue = dispatch_queue_create("touchpad.ring.window-scan", DISPATCH_QUEUE_SERIAL);
         g_scanTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_windowScanQueue);
         dispatch_source_set_timer(g_scanTimer,
@@ -3260,6 +3385,7 @@ int main(int argc, const char *argv[]) {
                 NSArray<RingEntry *> *entries = collectOpenWindows();
                 pruneThumbnailCaches(entries);
                 populateThumbnailsFromCache(entries);
+                noteChromeSelectionChanges(entries);
                 dispatch_async(dispatch_get_main_queue(), ^{
                     if (!atomic_load(&g_gestureActive)) {
                         g_windowEntries = entries;
