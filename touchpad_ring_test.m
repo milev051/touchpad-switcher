@@ -2308,7 +2308,7 @@ static void captureVisibleChromeTab(CGWindowID windowID, NSString *tabKey) {
     if (windowID == kCGNullWindowID || !tabKey.length || !CGPreflightScreenCaptureAccess()) return;
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     __block NSData *encoded = nil;
-    [SCShareableContent getShareableContentExcludingDesktopWindows:YES onScreenWindowsOnly:NO
+    [SCShareableContent getShareableContentExcludingDesktopWindows:YES onScreenWindowsOnly:YES
                                                 completionHandler:^(SCShareableContent *content, NSError *error) {
         if (content) {
             for (SCWindow *window in content.windows) {
@@ -2456,116 +2456,9 @@ static void scheduleChromeTabArtwork(NSArray<RingEntry *> *entries) {
 }
 
 static void scheduleChromeBackgroundPrefetch(NSArray<RingEntry *> *entries) {
-    if (atomic_load(&g_gestureActive) || atomic_load(&g_activeTouchCount) != 0 ||
-        atomic_load(&g_chromePrefetchActive) || chromePrefetchIsHeld() ||
-        !CGPreflightScreenCaptureAccess()) return;
-
-    RingEntry *target = nil;
-    @synchronized ([NSMutableDictionary class]) {
-        if (NSProcessInfo.processInfo.systemUptime < g_chromePrefetchRetryAfter) return;
-        for (RingEntry *entry in entries) {
-            if (!entry.isTab || !entry.chromeWindowID.length || !entry.chromeTabID.length ||
-                entry.isSelectedTab || entry.windowID == kCGNullWindowID ||
-                entry.application.isActive ||
-                g_tabThumbnailCache[tabThumbnailKey(entry)] ||
-                g_tabArtworkCache[tabThumbnailKey(entry)]) continue;
-            target = entry;
-            break;
-        }
-    }
-    if (!target || atomic_exchange(&g_chromePrefetchActive, true)) return;
-    if (!g_chromePrefetchQueue) {
-        g_chromePrefetchQueue = dispatch_queue_create("touchpad.ring.chrome-prefetch", DISPATCH_QUEUE_SERIAL);
-    }
-
-    NSString *windowID = [target.chromeWindowID copy];
-    NSString *tabID = [target.chromeTabID copy];
-    NSString *tabKey = [tabThumbnailKey(target) copy];
-    CGWindowID cgWindowID = target.windowID;
-    NSRunningApplication *chrome = target.application;
-    [SCShareableContent getShareableContentExcludingDesktopWindows:YES onScreenWindowsOnly:NO
-                                                completionHandler:^(SCShareableContent *content, NSError *error) {
-        if (error || !content) {
-            finishChromePrefetch(NO);
-            return;
-        }
-        SCWindow *shareableWindow = nil;
-        for (SCWindow *candidate in content.windows) {
-            if (candidate.windowID == cgWindowID) { shareableWindow = candidate; break; }
-        }
-        if (!shareableWindow) {
-            finishChromePrefetch(NO);
-            return;
-        }
-        SCWindow *windowToCapture = shareableWindow;
-        dispatch_async(g_chromePrefetchQueue, ^{
-            @autoreleasepool {
-                NSData *thumbnailData = nil;
-                NSString *originalTabID = nil;
-                BOOL switched = NO;
-                @synchronized ([NSAppleScript class]) {
-                    if (!chrome.isActive && !atomic_load(&g_gestureActive) &&
-                        atomic_load(&g_activeTouchCount) == 0 && !chromePrefetchIsHeld()) {
-                        originalTabID = chromeActiveTabID(windowID);
-                        if (originalTabID.length && ![originalTabID isEqualToString:tabID]) {
-                            switched = setChromeActiveTab(windowID, tabID);
-                            @try {
-                                if (switched) {
-                                    usleep(250000); // Let Chrome render the newly selected tab.
-                                    if (!chrome.isActive && !atomic_load(&g_gestureActive) &&
-                                        atomic_load(&g_activeTouchCount) == 0 &&
-                                        !chromePrefetchIsHeld() &&
-                                        [chromeActiveTabID(windowID) isEqualToString:tabID]) {
-                                        CGImageRef image = captureWindowImage(windowToCapture);
-                                        if (image) {
-                                            if ([chromeActiveTabID(windowID) isEqualToString:tabID]) {
-                                                thumbnailData = encodedThumbnailFromCGImage(image);
-                                            }
-                                            CGImageRelease(image);
-                                        }
-                                    }
-                                }
-                            } @finally {
-                                // Never restore if the user picked a tab while this
-                                // capture was in flight. That restore was sending
-                                // every card back to the previously active tab.
-                                if (!chromePrefetchIsHeld() &&
-                                    [chromeActiveTabID(windowID) isEqualToString:tabID]) {
-                                    if (!setChromeActiveTab(windowID, originalTabID)) {
-                                        NSLog(@"[Chrome thumbnails] Could not restore tab in window %@", windowID);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if (thumbnailData) {
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        BOOL didCache = NO;
-                        @synchronized ([NSMutableDictionary class]) {
-                            for (RingEntry *entry in g_windowEntries) {
-                                if ([tabThumbnailKey(entry) isEqualToString:tabKey]) {
-                                    g_tabThumbnailCache[tabKey] = thumbnailData;
-                                    g_tabLastCaptured[tabKey] = @(NSProcessInfo.processInfo.systemUptime);
-                                    applyThumbnailDataToEntry(entry, thumbnailData);
-                                    didCache = YES;
-                                }
-                            }
-                            if (g_ringView) {
-                                g_ringView.entries = g_windowEntries;
-                                [g_ringView setNeedsDisplay:YES];
-                            }
-                        }
-                        if (didCache) NSLog(@"[Chrome thumbnails] prefetched %@", tabKey);
-                        finishChromePrefetch(didCache);
-                    });
-                } else {
-                    finishChromePrefetch(NO);
-                }
-            }
-        });
-    }];
+    (void)entries;
 }
+
 
 static void releaseTabThumbnailRequest(RingEntry *entry) {
     NSString *key = tabThumbnailKey(entry);
@@ -2662,6 +2555,17 @@ static void capturePendingThumbnails(NSArray<RingEntry *> *entries,
     NSMutableSet<NSNumber *> *wantedChromeIDs = [NSMutableSet set];
     NSMutableArray<RingEntry *> *wantedTabs = [NSMutableArray array];
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    NSMutableSet<NSNumber *> *onScreenIDs = [NSMutableSet set];
+    CFArrayRef onScreenWindows = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+    if (onScreenWindows) {
+        CFIndex onScreenCount = CFArrayGetCount(onScreenWindows);
+        for (CFIndex i = 0; i < onScreenCount; i++) {
+            NSDictionary *info = (__bridge NSDictionary *)CFArrayGetValueAtIndex(onScreenWindows, i);
+            NSNumber *wid = info[(id)kCGWindowNumber];
+            if (wid) [onScreenIDs addObject:wid];
+        }
+        CFRelease(onScreenWindows);
+    }
 
     NSCountedSet<NSNumber *> *tabWindowIDCounts = [NSCountedSet set];
     for (RingEntry *entry in entries) {
@@ -2672,6 +2576,7 @@ static void capturePendingThumbnails(NSArray<RingEntry *> *entries,
 
     for (RingEntry *entry in entries) {
         NSNumber *key = @(entry.windowID);
+        if (entry.windowID != kCGNullWindowID && ![onScreenIDs containsObject:key]) continue;
         if (entry.isTab) {
             BOOL isChromeTab = [entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"];
             if (isChromeTab) {
@@ -2753,7 +2658,7 @@ static void capturePendingThumbnails(NSArray<RingEntry *> *entries,
         }
         return;
     }
-    [SCShareableContent getShareableContentExcludingDesktopWindows:YES onScreenWindowsOnly:NO
+    [SCShareableContent getShareableContentExcludingDesktopWindows:YES onScreenWindowsOnly:YES
                                                 completionHandler:^(SCShareableContent *content, NSError *error) {
         if (error || !content) {
             NSLog(@"ScreenCaptureKit could not list windows: %@", error.localizedDescription ?: @"no access");
