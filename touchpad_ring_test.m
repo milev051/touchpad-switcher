@@ -985,7 +985,7 @@ static void finishGesture(uint64_t generation, NSInteger selection) {
         }
         raiseWindowForEntry(entry, generation);
         if (!chromeTabKey.length) return;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 450 * NSEC_PER_MSEC),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 700 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
             if (atomic_load(&g_gestureActive)) return;
             @synchronized ([NSMutableDictionary class]) {
@@ -1367,14 +1367,22 @@ static void syncChromeTabMediaWithCurrentURL(RingEntry *entry) {
         entry.thumbnail = nil;
     }
     g_tabCachedURL[tabKey] = url ?: @"";
-    if (!entry.thumbnailData) {
-        NSString *artKey = chromeArtworkCacheKey(entry.tabURL);
-        NSData *shared = (artKey.length && g_urlArtworkCache) ? g_urlArtworkCache[artKey] : nil;
-        if (shared) {
-            g_tabArtworkCache[tabKey] = shared;
-            applyThumbnailDataToEntry(entry, shared);
-        }
+}
+
+static void applyBestChromeThumbnail(RingEntry *entry) {
+    NSString *tabKey = tabThumbnailKey(entry);
+    NSData *real = g_tabThumbnailCache[tabKey];
+    if (real.length) {
+        applyThumbnailDataToEntry(entry, real);
+        return;
     }
+    NSData *art = g_tabArtworkCache[tabKey];
+    if (!art) {
+        NSString *artKey = chromeArtworkCacheKey(entry.tabURL);
+        art = (artKey.length && g_urlArtworkCache) ? g_urlArtworkCache[artKey] : nil;
+        if (art) g_tabArtworkCache[tabKey] = art;
+    }
+    if (art.length) applyThumbnailDataToEntry(entry, art);
 }
 
 static NSString *tabThumbnailKey(RingEntry *entry) {
@@ -1399,10 +1407,7 @@ static void populateThumbnailsFromCache(NSArray<RingEntry *> *entries) {
                 // Drop stale screenshots when the tab navigates, then prefer a
                 // real capture and fall back to a site preview for the new URL.
                 syncChromeTabMediaWithCurrentURL(entry);
-                NSString *tabKey = tabThumbnailKey(entry);
-                if (!entry.thumbnailData) {
-                    applyThumbnailDataToEntry(entry, g_tabThumbnailCache[tabKey] ?: g_tabArtworkCache[tabKey]);
-                }
+                applyBestChromeThumbnail(entry);
             } else if (!entry.thumbnailData) {
                 NSString *tabKey = tabThumbnailKey(entry);
                 if (g_tabThumbnailCache && g_tabThumbnailCache[tabKey]) {
@@ -2586,8 +2591,9 @@ static void capturePendingThumbnails(NSArray<RingEntry *> *entries,
                 NSTimeInterval lastCaptured = tabLastCapturedSnapshot[tabKey].doubleValue;
                 BOOL justBecameSelected = [g_chromeForceCaptureKeys containsObject:tabKey];
                 if (justBecameSelected) [g_chromeForceCaptureKeys removeObject:tabKey];
+                BOOL hasRealShot = tabThumbnailSnapshot[tabKey] != nil;
                 NSTimeInterval refresh = entry.application.isActive ? 3.0 : 8.0;
-                BOOL captureDue = justBecameSelected || !tabThumbnailSnapshot[tabKey] ||
+                BOOL captureDue = justBecameSelected || !hasRealShot ||
                     (now - lastCaptured >= refresh);
                 if (entry.windowID != kCGNullWindowID && captureDue &&
                     now - lastAttempt >= 0.5 &&
