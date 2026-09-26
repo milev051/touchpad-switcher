@@ -146,8 +146,8 @@ static _Atomic(bool) g_settingFinderTabsOneCard = true;
 static _Atomic(bool) g_settingHideMenuIcon = false;
 static _Atomic(bool) g_settingSoundEffects = false;
 static _Atomic(int) g_settingBlurRadius = 15;   // 0 turns the blur off
-typedef enum { PointerStyleArrow = 0, PointerStyleDot = 1 } PointerStyle;
-static _Atomic(int) g_settingPointerStyle = PointerStyleArrow;
+typedef enum { PointerStyleArrow = 0, PointerStyleDot = 1, PointerStyleHidden = 2 } PointerStyle;
+static _Atomic(int) g_settingPointerStyle = PointerStyleHidden;
 static NSSound *g_selectSound;
 static NSSound *g_activateSound;
 
@@ -313,9 +313,7 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
 
 - (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
 
-- (CGPathRef)newSliceFrom:(CGFloat)startAngle to:(CGFloat)endAngle center:(NSPoint)center {
-    // Longer than the screen diagonal, so the slice always ends at the edge.
-    CGFloat reach = hypot(NSWidth(self.bounds), NSHeight(self.bounds));
+- (CGPathRef)newSliceFrom:(CGFloat)startAngle to:(CGFloat)endAngle center:(NSPoint)center reach:(CGFloat)reach {
     CGMutablePathRef path = CGPathCreateMutable();
     CGPathMoveToPoint(path, NULL, center.x, center.y);
     // A fixed number of points lets Core Animation morph one slice into the next.
@@ -338,16 +336,19 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
     }
     _lastMidAngle = midAngle;
 
-    CGPathRef path = [self newSliceFrom:startAngle to:endAngle center:center];
+    // Longer than the screen diagonal, so the slice always ends at the edge.
+    CGFloat fullReach = hypot(NSWidth(self.bounds), NSHeight(self.bounds));
+    CGPathRef path = [self newSliceFrom:startAngle to:endAngle center:center reach:fullReach];
     CGPathRef fromPath = NULL;
     if (_visible) {
         CAShapeLayer *shown = (CAShapeLayer *)_mask.presentationLayer;
         fromPath = CGPathRetain(shown.path ?: _mask.path);
+    } else {
+        // A new light shoots out of the center toward its card.
+        fromPath = [self newSliceFrom:startAngle to:endAngle center:center reach:kHubRadius];
     }
     CGFloat width = MAX(1.0, NSWidth(self.bounds)), height = MAX(1.0, NSHeight(self.bounds));
     CGFloat glowRadius = MAX(width, height) * 0.6;
-    float fromOpacity = ((CALayer *)_gradient.presentationLayer ?: _gradient).opacity;
-
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     _gradient.frame = self.layer.bounds;
@@ -362,18 +363,12 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
         CABasicAnimation *sweep = [CABasicAnimation animationWithKeyPath:@"path"];
         sweep.fromValue = (__bridge id)fromPath;
         sweep.toValue = (__bridge id)path;
-        sweep.duration = 0.12;
+        sweep.duration = _visible ? 0.12 : 0.14;
         sweep.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
         [_mask addAnimation:sweep forKey:@"sweep"];
         CGPathRelease(fromPath);
     }
-    if (!_visible || fromOpacity < 1.0) {
-        CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
-        fade.fromValue = @(fromOpacity);
-        fade.toValue = @1.0;
-        fade.duration = 0.15;
-        [_gradient addAnimation:fade forKey:@"fade"];
-    }
+    [_gradient removeAnimationForKey:@"fade"];
     _visible = YES;
     CGPathRelease(path);
 }
@@ -405,10 +400,31 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
     return self;
 }
 
+// Area of one card including its shadow, glow and label.
+- (NSRect)redrawRectForCard:(NSInteger)index {
+    NSUInteger count = self.entries.count;
+    if (index < 0 || index >= (NSInteger)count) return NSZeroRect;
+    CGFloat radiusX = self.ringRadius, radiusY = self.ringRadius;
+    ringEllipseRadii(count, self.ringRadius, &radiusX, &radiusY);
+    CGFloat previewWidth = safeCardWidthForRing(count, radiusX, radiusY, NSWidth(self.bounds)) * 0.94;
+    CGFloat rawAngle = rawItemAngle(index, count);
+    NSPoint itemCenter = NSMakePoint(self.anchorPoint.x + cos(rawAngle) * radiusX,
+                                     self.anchorPoint.y + sin(rawAngle) * radiusY);
+    CGFloat height = previewWidth * 0.60;
+    return NSInsetRect(NSMakeRect(itemCenter.x - previewWidth / 2.0, itemCenter.y - height / 2.0, previewWidth, height),
+                       -30.0, -30.0);
+}
+
 - (void)setSelectedIndex:(NSInteger)selectedIndex {
     if (_selectedIndex == selectedIndex) return;
+    NSInteger previousIndex = _selectedIndex;
     _selectedIndex = selectedIndex;
-    [self setNeedsDisplay:YES];
+    // Only the two cards and the hub change. Redrawing every thumbnail across
+    // a Retina screen on each change made the selection feel sluggish.
+    [self setNeedsDisplayInRect:[self redrawRectForCard:previousIndex]];
+    [self setNeedsDisplayInRect:[self redrawRectForCard:selectedIndex]];
+    [self setNeedsDisplayInRect:NSMakeRect(self.anchorPoint.x - kHubRadius - 6.0, self.anchorPoint.y - kHubRadius - 6.0,
+                                           (kHubRadius + 6.0) * 2.0, (kHubRadius + 6.0) * 2.0)];
     SectorGlowView *glow = (SectorGlowView *)self.glowView;
     NSUInteger count = self.entries.count;
     if (selectedIndex >= 0 && selectedIndex < (NSInteger)count) {
@@ -459,6 +475,7 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
         arrow.shadowOffset = CGSizeZero;
         arrow.affineTransform = CGAffineTransformMakeRotation((CGFloat)M_PI_2);
         [holder.layer addSublayer:arrow];
+        holder.hidden = atomic_load(&g_settingPointerStyle) == PointerStyleHidden;
         [self addSubview:holder];
         self.pointerView = holder;
         self.pointerArrow = arrow;
@@ -520,6 +537,10 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
         CGFloat rawAngle = rawItemAngle(i, count);
         NSPoint itemCenter = NSMakePoint(center.x + cos(rawAngle) * radiusX,
                                          center.y + sin(rawAngle) * radiusY);
+        CGFloat cardHeight = previewWidth * 0.60;
+        NSRect cardArea = NSInsetRect(NSMakeRect(itemCenter.x - previewWidth / 2.0, itemCenter.y - cardHeight / 2.0,
+                                                 previewWidth, cardHeight), -30.0, -30.0);
+        if (!NSIntersectsRect(cardArea, dirtyRect)) continue;
         BOOL selected = ((NSInteger)i == self.selectedIndex);
         RingEntry *entry = self.entries[i];
         NSImage *thumbnail = resolvedThumbnail(entry);
@@ -1027,18 +1048,6 @@ static void setPanelBlur(int radius) {
     if (g_panel) CGSSetWindowBackgroundBlurRadius(CGSMainConnectionID(), g_panel.windowNumber, radius);
 }
 
-// The blur grows over about 0.2 s instead of snapping in.
-static void animatePanelBlur(uint64_t generation, int radius) {
-    const int steps = 6;
-    for (int step = 1; step <= steps; step++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(step * 33 * NSEC_PER_MSEC)),
-                       dispatch_get_main_queue(), ^{
-            if (atomic_load(&g_ringShownGeneration) != generation || !atomic_load(&g_ringOverlayVisible)) return;
-            setPanelBlur(radius * step / steps);
-        });
-    }
-}
-
 static CGFloat fittedRingRadius(NSSize size, NSUInteger count, CGFloat *centerOffsetY) {
     CGFloat radius = MIN(size.width * 0.44, (size.height - 100.0) / 2.0);
     if (count == 0) {
@@ -1085,11 +1094,10 @@ static void showRing(uint64_t generation) {
     g_ringView.ringRadius = fittedRadius;
     [g_glowView hideAnimated:NO];
     [g_ringView movePointerTo:NSZeroPoint];
-    // The backdrop fades in and the blur grows; the cards show at once.
+    // Blur and dimming appear at once with the cards, no fade.
     int blurRadius = atomic_load(&g_settingBlurRadius);
-    setPanelBlur(0);
+    setPanelBlur(blurRadius);
     g_dimView.layer.backgroundColor = [NSColor colorWithCalibratedWhite:0.02 alpha:blurRadius > 0 ? 0.12 : 0.27].CGColor;
-    g_dimView.alphaValue = 0.0;
     for (RingEntry *entry in g_windowEntries) (void)resolvedThumbnail(entry);
     [g_ringView setNeedsDisplay:YES];
     // Avoid forcing a synchronous draw before the panel is ordered onscreen.
@@ -1097,12 +1105,6 @@ static void showRing(uint64_t generation) {
     atomic_store(&g_ringOverlayVisible, true);
     [g_panel orderFrontRegardless];
     atomic_store(&g_ringShownGeneration, generation);
-    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
-        context.duration = 0.2;
-        context.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
-        g_dimView.animator.alphaValue = 1.0;
-    } completionHandler:nil];
-    if (blurRadius > 0) animatePanelBlur(generation, blurRadius);
     fprintf(stderr, "[ring] overlay shown at screen center; %lu entries\n", (unsigned long)g_windowEntries.count);
 
     // The cached ring is already on screen. Fresh pictures of the visible
@@ -3473,6 +3475,25 @@ static void pruneThumbnailCaches(NSArray<RingEntry *> *entries) {
 // trackpad widths, so both axes move alike.
 static void moveRingPointer(double dx, double dy, NSInteger count) {
     const double kGain = 1.0 / 0.08;   // about 8% of the trackpad width reaches the ring
+    // Motion back toward the center counts triple, so changing your mind
+    // (up, then down; left, then right) is a short move. Motion around the
+    // ring keeps the normal speed, so picking a neighbor stays precise.
+    const double kInwardBoost = 3.0;
+    double length = hypot(g_pointerX, g_pointerY);
+    if (length > kPointerDeadZone) {
+        double unitX = g_pointerX / length, unitY = g_pointerY / length;
+        double radial = dx * unitX + dy * unitY;
+        if (radial < 0) {
+            // Boosted up to the center; motion past it continues at normal speed.
+            double inward = -radial;
+            double toCenter = length / kGain;
+            double boosted = inward * kInwardBoost <= toCenter
+                ? inward * kInwardBoost
+                : toCenter + (inward - toCenter / kInwardBoost);
+            dx += (inward - boosted) * unitX;
+            dy += (inward - boosted) * unitY;
+        }
+    }
     g_pointerX += dx * kGain;
     g_pointerY += dy * kGain;
 
@@ -3738,7 +3759,8 @@ static void loadSettings(void) {
     atomic_store(&g_settingSoundEffects, settingBool(CFSTR("SoundEffects"), NO));
     Boolean pointerValid = false;
     CFIndex pointerStyle = CFPreferencesGetAppIntegerValue(CFSTR("PointerStyle"), kSettingsID, &pointerValid);
-    atomic_store(&g_settingPointerStyle, pointerValid && pointerStyle == PointerStyleDot ? PointerStyleDot : PointerStyleArrow);
+    atomic_store(&g_settingPointerStyle, pointerValid && pointerStyle >= PointerStyleArrow && pointerStyle <= PointerStyleHidden
+                                             ? (int)pointerStyle : PointerStyleHidden);
     Boolean blurValid = false;
     CFIndex blurRadius = CFPreferencesGetAppIntegerValue(CFSTR("BlurRadius"), kSettingsID, &blurValid);
     atomic_store(&g_settingBlurRadius, blurValid ? (int)MIN(MAX(blurRadius, 0), 40) : 15);
@@ -3800,7 +3822,7 @@ static void loadSettings(void) {
     titles.selectedSegment = atomic_load(&g_settingCardTitles);
 
     NSTextField *pointerLabel = [self noteWithText:@"Pokazivač"];
-    NSSegmentedControl *pointer = [NSSegmentedControl segmentedControlWithLabels:@[@"Strelica", @"Krug"]
+    NSSegmentedControl *pointer = [NSSegmentedControl segmentedControlWithLabels:@[@"Strelica", @"Krug", @"Nevidljiv"]
                                                                     trackingMode:NSSegmentSwitchTrackingSelectOne
                                                                           target:self
                                                                           action:@selector(pointerStyleChanged:)];
@@ -3887,7 +3909,7 @@ static void loadSettings(void) {
 }
 
 - (void)pointerStyleChanged:(NSSegmentedControl *)control {
-    int style = control.selectedSegment == PointerStyleDot ? PointerStyleDot : PointerStyleArrow;
+    int style = (int)MIN(MAX(control.selectedSegment, PointerStyleArrow), PointerStyleHidden);
     atomic_store(&g_settingPointerStyle, style);
     CFNumberRef value = CFNumberCreate(NULL, kCFNumberIntType, &style);
     storeSetting(CFSTR("PointerStyle"), value);
