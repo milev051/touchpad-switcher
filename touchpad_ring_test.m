@@ -116,14 +116,16 @@ static void noteChromeSelectionChanges(NSArray<RingEntry *> *entries);
 @property(nonatomic, strong) NSView *pointerView;
 @property(nonatomic, strong) CAShapeLayer *pointerArrow;
 @property(nonatomic, weak) NSView *glowView;
+@property(nonatomic) NSPoint lastPointer;
 - (void)movePointerTo:(NSPoint)ringPoint;
 - (void)resetPointer;
 @end
 
-// Light for the selected direction. It sits under the cards and reaches the
-// edge of the screen; changing the selection sweeps it to the new sector.
+// Light in the direction of the fingers. It sits under the cards, reaches the
+// edge of the screen and follows the finger direction smoothly, while the
+// card selection moves in steps.
 @interface SectorGlowView : NSView
-- (void)showSectorFrom:(CGFloat)startAngle to:(CGFloat)endAngle center:(NSPoint)center;
+- (void)pointAt:(CGFloat)angle width:(CGFloat)width center:(NSPoint)center;
 - (void)hideAnimated:(BOOL)animated;
 @end
 
@@ -141,7 +143,8 @@ static const double kPointerReach = 0.80;
 #define kSettingsID CFSTR("com.milev.touchpad-switcher")
 typedef enum { CardTitlesAll = 0, CardTitlesFinderAndChrome = 1, CardTitlesNone = 2 } CardTitlesMode;
 static _Atomic(int) g_settingCardTitles = CardTitlesAll;
-static _Atomic(bool) g_settingPauseVideo = true;
+static _Atomic(bool) g_settingAutoPauseMedia = true;
+static _Atomic(bool) g_settingAutoResumeMedia = true;
 static _Atomic(bool) g_settingFinderTabsOneCard = true;
 static _Atomic(bool) g_settingHideMenuIcon = false;
 static _Atomic(bool) g_settingSoundEffects = false;
@@ -288,7 +291,6 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
 @implementation SectorGlowView {
     CAGradientLayer *_gradient;
     CAShapeLayer *_mask;
-    CGFloat _lastMidAngle;
     BOOL _visible;
 }
 
@@ -316,7 +318,6 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
 - (CGPathRef)newSliceFrom:(CGFloat)startAngle to:(CGFloat)endAngle center:(NSPoint)center reach:(CGFloat)reach {
     CGMutablePathRef path = CGPathCreateMutable();
     CGPathMoveToPoint(path, NULL, center.x, center.y);
-    // A fixed number of points lets Core Animation morph one slice into the next.
     for (int step = 0; step <= 24; step++) {
         CGFloat angle = startAngle + (endAngle - startAngle) * step / 24.0;
         CGPathAddLineToPoint(path, NULL, center.x + cos(angle) * reach, center.y + sin(angle) * reach);
@@ -325,52 +326,39 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
     return path;
 }
 
-- (void)showSectorFrom:(CGFloat)startAngle to:(CGFloat)endAngle center:(NSPoint)center {
-    CGFloat midAngle = (startAngle + endAngle) / 2.0;
-    if (_visible) {
-        // Sweep the short way around instead of through the center.
-        CGFloat shift = round((_lastMidAngle - midAngle) / (2.0 * M_PI)) * 2.0 * M_PI;
-        startAngle += shift;
-        endAngle += shift;
-        midAngle += shift;
-    }
-    _lastMidAngle = midAngle;
-
+- (void)pointAt:(CGFloat)angle width:(CGFloat)width center:(NSPoint)center {
     // Longer than the screen diagonal, so the slice always ends at the edge.
-    CGFloat fullReach = hypot(NSWidth(self.bounds), NSHeight(self.bounds));
-    CGPathRef path = [self newSliceFrom:startAngle to:endAngle center:center reach:fullReach];
-    CGPathRef fromPath = NULL;
-    if (_visible) {
-        CAShapeLayer *shown = (CAShapeLayer *)_mask.presentationLayer;
-        fromPath = CGPathRetain(shown.path ?: _mask.path);
-    } else {
-        // A new light shoots out of the center toward its card.
-        fromPath = [self newSliceFrom:startAngle to:endAngle center:center reach:kHubRadius];
-    }
-    CGFloat width = MAX(1.0, NSWidth(self.bounds)), height = MAX(1.0, NSHeight(self.bounds));
-    CGFloat glowRadius = MAX(width, height) * 0.6;
+    CGFloat reach = hypot(NSWidth(self.bounds), NSHeight(self.bounds));
+    CGPathRef path = [self newSliceFrom:angle - width / 2.0 to:angle + width / 2.0 center:center reach:reach];
+    BOOL appearing = !_visible;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    _gradient.frame = self.layer.bounds;
-    _mask.frame = _gradient.bounds;
-    _gradient.startPoint = CGPointMake(center.x / width, center.y / height);
-    _gradient.endPoint = CGPointMake((center.x + glowRadius) / width, (center.y + glowRadius) / height);
+    if (appearing) {
+        CGFloat viewWidth = MAX(1.0, NSWidth(self.bounds)), viewHeight = MAX(1.0, NSHeight(self.bounds));
+        CGFloat glowRadius = MAX(viewWidth, viewHeight) * 0.6;
+        [_gradient removeAllAnimations];
+        _gradient.frame = self.layer.bounds;
+        _gradient.startPoint = CGPointMake(center.x / viewWidth, center.y / viewHeight);
+        _gradient.endPoint = CGPointMake((center.x + glowRadius) / viewWidth, (center.y + glowRadius) / viewHeight);
+        // Scale around the ring center, so the light can grow out of it.
+        _mask.bounds = _gradient.bounds;
+        _mask.anchorPoint = CGPointMake(center.x / viewWidth, center.y / viewHeight);
+        _mask.position = center;
+    }
     _mask.path = path;
     _gradient.opacity = 1.0;
     [CATransaction commit];
-
-    if (fromPath) {
-        CABasicAnimation *sweep = [CABasicAnimation animationWithKeyPath:@"path"];
-        sweep.fromValue = (__bridge id)fromPath;
-        sweep.toValue = (__bridge id)path;
-        sweep.duration = _visible ? 0.12 : 0.14;
-        sweep.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
-        [_mask addAnimation:sweep forKey:@"sweep"];
-        CGPathRelease(fromPath);
-    }
-    [_gradient removeAnimationForKey:@"fade"];
-    _visible = YES;
     CGPathRelease(path);
+    if (appearing) {
+        // A new light shoots out of the center toward its card.
+        CABasicAnimation *grow = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+        grow.fromValue = @0.05;
+        grow.toValue = @1.0;
+        grow.duration = 0.14;
+        grow.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+        [_mask addAnimation:grow forKey:@"grow"];
+    }
+    _visible = YES;
 }
 
 - (void)hideAnimated:(BOOL)animated {
@@ -425,16 +413,26 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
     [self setNeedsDisplayInRect:[self redrawRectForCard:selectedIndex]];
     [self setNeedsDisplayInRect:NSMakeRect(self.anchorPoint.x - kHubRadius - 6.0, self.anchorPoint.y - kHubRadius - 6.0,
                                            (kHubRadius + 6.0) * 2.0, (kHubRadius + 6.0) * 2.0)];
-    SectorGlowView *glow = (SectorGlowView *)self.glowView;
-    NSUInteger count = self.entries.count;
-    if (selectedIndex >= 0 && selectedIndex < (NSInteger)count) {
-        CGFloat startAngle = 0, endAngle = 0;
-        cardSector(selectedIndex, count, &startAngle, &endAngle);
-        [glow showSectorFrom:startAngle to:endAngle center:self.anchorPoint];
+    if (selectedIndex >= 0 && selectedIndex < (NSInteger)self.entries.count) {
+        [self updateGlow];
         playRingSound(g_selectSound);
     } else {
-        [glow hideAnimated:YES];
+        [(SectorGlowView *)self.glowView hideAnimated:YES];
     }
+}
+
+// The light points where the fingers point, as wide as the selected card's
+// sector.
+- (void)updateGlow {
+    NSUInteger count = self.entries.count;
+    NSInteger selectedIndex = self.selectedIndex;
+    if (selectedIndex < 0 || selectedIndex >= (NSInteger)count) return;
+    CGFloat startAngle = 0, endAngle = 0;
+    cardSector(selectedIndex, count, &startAngle, &endAngle);
+    NSPoint pointer = self.lastPointer;
+    CGFloat angle = hypot(pointer.x, pointer.y) > 0.001 ? (CGFloat)atan2(pointer.y, pointer.x)
+                                                        : (startAngle + endAngle) / 2.0;
+    [(SectorGlowView *)self.glowView pointAt:angle width:endAngle - startAngle center:self.anchorPoint];
 }
 
 // The pointer (an arrow that turns to point away from the center, or a dot)
@@ -480,6 +478,8 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
         self.pointerView = holder;
         self.pointerArrow = arrow;
     }
+    self.lastPointer = ringPoint;
+    [self updateGlow];
     // At the very center there is no direction; start pointing up.
     CGFloat angle = hypot(ringPoint.x, ringPoint.y) > 0.001 ? (CGFloat)atan2(ringPoint.y, ringPoint.x) : (CGFloat)M_PI_2;
     // The arrow never hides the icon in the hub: it rides on the hub's edge
@@ -1122,7 +1122,7 @@ static void showRing(uint64_t generation) {
 
 static AXUIElementRef findTabButton(AXUIElementRef parent, NSString *title, int depth);
 static BOOL setChromeActiveTabWithIndex(NSString *windowID, NSString *tabID, NSUInteger tabIndex1Based,
-                                        BOOL pauseLeavingTab);
+                                        BOOL pauseLeavingTab, BOOL resumeTargetTab);
 
 static void raiseWindowForEntry(RingEntry *entry, uint64_t generation) {
     if (generation != atomic_load(&g_gestureGeneration)) return;
@@ -1133,7 +1133,8 @@ static void raiseWindowForEntry(RingEntry *entry, uint64_t generation) {
     if (generation == atomic_load(&g_gestureGeneration) && entry.isTab &&
         entry.chromeWindowID.length) {
         BOOL switched = setChromeActiveTabWithIndex(entry.chromeWindowID, entry.chromeTabID,
-                                                    entry.tabIndex + 1, atomic_load(&g_settingPauseVideo));
+                                                    entry.tabIndex + 1, atomic_load(&g_settingAutoPauseMedia),
+                                                    atomic_load(&g_settingAutoResumeMedia));
         if (switched) return;
         NSLog(@"[Chrome tabs] could not activate window %@ tab %@ index %lu",
               entry.chromeWindowID, entry.chromeTabID, (unsigned long)(entry.tabIndex + 1));
@@ -2135,7 +2136,27 @@ static BOOL ensureChromeAutomation(BOOL askUser) {
     return NO;
 }
 
-static BOOL runChromeSwitchScript(NSString *source) {
+// Media that this app paused is marked in the page, so coming back resumes
+// only what was playing, never something the user had stopped.
+static NSString *const kPauseMediaJS =
+    @"document.querySelectorAll('video,audio').forEach(function(m){if(!m.paused&&!m.ended){m.pause();m.dataset.touchpadSwitcherPaused='1';}})";
+static NSString *const kResumeMediaJS =
+    @"document.querySelectorAll('video,audio').forEach(function(m){if(m.dataset.touchpadSwitcherPaused==='1'){delete m.dataset.touchpadSwitcherPaused;m.play();}})";
+
+// AppleScript that runs JavaScript in one tab. Chrome allows it only with
+// View > Developer > Allow JavaScript from Apple Events; the result is noted
+// in jsStatus so the menu can show that hint.
+static NSString *chromeJavaScriptStep(NSString *tabExpression, NSString *javaScript) {
+    return [NSString stringWithFormat:
+        @"try\n"
+         "execute %@ javascript \"%@\"\n"
+         "if jsStatus is \"ok\" then set jsStatus to \"ok-js\"\n"
+         "on error errorMessage\n"
+         "if errorMessage contains \"JavaScript\" then set jsStatus to \"ok-js-blocked\"\n"
+         "end try\n", tabExpression, javaScript];
+}
+
+static BOOL runChromeScript(NSString *source) {
     NSAppleScript *script = [[NSAppleScript alloc] initWithSource:source];
     NSDictionary *error = nil;
     NSAppleEventDescriptor *result = nil;
@@ -2143,56 +2164,80 @@ static BOOL runChromeSwitchScript(NSString *source) {
         result = [script executeAndReturnError:&error];
     }
     if (error) {
-        NSLog(@"[Chrome tabs] switch script failed: %@", error[NSAppleScriptErrorMessage] ?: error);
+        NSLog(@"[Chrome tabs] script failed: %@", error[NSAppleScriptErrorMessage] ?: error);
         return NO;
     }
     NSString *status = result.stringValue ?: @"";
     if ([status isEqualToString:@"ok-js-blocked"]) {
         if (!atomic_exchange(&g_chromeJavaScriptBlocked, true)) {
-            NSLog(@"[Chrome tabs] video pause needs View > Developer > Allow JavaScript from Apple Events in Chrome");
+            NSLog(@"[Chrome tabs] media control needs View > Developer > Allow JavaScript from Apple Events in Chrome");
         }
-    } else if ([status isEqualToString:@"ok-paused"]) {
+    } else if ([status isEqualToString:@"ok-js"]) {
         atomic_store(&g_chromeJavaScriptBlocked, false);
     }
     return [status hasPrefix:@"ok"];
 }
 
+// Pause or resume media in the tab on screen in Chrome's front window. Used
+// when Chrome itself is left or entered.
+static dispatch_queue_t g_mediaQueue;
+static void runChromeMediaScript(NSString *javaScript) {
+    if (!g_mediaQueue) g_mediaQueue = dispatch_queue_create("touchpad.ring.media", DISPATCH_QUEUE_SERIAL);
+    NSString *source = [NSString stringWithFormat:
+        @"tell application \"Google Chrome\"\n"
+         "try\n"
+         "set jsStatus to \"ok\"\n"
+         "if (count of windows) is 0 then return jsStatus\n"
+         "%@"
+         "return jsStatus\n"
+         "end try\n"
+         "end tell\n"
+         "return \"failed\"", chromeJavaScriptStep(@"(active tab of window 1)", javaScript)];
+    dispatch_async(g_mediaQueue, ^{
+        if (ensureChromeAutomation(NO)) runChromeScript(source);
+    });
+}
+
 static BOOL setChromeActiveTabWithIndex(NSString *windowID, NSString *tabID, NSUInteger tabIndex1Based,
-                                        BOOL pauseLeavingTab) {
+                                        BOOL pauseLeavingTab, BOOL resumeTargetTab) {
     if (!validChromeID(windowID)) return NO;
     BOOL haveTabID = validChromeID(tabID);
     if (!haveTabID && tabIndex1Based == 0) return NO;
-    // The tab that was showing in this window pauses its video and audio once
-    // it is replaced. Chrome only runs this with Allow JavaScript from Apple
-    // Events turned on; otherwise the switch still happens.
-    NSString *pauseStep = pauseLeavingTab
-        ? @"if leavingID is not (id of active tab of targetWindow) then\n"
-           "try\n"
-           "execute (first tab of targetWindow whose id is leavingID) javascript \"document.querySelectorAll('video,audio').forEach(function(m){m.pause()})\"\n"
-           "return \"ok-paused\"\n"
-           "on error errorMessage\n"
-           "if errorMessage contains \"JavaScript\" then return \"ok-js-blocked\"\n"
-           "end try\n"
-           "end if\n"
-        : @"";
+    // The tab being replaced pauses its media; the tab being opened resumes
+    // what this app paused there earlier. Either step failing never blocks the
+    // switch itself.
+    NSMutableString *afterSwitch = [NSMutableString string];
+    if (pauseLeavingTab) {
+        [afterSwitch appendFormat:@"if leavingID is not (id of active tab of targetWindow) then\n%@end if\n",
+         chromeJavaScriptStep(@"(first tab of targetWindow whose id is leavingID)", kPauseMediaJS)];
+    }
+    if (resumeTargetTab) {
+        [afterSwitch appendString:chromeJavaScriptStep(@"(active tab of targetWindow)", kResumeMediaJS)];
+    }
     // Chrome exposes window and tab ids as text, not integers. Comparing a
     // text id with an unquoted number never matches, so the previously
     // selected tab (often YouTube) stayed in front for every card.
     NSMutableString *source = [NSMutableString stringWithFormat:
         @"tell application \"Google Chrome\"\n"
          "try\n"
+         "set jsStatus to \"ok\"\n"
          "set targetWindow to first window whose id is \"%@\"\n"
-         "set index of targetWindow to 1\n"
          "set leavingID to id of active tab of targetWindow\n", windowID];
+    if (pauseLeavingTab) {
+        // Moving to another Chrome window leaves the front window's tab too.
+        [source appendFormat:@"if (id of window 1) is not (id of targetWindow) then\n%@end if\n",
+         chromeJavaScriptStep(@"(active tab of window 1)", kPauseMediaJS)];
+    }
+    [source appendString:@"set index of targetWindow to 1\n"];
     if (haveTabID) {
         [source appendFormat:
          @"repeat with tabIndex from 1 to count of tabs of targetWindow\n"
           "if (id of tab tabIndex of targetWindow) as text is \"%@\" then\n"
           "set active tab index of targetWindow to tabIndex\n"
           "%@"
-          "return \"ok\"\n"
+          "return jsStatus\n"
           "end if\n"
-          "end repeat\n", tabID, pauseStep];
+          "end repeat\n", tabID, afterSwitch];
     }
     if (tabIndex1Based > 0) {
         [source appendFormat:
@@ -2200,15 +2245,15 @@ static BOOL setChromeActiveTabWithIndex(NSString *windowID, NSString *tabID, NSU
           "if %@ <= tabCount then\n"
           "set active tab index of targetWindow to %@\n"
           "%@"
-          "return \"ok\"\n"
-          "end if\n", @(tabIndex1Based), @(tabIndex1Based), pauseStep];
+          "return jsStatus\n"
+          "end if\n", @(tabIndex1Based), @(tabIndex1Based), afterSwitch];
     }
     [source appendString:
-         @"return \"ok\"\n"
+         @"return jsStatus\n"
           "end try\n"
           "end tell\n"
           "return \"failed\""];
-    return runChromeSwitchScript(source);
+    return runChromeScript(source);
 }
 
 static NSArray<RingEntry *> *collectOpenWindows(void) {
@@ -3688,6 +3733,8 @@ static void startMultitouchDevices(void) {
     NSLog(@"[touch] listening on %ld trackpad device(s)", (long)CFArrayGetCount(g_devices));
 }
 
+static BOOL g_frontWasChrome = NO;
+
 @interface TouchpadWakeObserver : NSObject
 @end
 @implementation TouchpadWakeObserver
@@ -3697,6 +3744,27 @@ static void startMultitouchDevices(void) {
         NSLog(@"[touch] wake: restarting trackpad listeners");
         startMultitouchDevices();
     });
+}
+
+// Leaving Chrome pauses the tab on screen, coming back resumes it. Our own
+// menu bar panel does not count as leaving.
+- (void)applicationActivated:(NSNotification *)notification {
+    NSRunningApplication *app = notification.userInfo[NSWorkspaceApplicationKey];
+    if (!app || app.processIdentifier == getpid()) return;
+    BOOL isChrome = [app.bundleIdentifier isEqualToString:@"com.google.Chrome"];
+    if (g_frontWasChrome && !isChrome && atomic_load(&g_settingAutoPauseMedia)) {
+        runChromeMediaScript(kPauseMediaJS);
+    }
+    if (isChrome && !g_frontWasChrome && atomic_load(&g_settingAutoResumeMedia)) {
+        // A ring selection switches the tab right after activating Chrome;
+        // resume whatever tab is on screen once that is done.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+            if ([NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier isEqualToString:@"com.google.Chrome"]) {
+                runChromeMediaScript(kResumeMediaJS);
+            }
+        });
+    }
+    g_frontWasChrome = isChrome;
 }
 
 // The app being left is still on screen for a moment, so its picture matches
@@ -3754,7 +3822,10 @@ static void loadSettings(void) {
     CFIndex titles = CFPreferencesGetAppIntegerValue(CFSTR("CardTitles"), kSettingsID, &valid);
     atomic_store(&g_settingCardTitles, valid && titles >= CardTitlesAll && titles <= CardTitlesNone
                                            ? (int)titles : CardTitlesAll);
-    atomic_store(&g_settingPauseVideo, settingBool(CFSTR("PauseVideoOnTabSwitch"), YES));
+    // AutoPauseMedia replaces PauseVideoOnTabSwitch and keeps its old value.
+    atomic_store(&g_settingAutoPauseMedia, settingBool(CFSTR("AutoPauseMedia"),
+                                                       settingBool(CFSTR("PauseVideoOnTabSwitch"), YES)));
+    atomic_store(&g_settingAutoResumeMedia, settingBool(CFSTR("AutoResumeMedia"), YES));
     atomic_store(&g_settingFinderTabsOneCard, settingBool(CFSTR("FinderTabsAsOneCard"), YES));
     atomic_store(&g_settingSoundEffects, settingBool(CFSTR("SoundEffects"), NO));
     Boolean pointerValid = false;
@@ -3830,11 +3901,16 @@ static void loadSettings(void) {
     pointer.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
     pointer.selectedSegment = atomic_load(&g_settingPointerStyle);
 
-    NSButton *pauseVideo = [NSButton checkboxWithTitle:@"Pauziraj video kad promeniš Chrome tab"
+    NSButton *pauseVideo = [NSButton checkboxWithTitle:@"Automatski zaustavi video kad izađeš"
                                                 target:self action:@selector(pauseVideoChanged:)];
-    pauseVideo.state = atomic_load(&g_settingPauseVideo) ? NSControlStateValueOn : NSControlStateValueOff;
+    pauseVideo.state = atomic_load(&g_settingAutoPauseMedia) ? NSControlStateValueOn : NSControlStateValueOff;
+    NSButton *resumeVideo = [NSButton checkboxWithTitle:@"Automatski pokreni video kad se vratiš"
+                                                 target:self action:@selector(resumeVideoChanged:)];
+    resumeVideo.state = atomic_load(&g_settingAutoResumeMedia) ? NSControlStateValueOn : NSControlStateValueOff;
+    NSTextField *resumeNote = [self noteWithText:
+        @"Važi za Chrome: pri prelasku na drugi tab i pri izlasku iz Chrome-a. Pokreće se samo video koji je ova aplikacija zaustavila."];
     self.javaScriptHint = [self noteWithText:
-        @"Chrome odbija pauzu. U Chrome-u uključi View > Developer > Allow JavaScript from Apple Events."];
+        @"Chrome ne dozvoljava upravljanje videom. U Chrome-u uključi View > Developer > Allow JavaScript from Apple Events."];
     self.javaScriptHint.textColor = NSColor.systemOrangeColor;
 
     NSButton *finderTabs = [NSButton checkboxWithTitle:@"Finder tabovi jednog prozora kao jedna kartica"
@@ -3862,7 +3938,7 @@ static void loadSettings(void) {
     NSButton *quit = [NSButton buttonWithTitle:@"Ugasi Touchpad Switcher" target:NSApp action:@selector(terminate:)];
     quit.controlSize = NSControlSizeSmall;
 
-    NSStackView *stack = [NSStackView stackViewWithViews:@[title, titlesLabel, titles, pointerLabel, pointer, pauseVideo, self.javaScriptHint,
+    NSStackView *stack = [NSStackView stackViewWithViews:@[title, titlesLabel, titles, pointerLabel, pointer, pauseVideo, resumeVideo, resumeNote, self.javaScriptHint,
                                                            finderTabs, sounds, self.blurLabel, blur, separator,
                                                            hideIcon, hideNote, quit]];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
@@ -3872,10 +3948,16 @@ static void loadSettings(void) {
     [stack setCustomSpacing:4 afterView:titlesLabel];
     [stack setCustomSpacing:4 afterView:pointerLabel];
     [stack setCustomSpacing:4 afterView:pauseVideo];
+    [stack setCustomSpacing:4 afterView:resumeVideo];
+    [stack setCustomSpacing:4 afterView:resumeNote];
     [stack setCustomSpacing:4 afterView:hideIcon];
     [stack setCustomSpacing:4 afterView:self.blurLabel];
     [stack setCustomSpacing:14 afterView:hideNote];
     [stack.widthAnchor constraintEqualToConstant:340].active = YES;
+    // A row wider than the panel was centered and lost its left margin.
+    for (NSView *row in stack.arrangedSubviews) {
+        [row.widthAnchor constraintLessThanOrEqualToConstant:312].active = YES;
+    }
     [separator.widthAnchor constraintEqualToConstant:312].active = YES;
     return stack;
 }
@@ -3893,7 +3975,7 @@ static void loadSettings(void) {
         self.popover.contentSize = controller.view.fittingSize;
         self.popover.behavior = NSPopoverBehaviorTransient;
     }
-    self.javaScriptHint.hidden = !(atomic_load(&g_chromeJavaScriptBlocked) && atomic_load(&g_settingPauseVideo));
+    [self updateJavaScriptHint];
     self.popover.contentSize = self.popover.contentViewController.view.fittingSize;
     NSButton *button = self.statusItem.button;
     [self.popover showRelativeToRect:button.bounds ofView:button preferredEdge:NSRectEdgeMinY];
@@ -3919,9 +4001,21 @@ static void loadSettings(void) {
 
 - (void)pauseVideoChanged:(NSButton *)button {
     BOOL on = button.state == NSControlStateValueOn;
-    atomic_store(&g_settingPauseVideo, on);
-    storeSetting(CFSTR("PauseVideoOnTabSwitch"), on ? kCFBooleanTrue : kCFBooleanFalse);
-    self.javaScriptHint.hidden = !(on && atomic_load(&g_chromeJavaScriptBlocked));
+    atomic_store(&g_settingAutoPauseMedia, on);
+    storeSetting(CFSTR("AutoPauseMedia"), on ? kCFBooleanTrue : kCFBooleanFalse);
+    [self updateJavaScriptHint];
+}
+
+- (void)resumeVideoChanged:(NSButton *)button {
+    BOOL on = button.state == NSControlStateValueOn;
+    atomic_store(&g_settingAutoResumeMedia, on);
+    storeSetting(CFSTR("AutoResumeMedia"), on ? kCFBooleanTrue : kCFBooleanFalse);
+    [self updateJavaScriptHint];
+}
+
+- (void)updateJavaScriptHint {
+    self.javaScriptHint.hidden = !(atomic_load(&g_chromeJavaScriptBlocked) &&
+                                   (atomic_load(&g_settingAutoPauseMedia) || atomic_load(&g_settingAutoResumeMedia)));
     self.popover.contentSize = self.popover.contentViewController.view.fittingSize;
 }
 
@@ -4070,6 +4164,12 @@ int main(int argc, const char *argv[]) {
         [workspaceCenter addObserver:g_wakeObserver
                             selector:@selector(didWake:)
                                 name:NSWorkspaceScreensDidWakeNotification
+                              object:nil];
+        g_frontWasChrome = [NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier
+                               isEqualToString:@"com.google.Chrome"];
+        [workspaceCenter addObserver:g_wakeObserver
+                            selector:@selector(applicationActivated:)
+                                name:NSWorkspaceDidActivateApplicationNotification
                               object:nil];
         [workspaceCenter addObserver:g_wakeObserver
                             selector:@selector(applicationDeactivated:)
