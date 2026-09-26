@@ -169,9 +169,8 @@ make run-python
 ## Eksperimentalni troprstni kružni meni
 
 Zaseban prototip prikazuje otvorene prozore oko centra ekrana kada detektuje tri
-prsta, bez obzira na položaj kursora. Tokom pokreta meni samo menja označenu
-stavku; podizanje prstiju aktivira izabrani prozor ili tab. Svaka kartica ima
-naslov prozora ili taba preko sličice. Izgradi i pokreni ga ovako:
+prsta, bez obzira na položaj kursora. Svaka kartica ima naslov prozora ili taba
+preko sličice, ako je tako izabrano u meniju. Izgradi i pokreni ga ovako:
 
 ```bash
 make touchpad_ring_test
@@ -192,12 +191,52 @@ odvojene kartice. Putanja: System Settings -> Privacy & Security -> Automation
 -> Touchpad Switcher -> Google Chrome. Kratka greška se ponovo pokušava, a izbor
 taba koristi numerički Chrome ID prozora i taba. Ekran je blago zatamnjen iza
 ikonica i thumbnailova.
-Thumbnailovi se snimaju u smanjenoj rezoluciji ako aplikacija koja pokreće test
-ima dozvolu za Screen Recording. Čuvaju se privremeno u memoriji dok su prozori
-otvoreni i uklanjaju se iz keša kada se prozori zatvore. Za Chrome se slika
-čuva zasebno za svaki tab. YouTube tabovi odmah dobijaju sliku videa iz URL-a,
-bez prebacivanja taba. Aktivni tab se snima sa ekrana. Kad korisnik izabere tab
-u meniju, snimak se radi posle prelaska na taj tab. Kada Chrome nije aktivna
-aplikacija i nema dodira na trackpadu, Touchpad Switcher kratko otvori jedan tab
-bez slike, snimi ga i vrati prethodni tab. Dok je Chrome aktivan, tabovi bez
-snimka imaju karticu sa naslovom i domenom sajta.
+### Izbor kartice
+
+Pokret tri prsta pomera pokazivač (bela tačka) od centra ka karticama. Izabrana
+je kartica najbliža pokazivaču. Pokazivač ima ubrzanje kao miš: spor pokret je
+precizan i pomera ga malo, pa se lako bira između dve susedne kartice, a brz
+pokret prebacuje na drugu stranu prstena. Kad se gura dalje od kartica,
+pokazivač klizi po prstenu. Pokret gore-dole vredi isto koliko i levo-desno,
+jer se uzima prava veličina trackpada.
+
+Krug u sredini je zona za odustajanje: ako se prsti podignu dok je pokazivač u
+njoj, ništa se ne bira.
+
+### Sličice
+
+Sličice se snimaju u smanjenoj rezoluciji ako aplikacija ima dozvolu za Screen
+Recording. Čuvaju se u memoriji dok su prozori otvoreni. Novi snimak nastaje:
+
+1. kad se napusti aplikacija, dok je njen prozor još na ekranu,
+2. kad se otvori meni, za sve vidljive prozore starije od sekunde, prvo za
+   prozor koji se napušta, pa se kartice osvežavaju dok je meni otvoren,
+3. na svake 3 s za aktivnu aplikaciju i na 12 s za ostale vidljive prozore.
+
+Snimaju se samo prozori sa trenutnog desktopa. Prozor sa drugog desktopa ili
+minimizovan zadržava poslednji snimak.
+
+Za Chrome se slika čuva zasebno za svaki tab. U trenutku snimanja Touchpad
+Switcher pita Chrome koji je tab aktivan, da snimak ne završi na pogrešnom
+tabu. Tab koji nikad nije bio vidljiv ima karticu sa naslovom i domenom, a ne
+sliku sa sajta (YouTube poster se više ne koristi). YouTube snimak ostaje dok je
+isti video, i kad se promeni vreme ili pozicija u listi.
+
+### Meni u gornjoj traci
+
+Ikonica šake u gornjoj traci otvara panel sa podešavanjima:
+
+| podešavanje | šta radi | podrazumevano |
+|---|---|---|
+| Naslovi na karticama | svi prozori, samo Finder i Chrome, ili bez naslova | svi prozori |
+| Pauziraj video kad promeniš Chrome tab | tab koji se zamenjuje u istom prozoru pauzira video i zvuk | uključeno |
+| Finder tabovi jednog prozora kao jedna kartica | tabovi jednog Finder prozora daju jednu karticu, zasebni prozori ostaju zasebni | uključeno |
+| Sakrij ikonicu iz gornje trake | uklanja ikonicu | isključeno |
+
+Pauza radi preko JavaScript-a u Chrome-u, pa u Chrome-u mora biti uključeno
+**View > Developer > Allow JavaScript from Apple Events**. Bez toga se tab i
+dalje menja, a panel ispisuje upozorenje.
+
+Sakrivena ikonica se vraća kad se aplikacija ponovo otvori dok već radi (npr.
+iz Spotlight-a ili `/Applications`). Podešavanja se čuvaju pod
+`com.milev.touchpad-switcher` (`defaults read com.milev.touchpad-switcher`).

@@ -59,6 +59,7 @@ extern void MTRegisterContactFrameCallback(MTDeviceRef, MTContactCallbackFunctio
 extern void MTDeviceStart(MTDeviceRef, int);
 extern void MTDeviceStop(MTDeviceRef);
 extern void MTUnregisterContactFrameCallback(MTDeviceRef, MTContactCallbackFunction);
+extern int MTDeviceGetSensorSurfaceDimensions(MTDeviceRef, int *width, int *height);
 
 @interface RingEntry : NSObject
 @property(nonatomic, strong) NSRunningApplication *application;
@@ -95,8 +96,7 @@ static NSString *tabThumbnailKey(RingEntry *entry);
 static BOOL ensureChromeAutomation(BOOL askUser);
 static void schedulePendingThumbnailCapture(NSArray<RingEntry *> *entries);
 static void scheduleChromeBackgroundPrefetch(NSArray<RingEntry *> *entries);
-static void scheduleChromeTabArtwork(NSArray<RingEntry *> *entries);
-static void captureVisibleChromeTab(CGWindowID windowID, NSString *tabKey);
+static void refreshThumbnailsNow(pid_t onlyPID, NSTimeInterval minAge);
 static void noteChromeSelectionChanges(NSArray<RingEntry *> *entries);
 
 @interface RingView : NSView
@@ -104,7 +104,32 @@ static void noteChromeSelectionChanges(NSArray<RingEntry *> *entries);
 @property(nonatomic) NSInteger selectedIndex;
 @property(nonatomic) NSPoint anchorPoint;
 @property(nonatomic) CGFloat ringRadius;
+@property(nonatomic, strong) NSView *pointerView;
+- (void)movePointerTo:(NSPoint)ringPoint;
 @end
+
+// Pointer inside this ellipse (in ring units) selects nothing, so lifting
+// there cancels, like the center of a game emote wheel.
+static const double kPointerDeadZone = 0.32;
+
+// Settings from the menu bar panel. Stored under one ID so the bare binary
+// and the .app bundle share them; read from the scan, touch and main threads.
+#define kSettingsID CFSTR("com.milev.touchpad-switcher")
+typedef enum { CardTitlesAll = 0, CardTitlesFinderAndChrome = 1, CardTitlesNone = 2 } CardTitlesMode;
+static _Atomic(int) g_settingCardTitles = CardTitlesAll;
+static _Atomic(bool) g_settingPauseVideo = true;
+static _Atomic(bool) g_settingFinderTabsOneCard = true;
+static _Atomic(bool) g_settingHideMenuIcon = false;
+static _Atomic(bool) g_chromeJavaScriptBlocked = false;
+static BOOL g_replacedRunningInstance = NO;
+
+static BOOL shouldDrawCardLabel(RingEntry *entry) {
+    int mode = atomic_load(&g_settingCardTitles);
+    if (mode == CardTitlesNone) return NO;
+    if (mode == CardTitlesAll) return YES;
+    NSString *bundleID = entry.application.bundleIdentifier;
+    return [bundleID isEqualToString:@"com.apple.finder"] || [bundleID isEqualToString:@"com.google.Chrome"];
+}
 
 @implementation RingView (InputShield)
 - (void)scrollWheel:(NSEvent *)event { (void)event; }
@@ -197,14 +222,6 @@ static CGFloat safeCardWidthForRing(NSUInteger count, CGFloat radiusX, CGFloat r
     return low;
 }
 
-static CGFloat visualItemAngle(NSInteger i, NSUInteger count) {
-    if (count == 0) return (CGFloat)M_PI_2;
-    CGFloat radiusX = 1.0, radiusY = 1.0;
-    ringEllipseRadii(count, 100.0, &radiusX, &radiusY);
-    CGFloat rawAngle = rawItemAngle(i, count);
-    return (CGFloat)atan2(sin(rawAngle) * radiusY, cos(rawAngle) * radiusX);
-}
-
 @implementation RingView
 - (BOOL)isFlipped { return NO; }
 
@@ -214,8 +231,32 @@ static CGFloat visualItemAngle(NSInteger i, NSUInteger count) {
 }
 
 - (void)setSelectedIndex:(NSInteger)selectedIndex {
+    if (_selectedIndex == selectedIndex) return;
     _selectedIndex = selectedIndex;
     [self setNeedsDisplay:YES];
+}
+
+// The pointer is its own small layer, so following the fingers never redraws
+// the thumbnails.
+- (void)movePointerTo:(NSPoint)ringPoint {
+    if (!self.pointerView) {
+        const CGFloat size = 16.0;
+        NSView *dot = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, size, size)];
+        dot.wantsLayer = YES;
+        dot.layer.cornerRadius = size / 2.0;
+        dot.layer.backgroundColor = [NSColor colorWithCalibratedWhite:1.0 alpha:0.92].CGColor;
+        dot.layer.borderColor = [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:1.0].CGColor;
+        dot.layer.borderWidth = 2.0;
+        dot.layer.shadowColor = [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:1.0].CGColor;
+        dot.layer.shadowOpacity = 0.8;
+        dot.layer.shadowRadius = 6.0;
+        dot.layer.shadowOffset = CGSizeZero;
+        [self addSubview:dot];
+        self.pointerView = dot;
+    }
+    NSSize size = self.pointerView.frame.size;
+    [self.pointerView setFrameOrigin:NSMakePoint(self.anchorPoint.x + ringPoint.x * self.ringRadius - size.width / 2.0,
+                                                 self.anchorPoint.y + ringPoint.y * self.ringRadius - size.height / 2.0)];
 }
 
 - (void)drawRect:(NSRect)dirtyRect {
@@ -237,6 +278,15 @@ static CGFloat visualItemAngle(NSInteger i, NSUInteger count) {
     CGFloat radius = self.ringRadius;
     CGFloat radiusX = radius, radiusY = radius;
     ringEllipseRadii(count, radius, &radiusX, &radiusY);
+
+    // Faint center zone: lifting the fingers inside it cancels.
+    NSRect deadZone = NSMakeRect(center.x - radiusX * kPointerDeadZone, center.y - radiusY * kPointerDeadZone,
+                                 radiusX * kPointerDeadZone * 2.0, radiusY * kPointerDeadZone * 2.0);
+    NSBezierPath *deadZonePath = [NSBezierPath bezierPathWithOvalInRect:deadZone];
+    deadZonePath.lineWidth = 1.5;
+    [[NSColor colorWithCalibratedWhite:1.0 alpha:self.selectedIndex < 0 ? 0.30 : 0.14] setStroke];
+    [deadZonePath stroke];
+
     CGFloat cardWidth = safeCardWidthForRing(count, radiusX, radiusY, NSWidth(bounds));
     CGFloat previewWidth = cardWidth * 0.94;
     for (NSUInteger i = 0; i < count; i++) {
@@ -277,7 +327,9 @@ static CGFloat visualItemAngle(NSInteger i, NSUInteger count) {
             [NSGraphicsContext restoreGraphicsState];
 
             BOOL isFinderEntry = [entry.application.bundleIdentifier isEqualToString:@"com.apple.finder"];
-            drawCardLabel(cardLabelText(entry), previewRect, isFinderEntry && entry.folderPath.length > 0);
+            if (shouldDrawCardLabel(entry)) {
+                drawCardLabel(cardLabelText(entry), previewRect, isFinderEntry && entry.folderPath.length > 0);
+            }
 
             // 4. Draw clean border around the card
             [NSGraphicsContext saveGraphicsState];
@@ -376,7 +428,9 @@ static CGFloat visualItemAngle(NSInteger i, NSUInteger count) {
 
             [entry.icon drawInRect:iconRect];
             BOOL isFinderIcon = [entry.application.bundleIdentifier isEqualToString:@"com.apple.finder"];
-            drawCardLabel(cardLabelText(entry), iconCardRect, isFinderIcon && entry.folderPath.length > 0);
+            if (shouldDrawCardLabel(entry)) {
+                drawCardLabel(cardLabelText(entry), iconCardRect, isFinderIcon && entry.folderPath.length > 0);
+            }
 
             [NSGraphicsContext saveGraphicsState];
             NSBezierPath *iconBorderPath = [NSBezierPath bezierPathWithRoundedRect:iconCardRect xRadius:8.0 yRadius:8.0];
@@ -422,8 +476,12 @@ static _Atomic(bool) g_gestureEnding = false;
 static _Atomic(uint64_t) g_ringShownGeneration = 0;
 static double g_previousX = 0.0;
 static double g_previousY = 0.0;
-static double g_motionAccumX = 0.0;
-static double g_motionAccumY = 0.0;
+static double g_previousTimestamp = 0.0;
+// Virtual pointer in ring units: cards sit on the ellipse ringEllipseRadii(count, 1).
+static double g_pointerX = 0.0;
+static double g_pointerY = 0.0;
+static double g_pointerSpeed = 0.0;
+static double g_trackpadAspect = 0.68;
 static NSInteger g_selectedIndex = -1;
 static _Atomic(uint64_t) g_gestureGeneration = 0;
 static CGPoint g_cursorAtGestureStart = {0, 0};
@@ -445,12 +503,10 @@ static NSMutableSet<NSString *> *g_chromeForceCaptureKeys;
 static NSMutableSet<NSNumber *> *g_thumbnailRequests;
 static NSMutableSet<NSString *> *g_tabThumbnailRequests;
 static NSMutableDictionary<NSString *, NSNumber *> *g_tabLastCaptured;
-static NSMutableDictionary<NSString *, NSData *> *g_tabArtworkCache;
-static NSMutableDictionary<NSString *, NSData *> *g_urlArtworkCache;
+static NSMutableDictionary<NSNumber *, NSNumber *> *g_windowLastCaptured;
 static NSMutableDictionary<NSString *, NSString *> *g_tabCachedURL;
 static NSMutableDictionary<NSNumber *, NSString *> *g_chromeCaptureURLs;
-static NSMutableSet<NSString *> *g_tabArtworkRequests;
-static dispatch_queue_t g_tabArtworkQueue;
+static dispatch_queue_t g_liveCaptureQueue;
 static NSTimeInterval g_shareableContentRetryAfter = 0;
 static NSUInteger g_shareableContentFailureCount = 0;
 static dispatch_queue_t g_tabCaptureQueue;
@@ -466,6 +522,7 @@ static NSTimeInterval g_chromePrefetchRetryAfter = 0;
 static NSTimeInterval g_chromePrefetchHoldUntil = 0;
 static os_unfair_lock g_selectionLock = OS_UNFAIR_LOCK_INIT;
 static NSInteger g_pendingSelection = -1;
+static NSPoint g_pendingPointer = {0, 0};
 static uint64_t g_pendingSelectionGeneration = 0;
 static BOOL g_selectionUpdatePending = NO;
 static const BOOL g_thumbnailPreviewsEnabled = YES;
@@ -500,6 +557,7 @@ static void terminateOtherSwitcherProcesses(void) {
         if (pid > 0 && pid != selfPID && executableIsSwitcher(pid)) {
             kill(pid, SIGTERM);
             [oldPIDs addObject:@(pid)];
+            g_replacedRunningInstance = YES;
         }
     }
     free(processIDs);
@@ -540,6 +598,7 @@ static BOOL claimSingleInstance(void) {
             break;
         }
         previousPID = lockedInstancePID(g_instanceLockFD);
+        g_replacedRunningInstance = YES;
         if (previousPID > 0 && previousPID != getpid()) {
             if (attempt == 0) kill(previousPID, SIGTERM);
             if (attempt == 20 && kill(previousPID, 0) == 0) kill(previousPID, SIGKILL);
@@ -701,6 +760,7 @@ static void ensurePanel(NSScreen *screen) {
                                  NSWindowCollectionBehaviorFullScreenAuxiliary |
                                  NSWindowCollectionBehaviorStationary;
     g_ringView = [[RingView alloc] initWithFrame:NSMakeRect(0, 0, NSWidth(screen.frame), NSHeight(screen.frame))];
+    g_ringView.wantsLayer = YES;
     g_ringView.entries = g_windowEntries;
     g_ringView.selectedIndex = -1;
     g_panel.contentView = g_ringView;
@@ -750,6 +810,7 @@ static void showRing(uint64_t generation) {
     g_ringView.selectedIndex = -1;
     g_ringView.anchorPoint = anchor;
     g_ringView.ringRadius = fittedRadius;
+    [g_ringView movePointerTo:NSZeroPoint];
     for (RingEntry *entry in g_windowEntries) (void)resolvedThumbnail(entry);
     [g_ringView setNeedsDisplay:YES];
     // Avoid forcing a synchronous draw before the panel is ordered onscreen.
@@ -758,6 +819,10 @@ static void showRing(uint64_t generation) {
     [g_panel orderFrontRegardless];
     atomic_store(&g_ringShownGeneration, generation);
     fprintf(stderr, "[ring] overlay shown at screen center; %lu entries\n", (unsigned long)g_windowEntries.count);
+
+    // The cached ring is already on screen. Fresh pictures of the visible
+    // windows, above all the one being left, replace it as they arrive.
+    refreshThumbnailsNow(0, 1.0);
 
     // Pruning may issue CG/AX queries. Run it after the cached ring is already
     // visible, away from the main queue and gesture-start path.
@@ -769,8 +834,8 @@ static void showRing(uint64_t generation) {
 }
 
 static AXUIElementRef findTabButton(AXUIElementRef parent, NSString *title, int depth);
-static BOOL setChromeActiveTab(NSString *windowID, NSString *tabID);
-static BOOL setChromeActiveTabWithIndex(NSString *windowID, NSString *tabID, NSUInteger tabIndex1Based);
+static BOOL setChromeActiveTabWithIndex(NSString *windowID, NSString *tabID, NSUInteger tabIndex1Based,
+                                        BOOL pauseLeavingTab);
 
 static void raiseWindowForEntry(RingEntry *entry, uint64_t generation) {
     if (generation != atomic_load(&g_gestureGeneration)) return;
@@ -781,7 +846,7 @@ static void raiseWindowForEntry(RingEntry *entry, uint64_t generation) {
     if (generation == atomic_load(&g_gestureGeneration) && entry.isTab &&
         entry.chromeWindowID.length) {
         BOOL switched = setChromeActiveTabWithIndex(entry.chromeWindowID, entry.chromeTabID,
-                                                    entry.tabIndex + 1);
+                                                    entry.tabIndex + 1, atomic_load(&g_settingPauseVideo));
         if (switched) return;
         NSLog(@"[Chrome tabs] could not activate window %@ tab %@ index %lu",
               entry.chromeWindowID, entry.chromeTabID, (unsigned long)(entry.tabIndex + 1));
@@ -877,16 +942,19 @@ static void raiseWindowForEntry(RingEntry *entry, uint64_t generation) {
     }
 }
 
-static void selectWindowImmediately(uint64_t generation, NSInteger selection) {
+static void selectWindowImmediately(uint64_t generation, NSInteger selection, NSPoint pointer) {
     if (generation != atomic_load(&g_gestureGeneration) || !atomic_load(&g_gestureActive) || !g_panel) return;
     g_ringView.selectedIndex = selection;
-    [g_ringView setNeedsDisplay:YES];
+    [g_ringView movePointerTo:pointer];
 }
 
-static void scheduleSelectionUpdate(uint64_t generation, NSInteger selection) {
+// Touch frames arrive faster than the screen refreshes. Only the latest
+// pointer and selection reach the main queue.
+static void scheduleSelectionUpdate(uint64_t generation, NSInteger selection, NSPoint pointer) {
     BOOL shouldDispatch = NO;
     os_unfair_lock_lock(&g_selectionLock);
     g_pendingSelection = selection;
+    g_pendingPointer = pointer;
     g_pendingSelectionGeneration = generation;
     if (!g_selectionUpdatePending) {
         g_selectionUpdatePending = YES;
@@ -898,10 +966,11 @@ static void scheduleSelectionUpdate(uint64_t generation, NSInteger selection) {
     dispatch_async(dispatch_get_main_queue(), ^{
         os_unfair_lock_lock(&g_selectionLock);
         NSInteger latestSelection = g_pendingSelection;
+        NSPoint latestPointer = g_pendingPointer;
         uint64_t latestGeneration = g_pendingSelectionGeneration;
         g_selectionUpdatePending = NO;
         os_unfair_lock_unlock(&g_selectionLock);
-        selectWindowImmediately(latestGeneration, latestSelection);
+        selectWindowImmediately(latestGeneration, latestSelection, latestPointer);
     });
 }
 
@@ -964,25 +1033,9 @@ static void finishGesture(uint64_t generation, NSInteger selection) {
         entry.windowID != kCGNullWindowID;
     NSString *chromeTabKey = captureChromeAfterRaise ? [tabThumbnailKey(entry) copy] : nil;
     CGWindowID chromeWindowID = entry.windowID;
+    // The window being left was captured when the ring opened, so raising the
+    // selection does not wait for a screenshot.
     dispatch_async(g_windowActivationQueue, ^{
-        NSString *leavingKey = nil;
-        CGWindowID leavingWindow = kCGNullWindowID;
-        @synchronized ([NSMutableDictionary class]) {
-            NSRunningApplication *front = NSWorkspace.sharedWorkspace.frontmostApplication;
-            for (RingEntry *current in g_windowEntries) {
-                if (!current.isTab || !current.isSelectedTab) continue;
-                if (![current.application.bundleIdentifier isEqualToString:@"com.google.Chrome"]) continue;
-                if (front && current.application.processIdentifier != front.processIdentifier) continue;
-                NSString *key = tabThumbnailKey(current);
-                if (chromeTabKey.length && [key isEqualToString:chromeTabKey]) continue;
-                leavingKey = [key copy];
-                leavingWindow = current.windowID;
-                break;
-            }
-        }
-        if (leavingKey.length && leavingWindow != kCGNullWindowID) {
-            captureVisibleChromeTab(leavingWindow, leavingKey);
-        }
         raiseWindowForEntry(entry, generation);
         if (!chromeTabKey.length) return;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 700 * NSEC_PER_MSEC),
@@ -1343,7 +1396,9 @@ static NSString *normalizedTabURL(NSString *urlString) {
     return parts.string ?: urlString;
 }
 
-static NSString *chromeArtworkCacheKey(NSString *tabURL) {
+// Same page for screenshot purposes. YouTube keeps the video ID while other
+// query parameters (playlist index, time) change.
+static NSString *chromePageIdentity(NSString *tabURL) {
     NSString *videoID = youtubeVideoIDFromURL(tabURL);
     if (videoID.length) return [NSString stringWithFormat:@"yt:%@", videoID];
     NSString *norm = normalizedTabURL(tabURL);
@@ -1355,34 +1410,23 @@ static void syncChromeTabMediaWithCurrentURL(RingEntry *entry) {
     NSString *tabKey = tabThumbnailKey(entry);
     if (!tabKey.length) return;
     if (!g_tabCachedURL) g_tabCachedURL = [NSMutableDictionary dictionary];
-    NSString *url = normalizedTabURL(entry.tabURL);
+    NSString *url = chromePageIdentity(entry.tabURL) ?: @"";
     NSString *previous = g_tabCachedURL[tabKey];
     if (previous && ![previous isEqualToString:url]) {
         [g_tabThumbnailCache removeObjectForKey:tabKey];
-        [g_tabArtworkCache removeObjectForKey:tabKey];
         [g_tabLastCaptured removeObjectForKey:tabKey];
-        [g_tabArtworkRequests removeObject:tabKey];
         if (entry.windowID != kCGNullWindowID) g_chromeWindowLastCapture[@(entry.windowID)] = @0;
         entry.thumbnailData = nil;
         entry.thumbnail = nil;
     }
-    g_tabCachedURL[tabKey] = url ?: @"";
+    g_tabCachedURL[tabKey] = url;
 }
 
+// Only a real screenshot of the page. A tab that was never visible keeps the
+// title card instead of a site poster (YouTube used to show the video cover).
 static void applyBestChromeThumbnail(RingEntry *entry) {
-    NSString *tabKey = tabThumbnailKey(entry);
-    NSData *real = g_tabThumbnailCache[tabKey];
-    if (real.length) {
-        applyThumbnailDataToEntry(entry, real);
-        return;
-    }
-    NSData *art = g_tabArtworkCache[tabKey];
-    if (!art) {
-        NSString *artKey = chromeArtworkCacheKey(entry.tabURL);
-        art = (artKey.length && g_urlArtworkCache) ? g_urlArtworkCache[artKey] : nil;
-        if (art) g_tabArtworkCache[tabKey] = art;
-    }
-    if (art.length) applyThumbnailDataToEntry(entry, art);
+    NSData *real = g_tabThumbnailCache[tabThumbnailKey(entry)];
+    if (real.length || entry.thumbnailData) applyThumbnailDataToEntry(entry, real);
 }
 
 static NSString *tabThumbnailKey(RingEntry *entry) {
@@ -1529,6 +1573,7 @@ static void pruneDeadWindowEntriesLive(void) {
             if (g_thumbnailCache) {
                 for (NSNumber *wid in deadWindowIDs) {
                     [g_thumbnailCache removeObjectForKey:wid];
+                    [g_windowLastCaptured removeObjectForKey:wid];
                     [g_windowLastSeen removeObjectForKey:wid];
                     [g_windowPIDMap removeObjectForKey:wid];
                 }
@@ -1536,7 +1581,6 @@ static void pruneDeadWindowEntriesLive(void) {
             if (g_tabThumbnailCache) {
                 for (NSString *tKey in deadTabKeys) {
                     [g_tabThumbnailCache removeObjectForKey:tKey];
-                    [g_tabArtworkCache removeObjectForKey:tKey];
                     [g_tabCachedURL removeObjectForKey:tKey];
                     [g_tabLastSeen removeObjectForKey:tKey];
                     [g_tabPIDMap removeObjectForKey:tKey];
@@ -1790,13 +1834,35 @@ static BOOL runChromeSwitchScript(NSString *source) {
         NSLog(@"[Chrome tabs] switch script failed: %@", error[NSAppleScriptErrorMessage] ?: error);
         return NO;
     }
-    return result.booleanValue || [result.stringValue isEqualToString:@"true"];
+    NSString *status = result.stringValue ?: @"";
+    if ([status isEqualToString:@"ok-js-blocked"]) {
+        if (!atomic_exchange(&g_chromeJavaScriptBlocked, true)) {
+            NSLog(@"[Chrome tabs] video pause needs View > Developer > Allow JavaScript from Apple Events in Chrome");
+        }
+    } else if ([status isEqualToString:@"ok-paused"]) {
+        atomic_store(&g_chromeJavaScriptBlocked, false);
+    }
+    return [status hasPrefix:@"ok"];
 }
 
-static BOOL setChromeActiveTabWithIndex(NSString *windowID, NSString *tabID, NSUInteger tabIndex1Based) {
+static BOOL setChromeActiveTabWithIndex(NSString *windowID, NSString *tabID, NSUInteger tabIndex1Based,
+                                        BOOL pauseLeavingTab) {
     if (!validChromeID(windowID)) return NO;
     BOOL haveTabID = validChromeID(tabID);
     if (!haveTabID && tabIndex1Based == 0) return NO;
+    // The tab that was showing in this window pauses its video and audio once
+    // it is replaced. Chrome only runs this with Allow JavaScript from Apple
+    // Events turned on; otherwise the switch still happens.
+    NSString *pauseStep = pauseLeavingTab
+        ? @"if leavingID is not (id of active tab of targetWindow) then\n"
+           "try\n"
+           "execute (first tab of targetWindow whose id is leavingID) javascript \"document.querySelectorAll('video,audio').forEach(function(m){m.pause()})\"\n"
+           "return \"ok-paused\"\n"
+           "on error errorMessage\n"
+           "if errorMessage contains \"JavaScript\" then return \"ok-js-blocked\"\n"
+           "end try\n"
+           "end if\n"
+        : @"";
     // Chrome exposes window and tab ids as text, not integers. Comparing a
     // text id with an unquoted number never matches, so the previously
     // selected tab (often YouTube) stayed in front for every card.
@@ -1804,34 +1870,33 @@ static BOOL setChromeActiveTabWithIndex(NSString *windowID, NSString *tabID, NSU
         @"tell application \"Google Chrome\"\n"
          "try\n"
          "set targetWindow to first window whose id is \"%@\"\n"
-         "set index of targetWindow to 1\n", windowID];
+         "set index of targetWindow to 1\n"
+         "set leavingID to id of active tab of targetWindow\n", windowID];
     if (haveTabID) {
         [source appendFormat:
          @"repeat with tabIndex from 1 to count of tabs of targetWindow\n"
           "if (id of tab tabIndex of targetWindow) as text is \"%@\" then\n"
           "set active tab index of targetWindow to tabIndex\n"
-          "return true\n"
+          "%@"
+          "return \"ok\"\n"
           "end if\n"
-          "end repeat\n", tabID];
+          "end repeat\n", tabID, pauseStep];
     }
     if (tabIndex1Based > 0) {
         [source appendFormat:
          @"set tabCount to count of tabs of targetWindow\n"
           "if %@ <= tabCount then\n"
           "set active tab index of targetWindow to %@\n"
-          "return true\n"
-          "end if\n", @(tabIndex1Based), @(tabIndex1Based)];
+          "%@"
+          "return \"ok\"\n"
+          "end if\n", @(tabIndex1Based), @(tabIndex1Based), pauseStep];
     }
     [source appendString:
-         @"return true\n"
+         @"return \"ok\"\n"
           "end try\n"
           "end tell\n"
-          "return false"];
+          "return \"failed\""];
     return runChromeSwitchScript(source);
-}
-
-static BOOL setChromeActiveTab(NSString *windowID, NSString *tabID) {
-    return setChromeActiveTabWithIndex(windowID, tabID, 0);
 }
 
 static NSArray<RingEntry *> *collectOpenWindows(void) {
@@ -2179,6 +2244,29 @@ static NSArray<RingEntry *> *collectOpenWindows(void) {
         [filteredEntries addObject:entry];
     }
     entries = filteredEntries;
+
+    // Finder tabs of one window can share a single card: the tab on screen
+    // stands for the window. Separate Finder windows keep their own cards.
+    if (atomic_load(&g_settingFinderTabsOneCard)) {
+        NSMutableDictionary<NSValue *, RingEntry *> *finderCardByWindow = [NSMutableDictionary dictionary];
+        for (RingEntry *entry in entries) {
+            if (!entry.isTab || !entry.accessibilityWindowObject ||
+                ![entry.application.bundleIdentifier isEqualToString:@"com.apple.finder"]) continue;
+            NSValue *windowKey = [NSValue valueWithPointer:(__bridge const void *)entry.accessibilityWindowObject];
+            RingEntry *current = finderCardByWindow[windowKey];
+            if (!current || (!current.isSelectedTab && entry.isSelectedTab)) finderCardByWindow[windowKey] = entry;
+        }
+        NSMutableArray<RingEntry *> *mergedFinderEntries = [NSMutableArray arrayWithCapacity:entries.count];
+        for (RingEntry *entry in entries) {
+            if (entry.isTab && entry.accessibilityWindowObject &&
+                [entry.application.bundleIdentifier isEqualToString:@"com.apple.finder"]) {
+                NSValue *windowKey = [NSValue valueWithPointer:(__bridge const void *)entry.accessibilityWindowObject];
+                if (finderCardByWindow[windowKey] != entry) continue;
+            }
+            [mergedFinderEntries addObject:entry];
+        }
+        entries = mergedFinderEntries;
+    }
     [entries sortUsingComparator:^NSComparisonResult(RingEntry *a, RingEntry *b) {
         NSComparisonResult appOrder = [a.application.localizedName localizedCaseInsensitiveCompare:b.application.localizedName];
         if (appOrder != NSOrderedSame) return appOrder;
@@ -2291,52 +2379,6 @@ static CGImageRef captureWindowImage(SCWindow *window) {
     return result;
 }
 
-static void rememberChromeTabScreenshot(CGWindowID windowID, NSString *tabKey, NSData *data) {
-    if (!tabKey.length || !data.length) return;
-    @synchronized ([NSMutableDictionary class]) {
-        g_tabThumbnailCache[tabKey] = data;
-        if (!g_tabLastCaptured) g_tabLastCaptured = [NSMutableDictionary dictionary];
-        g_tabLastCaptured[tabKey] = @(NSProcessInfo.processInfo.systemUptime);
-        if (windowID != kCGNullWindowID) {
-            if (!g_chromeWindowLastCapture) g_chromeWindowLastCapture = [NSMutableDictionary dictionary];
-            g_chromeWindowLastCapture[@(windowID)] = @(NSProcessInfo.processInfo.systemUptime);
-        }
-        for (RingEntry *entry in g_windowEntries) {
-            if ([tabThumbnailKey(entry) isEqualToString:tabKey]) {
-                applyThumbnailDataToEntry(entry, data);
-            }
-        }
-    }
-}
-
-static void captureVisibleChromeTab(CGWindowID windowID, NSString *tabKey) {
-    if (windowID == kCGNullWindowID || !tabKey.length || !CGPreflightScreenCaptureAccess()) return;
-    dispatch_semaphore_t done = dispatch_semaphore_create(0);
-    __block NSData *encoded = nil;
-    [SCShareableContent getShareableContentExcludingDesktopWindows:YES onScreenWindowsOnly:YES
-                                                completionHandler:^(SCShareableContent *content, NSError *error) {
-        if (content) {
-            for (SCWindow *window in content.windows) {
-                if (window.windowID != windowID) continue;
-                CGImageRef image = captureWindowImage(window);
-                if (image) {
-                    encoded = encodedThumbnailFromCGImage(image);
-                    CGImageRelease(image);
-                }
-                break;
-            }
-        } else if (error) {
-            NSLog(@"[Chrome thumbnails] leave-capture list failed: %@", error.localizedDescription);
-        }
-        dispatch_semaphore_signal(done);
-    }];
-    dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1200 * NSEC_PER_MSEC)));
-    if (encoded) {
-        rememberChromeTabScreenshot(windowID, tabKey, encoded);
-        NSLog(@"[Chrome thumbnails] saved last shot %@", tabKey);
-    }
-}
-
 static void noteChromeSelectionChanges(NSArray<RingEntry *> *entries) {
     @synchronized ([NSMutableDictionary class]) {
         if (!g_lastSelectedChromeTabKeys) g_lastSelectedChromeTabKeys = [NSMutableDictionary dictionary];
@@ -2360,17 +2402,151 @@ static void noteChromeSelectionChanges(NSArray<RingEntry *> *entries) {
     }
 }
 
-static NSString *chromeActiveTabID(NSString *windowID) {
-    if (!validChromeID(windowID)) return nil;
+// Chrome's active tab and its page, read at capture time. The periodic scan can
+// be two seconds old, and a screenshot stored under the wrong tab stays there.
+static NSString *chromeActiveTab(NSString *windowID, NSString **urlOut) {
+    if (!validChromeID(windowID) || !ensureChromeAutomation(NO)) return nil;
     NSString *source = [NSString stringWithFormat:
         @"tell application \"Google Chrome\"\n"
-         "set targetWindow to first window whose id is \"%@\"\n"
-         "return (id of active tab of targetWindow) as text\n"
+         "set targetTab to active tab of (first window whose id is \"%@\")\n"
+         "return ((id of targetTab) as text) & (ASCII character 31) & ((URL of targetTab) as text)\n"
          "end tell", windowID];
     NSAppleScript *script = [[NSAppleScript alloc] initWithSource:source];
     NSDictionary *error = nil;
-    NSAppleEventDescriptor *result = [script executeAndReturnError:&error];
-    return error ? nil : result.stringValue;
+    NSAppleEventDescriptor *result = nil;
+    @synchronized ([NSAppleScript class]) {
+        result = [script executeAndReturnError:&error];
+    }
+    if (error) return nil;
+    NSArray<NSString *> *parts = [result.stringValue componentsSeparatedByString:@"\x1f"];
+    if (parts.count < 2 || !validChromeID(parts[0])) return nil;
+    if (urlOut) *urlOut = parts[1];
+    return parts[0];
+}
+
+// Captures visible windows right away instead of waiting for the periodic
+// planner: the app being left (onlyPID) or, when the ring opens, every visible
+// window whose picture is older than minAge. Results are stored in one pass so
+// an open ring redraws once.
+static void refreshThumbnailsNow(pid_t onlyPID, NSTimeInterval minAge) {
+    if (!g_thumbnailPreviewsEnabled || !g_liveCaptureQueue || !CGPreflightScreenCaptureAccess()) return;
+    NSMutableSet<NSNumber *> *onScreenIDs = [NSMutableSet set];
+    CFArrayRef onScreenWindows = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+    if (onScreenWindows) {
+        for (CFIndex i = 0; i < CFArrayGetCount(onScreenWindows); i++) {
+            NSDictionary *info = (__bridge NSDictionary *)CFArrayGetValueAtIndex(onScreenWindows, i);
+            NSNumber *wid = info[(id)kCGWindowNumber];
+            if (wid) [onScreenIDs addObject:wid];
+        }
+        CFRelease(onScreenWindows);
+    }
+
+    pid_t frontPID = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    NSMutableDictionary<NSNumber *, RingEntry *> *entryByWindow = [NSMutableDictionary dictionary];
+    NSMutableArray<NSNumber *> *windowOrder = [NSMutableArray array];
+    for (RingEntry *entry in g_windowEntries) {
+        NSNumber *windowKey = @(entry.windowID);
+        if (entry.windowID == kCGNullWindowID || ![onScreenIDs containsObject:windowKey]) continue;
+        if (onlyPID > 0 && entry.application.processIdentifier != onlyPID) continue;
+        RingEntry *current = entryByWindow[windowKey];
+        if (!current) [windowOrder addObject:windowKey];
+        // Tabs share one window and only the selected tab is on screen.
+        if (!current || (!current.isSelectedTab && entry.isSelectedTab)) entryByWindow[windowKey] = entry;
+    }
+
+    NSMutableArray<NSDictionary *> *targets = [NSMutableArray array];
+    @synchronized ([NSMutableDictionary class]) {
+        for (NSNumber *windowKey in windowOrder) {
+            RingEntry *entry = entryByWindow[windowKey];
+            NSString *tabKey = entry.isTab ? tabThumbnailKey(entry) : nil;
+            NSTimeInterval last = tabKey ? g_tabLastCaptured[tabKey].doubleValue
+                                         : g_windowLastCaptured[windowKey].doubleValue;
+            if (last > 0 && now - last < minAge) continue;
+            NSMutableDictionary *target = [@{
+                @"window": windowKey,
+                @"pid": @(entry.application.processIdentifier)
+            } mutableCopy];
+            if (tabKey) target[@"tabKey"] = tabKey;
+            if (entry.isTab && entry.chromeWindowID.length) target[@"chromeWindowID"] = entry.chromeWindowID;
+            // The window the user is looking at goes first.
+            if (entry.application.processIdentifier == frontPID) [targets insertObject:target atIndex:0];
+            else [targets addObject:target];
+        }
+    }
+    if (!targets.count) return;
+
+    dispatch_async(g_liveCaptureQueue, ^{
+        dispatch_semaphore_t listed = dispatch_semaphore_create(0);
+        __block NSArray<SCWindow *> *shareableWindows = nil;
+        [SCShareableContent getShareableContentExcludingDesktopWindows:YES onScreenWindowsOnly:YES
+                                                    completionHandler:^(SCShareableContent *content, NSError *error) {
+            (void)error;
+            shareableWindows = content.windows;
+            dispatch_semaphore_signal(listed);
+        }];
+        if (dispatch_semaphore_wait(listed, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1000 * NSEC_PER_MSEC))) != 0) return;
+
+        NSMutableArray<NSDictionary *> *results = [NSMutableArray array];
+        for (NSDictionary *target in targets) {
+            NSNumber *windowKey = target[@"window"];
+            SCWindow *window = nil;
+            for (SCWindow *candidate in shareableWindows) {
+                if (candidate.windowID == windowKey.unsignedIntValue) { window = candidate; break; }
+            }
+            if (!window) continue;
+            NSString *tabKey = target[@"tabKey"];
+            NSString *pageURL = nil;
+            NSString *chromeWindowID = target[@"chromeWindowID"];
+            if (chromeWindowID.length) {
+                NSString *activeTabID = chromeActiveTab(chromeWindowID, &pageURL);
+                // Unknown tab: no picture is better than a picture on the wrong tab.
+                if (!activeTabID) continue;
+                tabKey = [NSString stringWithFormat:@"%d:chrome:%@:%@", [target[@"pid"] intValue],
+                          chromeWindowID, activeTabID];
+            }
+            CGImageRef image = captureWindowImage(window);
+            if (!image) continue;
+            NSData *data = encodedThumbnailFromCGImage(image);
+            CGImageRelease(image);
+            if (!data) continue;
+            NSMutableDictionary *result = [@{@"window": windowKey, @"data": data} mutableCopy];
+            if (tabKey) result[@"tabKey"] = tabKey;
+            if (pageURL) result[@"pageURL"] = pageURL;
+            [results addObject:result];
+        }
+        if (!results.count) return;
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            @synchronized ([NSMutableDictionary class]) {
+                NSNumber *stamp = @(NSProcessInfo.processInfo.systemUptime);
+                for (NSDictionary *result in results) {
+                    NSNumber *windowKey = result[@"window"];
+                    NSString *tabKey = result[@"tabKey"];
+                    NSData *data = result[@"data"];
+                    recordThumbnailCaptureSuccess(windowKey);
+                    if (tabKey) {
+                        g_tabThumbnailCache[tabKey] = data;
+                        g_tabLastCaptured[tabKey] = stamp;
+                        if (result[@"pageURL"]) {
+                            g_tabCachedURL[tabKey] = chromePageIdentity(result[@"pageURL"]) ?: @"";
+                            g_chromeWindowLastCapture[windowKey] = stamp;
+                        }
+                    } else {
+                        g_thumbnailCache[windowKey] = data;
+                        g_windowLastCaptured[windowKey] = stamp;
+                    }
+                    for (RingEntry *entry in g_windowEntries) {
+                        if (entry.windowID != windowKey.unsignedIntValue) continue;
+                        BOOL matches = tabKey ? (entry.isTab && [tabThumbnailKey(entry) isEqualToString:tabKey])
+                                              : !entry.isTab;
+                        if (matches) applyThumbnailDataToEntry(entry, data);
+                    }
+                }
+            }
+            if (g_ringView && atomic_load(&g_ringOverlayVisible)) [g_ringView setNeedsDisplay:YES];
+        });
+    });
 }
 
 static void finishChromePrefetch(BOOL succeeded) {
@@ -2378,86 +2554,6 @@ static void finishChromePrefetch(BOOL succeeded) {
         g_chromePrefetchRetryAfter = succeeded ? 0 : NSProcessInfo.processInfo.systemUptime + 3.0;
     }
     atomic_store(&g_chromePrefetchActive, false);
-}
-
-static NSURL *chromeArtworkURL(NSString *tabURL) {
-    NSString *videoID = youtubeVideoIDFromURL(tabURL);
-    if (!videoID.length) return nil;
-    return [NSURL URLWithString:[NSString stringWithFormat:@"https://i.ytimg.com/vi/%@/hqdefault.jpg", videoID]];
-}
-
-static void scheduleChromeTabArtwork(NSArray<RingEntry *> *entries) {
-    if (!entries.count) return;
-    if (!g_tabArtworkQueue) {
-        g_tabArtworkQueue = dispatch_queue_create("touchpad.ring.chrome-artwork", DISPATCH_QUEUE_SERIAL);
-    }
-    @synchronized ([NSMutableDictionary class]) {
-        if (!g_tabArtworkCache) g_tabArtworkCache = [NSMutableDictionary dictionary];
-        if (!g_tabArtworkRequests) g_tabArtworkRequests = [NSMutableSet set];
-    }
-    for (RingEntry *entry in entries) {
-        if (![entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"]) continue;
-        NSString *tabKey = tabThumbnailKey(entry);
-        NSURL *artworkURL = chromeArtworkURL(entry.tabURL);
-        if (!artworkURL || !tabKey.length) continue;
-        NSString *artKey = chromeArtworkCacheKey(entry.tabURL);
-        NSString *requestURL = normalizedTabURL(entry.tabURL);
-        @synchronized ([NSMutableDictionary class]) {
-            NSData *shared = (artKey.length && g_urlArtworkCache) ? g_urlArtworkCache[artKey] : nil;
-            if (shared && !g_tabArtworkCache[tabKey] && !g_tabThumbnailCache[tabKey]) {
-                g_tabArtworkCache[tabKey] = shared;
-                applyThumbnailDataToEntry(entry, shared);
-            }
-            if (g_tabThumbnailCache[tabKey] || g_tabArtworkCache[tabKey] ||
-                [g_tabArtworkRequests containsObject:tabKey]) continue;
-            [g_tabArtworkRequests addObject:tabKey];
-        }
-        NSString *requestKey = [tabKey copy];
-        NSString *requestArtKey = [artKey copy];
-        dispatch_async(g_tabArtworkQueue, ^{
-            NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:artworkURL];
-            request.timeoutInterval = 6.0;
-            request.cachePolicy = NSURLRequestReturnCacheDataElseLoad;
-            NSURLSessionDataTask *task =
-                [[NSURLSession sharedSession] dataTaskWithRequest:request
-                                                completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-                NSData *stored = nil;
-                NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]]
-                    ? (NSHTTPURLResponse *)response : nil;
-                if (!error && data.length && http.statusCode == 200) {
-                    NSImage *probe = [[NSImage alloc] initWithData:data];
-                    if (probe && probe.size.width >= 16) stored = data;
-                }
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    @synchronized ([NSMutableDictionary class]) {
-                        [g_tabArtworkRequests removeObject:requestKey];
-                        if (stored.length) {
-                            if (requestArtKey.length) {
-                                if (!g_urlArtworkCache) g_urlArtworkCache = [NSMutableDictionary dictionary];
-                                g_urlArtworkCache[requestArtKey] = stored;
-                            }
-                            BOOL urlStillMatches = NO;
-                            for (RingEntry *current in g_windowEntries) {
-                                if (![tabThumbnailKey(current) isEqualToString:requestKey]) continue;
-                                if (![normalizedTabURL(current.tabURL) isEqualToString:requestURL]) continue;
-                                urlStillMatches = YES;
-                                if (!g_tabThumbnailCache[requestKey]) {
-                                    g_tabArtworkCache[requestKey] = stored;
-                                    applyThumbnailDataToEntry(current, stored);
-                                }
-                            }
-                            if (urlStillMatches && g_ringView) {
-                                g_ringView.entries = g_windowEntries;
-                                [g_ringView setNeedsDisplay:YES];
-                            }
-                            if (urlStillMatches) NSLog(@"[Chrome thumbnails] artwork %@", requestKey);
-                        }
-                    }
-                });
-            }];
-            [task resume];
-        });
-    }
 }
 
 static void scheduleChromeBackgroundPrefetch(NSArray<RingEntry *> *entries) {
@@ -2624,10 +2720,14 @@ static void capturePendingThumbnails(NSArray<RingEntry *> *entries,
                 }
             }
         }
-        if (!entry.isTab && entry.windowID != kCGNullWindowID && !thumbnailSnapshot[key] &&
-                   !thumbnailCaptureIsCoolingDown(key) &&
-                   ![g_thumbnailRequests containsObject:key]) {
-            [wantedIDs addObject:key];
+        if (!entry.isTab && entry.windowID != kCGNullWindowID &&
+            !thumbnailCaptureIsCoolingDown(key) &&
+            ![g_thumbnailRequests containsObject:key]) {
+            // Visible windows keep changing; the active app refreshes sooner.
+            NSTimeInterval refresh = entry.application.isActive ? 3.0 : 12.0;
+            if (!thumbnailSnapshot[key] || now - g_windowLastCaptured[key].doubleValue >= refresh) {
+                [wantedIDs addObject:key];
+            }
         }
     }
     if (!wantedIDs.count && !wantedTabs.count) return;
@@ -2753,6 +2853,7 @@ static void capturePendingThumbnails(NSArray<RingEntry *> *entries,
                     }
                     recordThumbnailCaptureSuccess(windowKey);
                     g_thumbnailCache[windowKey] = thumbnail;
+                    if (!chromeTabKey.length) g_windowLastCaptured[windowKey] = @(NSProcessInfo.processInfo.systemUptime);
                     [g_thumbnailRequests removeObject:windowKey];
                     if (chromeTabKey.length) {
                         BOOL firstCaptureForTab = g_tabThumbnailCache[chromeTabKey] == nil;
@@ -2884,6 +2985,7 @@ static void pruneThumbnailCaches(NSArray<RingEntry *> *entries) {
         }
         for (NSNumber *key in keysToRemove) {
             [g_thumbnailCache removeObjectForKey:key];
+            [g_windowLastCaptured removeObjectForKey:key];
             [g_windowLastSeen removeObjectForKey:key];
             [g_windowPIDMap removeObjectForKey:key];
         }
@@ -2913,7 +3015,6 @@ static void pruneThumbnailCaches(NSArray<RingEntry *> *entries) {
         }
         for (NSString *key in keysToRemove) {
             [g_tabThumbnailCache removeObjectForKey:key];
-            [g_tabArtworkCache removeObjectForKey:key];
             [g_tabCachedURL removeObjectForKey:key];
             [g_tabLastSeen removeObjectForKey:key];
             [g_tabPIDMap removeObjectForKey:key];
@@ -2926,51 +3027,63 @@ static void pruneThumbnailCaches(NSArray<RingEntry *> *entries) {
     }
 }
 
-static NSInteger directionIndex(double dx, double dy, NSInteger count) {
-    if (count <= 0) return -1;
-    double angle = atan2(dy, dx);
-    double bestAlignment = -DBL_MAX;
-    NSInteger bestIndex = -1;
-    for (NSInteger i = 0; i < count; i++) {
-        double itemAngle = (double)visualItemAngle(i, (NSUInteger)count);
-        double alignment = cos(angle - itemAngle);
-        if (alignment > bestAlignment) {
-            bestAlignment = alignment;
-            bestIndex = i;
-        }
+// Finger travel moves a pointer, with acceleration like a mouse: slow motion
+// is fine enough to pick between neighboring cards, a fast flick reaches the
+// far side. dx and dy are in trackpad widths, so both axes move alike.
+static void moveRingPointer(double dx, double dy, double dt, NSInteger count) {
+    dt = MIN(MAX(dt, 0.004), 0.05);
+    double speed = hypot(dx, dy) / dt;
+    g_pointerSpeed = g_pointerSpeed * 0.7 + speed * 0.3;
+    const double kBaseGain = 1.0 / 0.08;   // about 8% of the trackpad width reaches the ring
+    double t = MIN(MAX((g_pointerSpeed - 0.08) / (0.60 - 0.08), 0.0), 1.0);
+    double gain = kBaseGain * (0.45 + 1.15 * t);
+    g_pointerX += dx * gain;
+    g_pointerY += dy * gain;
+
+    // Keep the pointer just past the cards; pushing further slides along the
+    // ring instead of wandering off screen.
+    CGFloat radiusX = 1.0, radiusY = 1.0;
+    ringEllipseRadii((NSUInteger)MAX(count, 1), 1.0, &radiusX, &radiusY);
+    double norm = hypot(g_pointerX / radiusX, g_pointerY / radiusY);
+    const double kMaxNorm = 1.08;
+    if (norm > kMaxNorm) {
+        g_pointerX *= kMaxNorm / norm;
+        g_pointerY *= kMaxNorm / norm;
     }
-    return bestIndex;
+}
+
+// The card closest to the pointer, with a small margin so the choice does not
+// flicker on the midline between two cards.
+static NSInteger pointerSelection(NSInteger count, NSInteger currentIndex) {
+    if (count <= 0) return -1;
+    CGFloat radiusX = 1.0, radiusY = 1.0;
+    ringEllipseRadii((NSUInteger)count, 1.0, &radiusX, &radiusY);
+    if (hypot(g_pointerX / radiusX, g_pointerY / radiusY) < kPointerDeadZone) return -1;
+    NSInteger best = -1;
+    double bestDistance = DBL_MAX, currentDistance = DBL_MAX;
+    for (NSInteger i = 0; i < count; i++) {
+        CGFloat angle = rawItemAngle(i, (NSUInteger)count);
+        double distance = hypot(g_pointerX - cos(angle) * radiusX, g_pointerY - sin(angle) * radiusY);
+        if (i == currentIndex) currentDistance = distance;
+        if (distance < bestDistance) { bestDistance = distance; best = i; }
+    }
+    const double kSwitchMargin = 0.08;
+    if (currentIndex >= 0 && currentIndex < count && currentDistance - bestDistance < kSwitchMargin) return currentIndex;
+    return best;
 }
 
 static NSInteger selectionForLift(void) {
-    if (g_selectedIndex >= 0) return g_selectedIndex;
-    NSInteger count = atomic_load(&g_windowEntryCount);
-    double len = hypot(g_motionAccumX, g_motionAccumY);
-    if (count <= 0 || len < 0.005) return -1;
-    return directionIndex(g_motionAccumX, g_motionAccumY, count);
-}
-
-static NSInteger stableDirectionIndex(double dx, double dy, NSInteger count, NSInteger currentIndex) {
-    NSInteger candidate = directionIndex(dx, dy, count);
-    if (candidate < 0 || currentIndex < 0 || candidate == currentIndex) return candidate;
-    double movementAngle = atan2(dy, dx);
-    double currentAngle = (double)visualItemAngle(currentIndex, (NSUInteger)count);
-    double angularDistance = fabs(remainder(movementAngle - currentAngle, 2.0 * M_PI));
-    // Sticky through a bit past the midpoint, but never wider than the gap to
-    // the next card. A fixed extra angle blocked neighbors when N was large.
-    double halfSector = M_PI / (double)MAX(count, 1);
-    double switchBoundary = halfSector * 1.18;
-    return angularDistance <= switchBoundary ? currentIndex : candidate;
+    return g_selectedIndex;
 }
 
 static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouches, double timestamp, int frame) {
-    (void)device;
     (void)frame;
     @autoreleasepool {
         static BOOL suppressUntilFourFingerLift = NO;
         static double allFingersUpSince = -1.0;
         static BOOL liftCompletionScheduled = NO;
         static uint64_t fourFingerAbortGeneration = 0;
+        static BOOL threeFingersLastFrame = NO;
         int activeCount = 0;
         double sumX = 0.0, sumY = 0.0;
         for (int i = 0; i < numTouches; i++) {
@@ -2982,6 +3095,8 @@ static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouche
             }
         }
         atomic_store(&g_activeTouchCount, activeCount);
+        BOOL hadThreeFingers = threeFingersLastFrame;
+        threeFingersLastFrame = activeCount == 3;
 
         if (activeCount >= 3) {
             uint64_t nowNanos = (uint64_t)(NSProcessInfo.processInfo.systemUptime * 1000000000.0);
@@ -3027,9 +3142,16 @@ static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouche
             liftCompletionScheduled = NO;
             g_previousX = x;
             g_previousY = y;
-            g_motionAccumX = 0.0;
-            g_motionAccumY = 0.0;
+            g_previousTimestamp = timestamp;
+            g_pointerX = 0.0;
+            g_pointerY = 0.0;
+            g_pointerSpeed = 0.0;
             g_selectedIndex = -1;
+            int surfaceWidth = 0, surfaceHeight = 0;
+            if (MTDeviceGetSensorSurfaceDimensions(device, &surfaceWidth, &surfaceHeight) == 0 &&
+                surfaceWidth > 0 && surfaceHeight > 0) {
+                g_trackpadAspect = (double)surfaceHeight / (double)surfaceWidth;
+            }
             CGEventRef cursorEvent = CGEventCreate(NULL);
             if (cursorEvent) {
                 g_cursorAtGestureStart = CGEventGetLocation(cursorEvent);
@@ -3071,36 +3193,21 @@ static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouche
                 });
             } else if (activeCount == 3) {
                 double x = sumX / 3.0, y = sumY / 3.0;
-                g_motionAccumX += x - g_previousX;
-                g_motionAccumY += y - g_previousY;
+                if (hadThreeFingers) {
+                    moveRingPointer(x - g_previousX, (y - g_previousY) * g_trackpadAspect,
+                                    timestamp - g_previousTimestamp, atomic_load(&g_windowEntryCount));
+                }
+                // After a finger is lifted and put back, its new spot is not motion.
                 g_previousX = x;
                 g_previousY = y;
-                NSInteger count = atomic_load(&g_windowEntryCount);
-                const double kFirstSelectTravel = count >= 8 ? 0.014 : 0.012;
-                const double kChangeSelectTravel = count <= 5 ? 0.028 : (count <= 8 ? 0.018 : 0.012);
-                const double kSelectionBias = count >= 8 ? 0.003 : 0.007;
-                const double kAccumClamp = 0.050;
-                double motionLength = hypot(g_motionAccumX, g_motionAccumY);
-                NSInteger candidate = motionLength >= kFirstSelectTravel
-                    ? stableDirectionIndex(g_motionAccumX, g_motionAccumY, count, g_selectedIndex) : -1;
-                double requiredLength = g_selectedIndex < 0 ? kFirstSelectTravel : kChangeSelectTravel;
-                NSInteger selection = candidate >= 0 && (candidate == g_selectedIndex || motionLength >= requiredLength)
-                    ? candidate : -1;
-                if (selection >= 0 && selection == g_selectedIndex) {
-                    if (motionLength > kAccumClamp && motionLength > 0.0) {
-                        double scale = kAccumClamp / motionLength;
-                        g_motionAccumX *= scale;
-                        g_motionAccumY *= scale;
-                    }
-                } else if (selection >= 0 && selection != g_selectedIndex) {
+                g_previousTimestamp = timestamp;
+                NSInteger selection = pointerSelection(atomic_load(&g_windowEntryCount), g_selectedIndex);
+                if (selection != g_selectedIndex) {
                     g_selectedIndex = selection;
-                    double angle = (double)visualItemAngle(selection, (NSUInteger)MAX(count, 1));
-                    g_motionAccumX = cos(angle) * kSelectionBias;
-                    g_motionAccumY = sin(angle) * kSelectionBias;
                     fprintf(stderr, "[touch] selected entry %ld\n", (long)selection);
-                    uint64_t generation = atomic_load(&g_gestureGeneration);
-                    scheduleSelectionUpdate(generation, selection);
                 }
+                scheduleSelectionUpdate(atomic_load(&g_gestureGeneration), g_selectedIndex,
+                                        NSMakePoint(g_pointerX, g_pointerY));
             }
         }
     }
@@ -3141,12 +3248,21 @@ static void startMultitouchDevices(void) {
     });
 }
 
+// The app being left is still on screen for a moment, so its picture matches
+// what the user last saw.
+- (void)applicationDeactivated:(NSNotification *)notification {
+    NSRunningApplication *app = notification.userInfo[NSWorkspaceApplicationKey];
+    if (!app || app.processIdentifier == getpid() || atomic_load(&g_gestureActive)) return;
+    refreshThumbnailsNow(app.processIdentifier, 1.0);
+}
+
 - (void)appearanceChanged:(NSNotification *)notification {
     (void)notification;
     dispatch_async(dispatch_get_main_queue(), ^{
         NSLog(@"[thumbnails] light/dark change; recapturing visible windows");
         @synchronized ([NSMutableDictionary class]) {
             [g_thumbnailCache removeAllObjects];
+            [g_windowLastCaptured removeAllObjects];
             [g_tabThumbnailCache removeAllObjects];
             [g_tabLastCaptured removeAllObjects];
             [g_chromeWindowLastCapture removeAllObjects];
@@ -3167,6 +3283,167 @@ static void startMultitouchDevices(void) {
 @end
 
 static TouchpadWakeObserver *g_wakeObserver;
+
+static BOOL settingBool(CFStringRef key, BOOL fallback) {
+    Boolean valid = false;
+    Boolean value = CFPreferencesGetAppBooleanValue(key, kSettingsID, &valid);
+    return valid ? value : fallback;
+}
+
+static void storeSetting(CFStringRef key, CFPropertyListRef value) {
+    CFPreferencesSetAppValue(key, value, kSettingsID);
+    CFPreferencesAppSynchronize(kSettingsID);
+}
+
+static void loadSettings(void) {
+    Boolean valid = false;
+    CFIndex titles = CFPreferencesGetAppIntegerValue(CFSTR("CardTitles"), kSettingsID, &valid);
+    atomic_store(&g_settingCardTitles, valid && titles >= CardTitlesAll && titles <= CardTitlesNone
+                                           ? (int)titles : CardTitlesAll);
+    atomic_store(&g_settingPauseVideo, settingBool(CFSTR("PauseVideoOnTabSwitch"), YES));
+    atomic_store(&g_settingFinderTabsOneCard, settingBool(CFSTR("FinderTabsAsOneCard"), YES));
+    BOOL hideIcon = settingBool(CFSTR("HideMenuBarIcon"), NO);
+    // Opening the app again while it runs is the way back to a hidden icon.
+    if (hideIcon && g_replacedRunningInstance) {
+        hideIcon = NO;
+        storeSetting(CFSTR("HideMenuBarIcon"), kCFBooleanFalse);
+    }
+    atomic_store(&g_settingHideMenuIcon, hideIcon);
+}
+
+// Menu bar icon with a small panel of switches, the same shape as Limiti.
+@interface SettingsMenu : NSObject
+@property(nonatomic, strong) NSStatusItem *statusItem;
+@property(nonatomic, strong) NSPopover *popover;
+@property(nonatomic, strong) NSTextField *javaScriptHint;
+@end
+
+@implementation SettingsMenu
+- (void)showIcon {
+    if (self.statusItem) return;
+    self.statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
+    NSImage *image = [NSImage imageWithSystemSymbolName:@"hand.draw" accessibilityDescription:@"Touchpad Switcher"];
+    if (image) {
+        image.template = YES;
+        self.statusItem.button.image = image;
+    } else {
+        self.statusItem.button.title = @"TS";
+    }
+    self.statusItem.button.target = self;
+    self.statusItem.button.action = @selector(togglePanel:);
+}
+
+- (NSTextField *)noteWithText:(NSString *)text {
+    NSTextField *note = [NSTextField wrappingLabelWithString:text];
+    note.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+    note.textColor = NSColor.secondaryLabelColor;
+    note.preferredMaxLayoutWidth = 312;
+    return note;
+}
+
+- (NSView *)panelContent {
+    NSTextField *title = [NSTextField labelWithString:@"Touchpad Switcher"];
+    title.font = [NSFont boldSystemFontOfSize:13];
+
+    NSTextField *titlesLabel = [self noteWithText:@"Naslovi na karticama"];
+    NSSegmentedControl *titles = [NSSegmentedControl segmentedControlWithLabels:@[@"Svi prozori", @"Finder i Chrome", @"Bez naslova"]
+                                                                   trackingMode:NSSegmentSwitchTrackingSelectOne
+                                                                         target:self
+                                                                         action:@selector(cardTitlesChanged:)];
+    titles.controlSize = NSControlSizeSmall;
+    titles.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+    titles.selectedSegment = atomic_load(&g_settingCardTitles);
+
+    NSButton *pauseVideo = [NSButton checkboxWithTitle:@"Pauziraj video kad promeniš Chrome tab"
+                                                target:self action:@selector(pauseVideoChanged:)];
+    pauseVideo.state = atomic_load(&g_settingPauseVideo) ? NSControlStateValueOn : NSControlStateValueOff;
+    self.javaScriptHint = [self noteWithText:
+        @"Chrome odbija pauzu. U Chrome-u uključi View > Developer > Allow JavaScript from Apple Events."];
+    self.javaScriptHint.textColor = NSColor.systemOrangeColor;
+
+    NSButton *finderTabs = [NSButton checkboxWithTitle:@"Finder tabovi jednog prozora kao jedna kartica"
+                                                target:self action:@selector(finderTabsChanged:)];
+    finderTabs.state = atomic_load(&g_settingFinderTabsOneCard) ? NSControlStateValueOn : NSControlStateValueOff;
+
+    NSBox *separator = [NSBox new];
+    separator.boxType = NSBoxSeparator;
+
+    NSButton *hideIcon = [NSButton checkboxWithTitle:@"Sakrij ikonicu iz gornje trake"
+                                              target:self action:@selector(hideIconChanged:)];
+    NSTextField *hideNote = [self noteWithText:@"Ikonica se vraća kad ponovo otvoriš aplikaciju."];
+
+    NSButton *quit = [NSButton buttonWithTitle:@"Ugasi Touchpad Switcher" target:NSApp action:@selector(terminate:)];
+    quit.controlSize = NSControlSizeSmall;
+
+    NSStackView *stack = [NSStackView stackViewWithViews:@[title, titlesLabel, titles, pauseVideo, self.javaScriptHint,
+                                                           finderTabs, separator, hideIcon, hideNote, quit]];
+    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    stack.alignment = NSLayoutAttributeLeading;
+    stack.spacing = 10;
+    stack.edgeInsets = NSEdgeInsetsMake(14, 14, 14, 14);
+    [stack setCustomSpacing:4 afterView:titlesLabel];
+    [stack setCustomSpacing:4 afterView:pauseVideo];
+    [stack setCustomSpacing:4 afterView:hideIcon];
+    [stack setCustomSpacing:14 afterView:hideNote];
+    [stack.widthAnchor constraintEqualToConstant:340].active = YES;
+    [separator.widthAnchor constraintEqualToConstant:312].active = YES;
+    return stack;
+}
+
+- (void)togglePanel:(id)sender {
+    if (self.popover.isShown) {
+        [self.popover performClose:sender];
+        return;
+    }
+    if (!self.popover) {
+        NSViewController *controller = [NSViewController new];
+        controller.view = [self panelContent];
+        self.popover = [NSPopover new];
+        self.popover.contentViewController = controller;
+        self.popover.contentSize = controller.view.fittingSize;
+        self.popover.behavior = NSPopoverBehaviorTransient;
+    }
+    self.javaScriptHint.hidden = !(atomic_load(&g_chromeJavaScriptBlocked) && atomic_load(&g_settingPauseVideo));
+    self.popover.contentSize = self.popover.contentViewController.view.fittingSize;
+    NSButton *button = self.statusItem.button;
+    [self.popover showRelativeToRect:button.bounds ofView:button preferredEdge:NSRectEdgeMinY];
+    [NSApp activate];
+}
+
+- (void)cardTitlesChanged:(NSSegmentedControl *)control {
+    int mode = (int)control.selectedSegment;
+    atomic_store(&g_settingCardTitles, mode);
+    CFNumberRef value = CFNumberCreate(NULL, kCFNumberIntType, &mode);
+    storeSetting(CFSTR("CardTitles"), value);
+    CFRelease(value);
+}
+
+- (void)pauseVideoChanged:(NSButton *)button {
+    BOOL on = button.state == NSControlStateValueOn;
+    atomic_store(&g_settingPauseVideo, on);
+    storeSetting(CFSTR("PauseVideoOnTabSwitch"), on ? kCFBooleanTrue : kCFBooleanFalse);
+    self.javaScriptHint.hidden = !(on && atomic_load(&g_chromeJavaScriptBlocked));
+    self.popover.contentSize = self.popover.contentViewController.view.fittingSize;
+}
+
+- (void)finderTabsChanged:(NSButton *)button {
+    BOOL on = button.state == NSControlStateValueOn;
+    atomic_store(&g_settingFinderTabsOneCard, on);
+    storeSetting(CFSTR("FinderTabsAsOneCard"), on ? kCFBooleanTrue : kCFBooleanFalse);
+}
+
+- (void)hideIconChanged:(NSButton *)button {
+    if (button.state != NSControlStateValueOn) return;
+    atomic_store(&g_settingHideMenuIcon, true);
+    storeSetting(CFSTR("HideMenuBarIcon"), kCFBooleanTrue);
+    [self.popover close];
+    self.popover = nil;
+    if (self.statusItem) [NSStatusBar.systemStatusBar removeStatusItem:self.statusItem];
+    self.statusItem = nil;
+}
+@end
+
+static SettingsMenu *g_settingsMenu;
 
 static void handleSignal(int signalNumber) {
     (void)signalNumber;
@@ -3193,6 +3470,9 @@ int main(int argc, const char *argv[]) {
         }
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        loadSettings();
+        g_settingsMenu = [SettingsMenu new];
+        if (!atomic_load(&g_settingHideMenuIcon)) [g_settingsMenu showIcon];
         signal(SIGINT, handleSignal);
         signal(SIGTERM, handleSignal);
         BOOL accessibilityTrusted = AXIsProcessTrusted();
@@ -3222,18 +3502,16 @@ int main(int argc, const char *argv[]) {
         g_thumbnailRequests = [NSMutableSet set];
         g_tabThumbnailRequests = [NSMutableSet set];
         g_tabLastCaptured = [NSMutableDictionary dictionary];
-        g_tabArtworkCache = [NSMutableDictionary dictionary];
-        g_urlArtworkCache = [NSMutableDictionary dictionary];
+        g_windowLastCaptured = [NSMutableDictionary dictionary];
         g_tabCachedURL = [NSMutableDictionary dictionary];
         g_chromeCaptureURLs = [NSMutableDictionary dictionary];
-        g_tabArtworkRequests = [NSMutableSet set];
         g_windowActivationQueue = dispatch_queue_create("touchpad.ring.window-activation", DISPATCH_QUEUE_SERIAL);
+        g_liveCaptureQueue = dispatch_queue_create("touchpad.ring.live-capture", DISPATCH_QUEUE_SERIAL);
         g_windowEntries = collectOpenWindows();
         populateThumbnailsFromCache(g_windowEntries);
         atomic_store(&g_windowEntryCount, (int)g_windowEntries.count);
         if (g_thumbnailPreviewsEnabled) schedulePendingThumbnailCapture(g_windowEntries);
         if (g_thumbnailPreviewsEnabled) scheduleChromeBackgroundPrefetch(g_windowEntries);
-        scheduleChromeTabArtwork(g_windowEntries);
         dispatch_async(dispatch_get_main_queue(), ^{
             if (ensureChromeAutomation(YES)) {
                 NSArray<RingEntry *> *entries = collectOpenWindows();
@@ -3243,7 +3521,6 @@ int main(int argc, const char *argv[]) {
                 if (g_ringView) g_ringView.entries = entries;
                 if (g_thumbnailPreviewsEnabled) schedulePendingThumbnailCapture(entries);
                 if (g_thumbnailPreviewsEnabled) scheduleChromeBackgroundPrefetch(entries);
-                scheduleChromeTabArtwork(entries);
                 printf("Chrome Automation granted. Entries: %d\n", atomic_load(&g_windowEntryCount));
                 fflush(stdout);
             }
@@ -3271,6 +3548,10 @@ int main(int argc, const char *argv[]) {
         [workspaceCenter addObserver:g_wakeObserver
                             selector:@selector(didWake:)
                                 name:NSWorkspaceScreensDidWakeNotification
+                              object:nil];
+        [workspaceCenter addObserver:g_wakeObserver
+                            selector:@selector(applicationDeactivated:)
+                                name:NSWorkspaceDidDeactivateApplicationNotification
                               object:nil];
         [[NSDistributedNotificationCenter defaultCenter] addObserver:g_wakeObserver
                                                             selector:@selector(appearanceChanged:)
@@ -3306,7 +3587,6 @@ int main(int argc, const char *argv[]) {
                         }
                         if (g_thumbnailPreviewsEnabled) schedulePendingThumbnailCapture(entries);
                         if (g_thumbnailPreviewsEnabled) scheduleChromeBackgroundPrefetch(entries);
-                        scheduleChromeTabArtwork(entries);
                     }
                     atomic_store(&g_isScanning, false);
                 });
