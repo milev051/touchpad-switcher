@@ -5,6 +5,7 @@
 #import <ApplicationServices/ApplicationServices.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <ImageIO/ImageIO.h>
+#import <QuartzCore/QuartzCore.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #include <math.h>
 #include <float.h>
@@ -60,6 +61,14 @@ extern void MTDeviceStart(MTDeviceRef, int);
 extern void MTDeviceStop(MTDeviceRef);
 extern void MTUnregisterContactFrameCallback(MTDeviceRef, MTContactCallbackFunction);
 extern int MTDeviceGetSensorSurfaceDimensions(MTDeviceRef, int *width, int *height);
+// Exact window-server ID of an AX window (used by AltTab and yabai). Bounds
+// cannot identify windows when Stage Manager shrinks them into its strip.
+extern AXError _AXUIElementGetWindow(AXUIElementRef element, CGWindowID *identifier);
+// Blur behind a window with an exact radius (used by iTerm2). The public
+// NSVisualEffectView blur has a fixed strength.
+typedef int CGSConnectionID;
+extern CGSConnectionID CGSMainConnectionID(void);
+extern CGError CGSSetWindowBackgroundBlurRadius(CGSConnectionID connection, NSInteger windowNumber, int radius);
 
 @interface RingEntry : NSObject
 @property(nonatomic, strong) NSRunningApplication *application;
@@ -105,12 +114,27 @@ static void noteChromeSelectionChanges(NSArray<RingEntry *> *entries);
 @property(nonatomic) NSPoint anchorPoint;
 @property(nonatomic) CGFloat ringRadius;
 @property(nonatomic, strong) NSView *pointerView;
+@property(nonatomic, strong) CAShapeLayer *pointerArrow;
+@property(nonatomic, weak) NSView *glowView;
 - (void)movePointerTo:(NSPoint)ringPoint;
+- (void)resetPointer;
 @end
 
-// Pointer inside this ellipse (in ring units) selects nothing, so lifting
-// there cancels, like the center of a game emote wheel.
-static const double kPointerDeadZone = 0.32;
+// Light for the selected direction. It sits under the cards and reaches the
+// edge of the screen; changing the selection sweeps it to the new sector.
+@interface SectorGlowView : NSView
+- (void)showSectorFrom:(CGFloat)startAngle to:(CGFloat)endAngle center:(NSPoint)center;
+- (void)hideAnimated:(BOOL)animated;
+@end
+
+// The first bit of motion already selects: past this tiny radius (in ring
+// units, about half a millimeter of finger travel) the direction counts.
+// Lifting before any motion still selects nothing.
+static const double kPointerDeadZone = 0.05;
+// Radius of the drawn center circle in points; the arrow rides on its edge.
+static const CGFloat kHubRadius = 26.0;
+// The pointer stays inside the ring of cards; only its direction matters.
+static const double kPointerReach = 0.80;
 
 // Settings from the menu bar panel. Stored under one ID so the bare binary
 // and the .app bundle share them; read from the scan, touch and main threads.
@@ -120,6 +144,20 @@ static _Atomic(int) g_settingCardTitles = CardTitlesAll;
 static _Atomic(bool) g_settingPauseVideo = true;
 static _Atomic(bool) g_settingFinderTabsOneCard = true;
 static _Atomic(bool) g_settingHideMenuIcon = false;
+static _Atomic(bool) g_settingSoundEffects = false;
+static _Atomic(int) g_settingBlurRadius = 15;   // 0 turns the blur off
+typedef enum { PointerStyleArrow = 0, PointerStyleDot = 1 } PointerStyle;
+static _Atomic(int) g_settingPointerStyle = PointerStyleArrow;
+static NSSound *g_selectSound;
+static NSSound *g_activateSound;
+
+// Short clicks like the CS buy menu: one when the selection changes, one when
+// the chosen window opens. Off unless turned on in the menu.
+static void playRingSound(NSSound *sound) {
+    if (!sound || !atomic_load(&g_settingSoundEffects)) return;
+    [sound stop];
+    [sound play];
+}
 static _Atomic(bool) g_chromeJavaScriptBlocked = false;
 static BOOL g_replacedRunningInstance = NO;
 
@@ -222,6 +260,143 @@ static CGFloat safeCardWidthForRing(NSUInteger count, CGFloat radiusX, CGFloat r
     return low;
 }
 
+// Direction of a card as seen on screen (the ring is an ellipse, so this is not
+// the raw layout angle).
+static CGFloat cardScreenAngle(NSInteger i, NSUInteger count) {
+    CGFloat radiusX = 1.0, radiusY = 1.0;
+    ringEllipseRadii(count, 1.0, &radiusX, &radiusY);
+    CGFloat rawAngle = rawItemAngle(i, count);
+    return (CGFloat)atan2(sin(rawAngle) * radiusY, cos(rawAngle) * radiusX);
+}
+
+// A card owns the directions up to halfway to each neighbor.
+static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFloat *endAngle) {
+    CGFloat angle = cardScreenAngle(i, count);
+    CGFloat counterClockwise = (CGFloat)M_PI_2, clockwise = (CGFloat)M_PI_2;
+    if (count <= 1) {
+        counterClockwise = clockwise = (CGFloat)M_PI;
+    } else if (count > 2) {
+        CGFloat toPrevious = (CGFloat)remainder(cardScreenAngle((i + count - 1) % count, count) - angle, 2.0 * M_PI);
+        CGFloat toNext = (CGFloat)remainder(cardScreenAngle((i + 1) % count, count) - angle, 2.0 * M_PI);
+        counterClockwise = (toPrevious > 0 ? toPrevious : toNext) / 2.0;
+        clockwise = -(toPrevious > 0 ? toNext : toPrevious) / 2.0;
+    }
+    if (startAngle) *startAngle = angle - clockwise;
+    if (endAngle) *endAngle = angle + counterClockwise;
+}
+
+@implementation SectorGlowView {
+    CAGradientLayer *_gradient;
+    CAShapeLayer *_mask;
+    CGFloat _lastMidAngle;
+    BOOL _visible;
+}
+
+- (instancetype)initWithFrame:(NSRect)frame {
+    self = [super initWithFrame:frame];
+    self.wantsLayer = YES;
+    _gradient = [CAGradientLayer layer];
+    _gradient.type = kCAGradientLayerRadial;
+    // Brightest at the center, fading out toward the edge of the screen.
+    _gradient.colors = @[
+        (id)[NSColor colorWithCalibratedRed:0.60 green:0.92 blue:1.0 alpha:0.45].CGColor,
+        (id)[NSColor colorWithCalibratedRed:0.45 green:0.88 blue:1.0 alpha:0.18].CGColor,
+        (id)[NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.0].CGColor
+    ];
+    _gradient.locations = @[@0.0, @0.40, @1.0];
+    _gradient.opacity = 0;
+    _mask = [CAShapeLayer layer];
+    _gradient.mask = _mask;
+    [self.layer addSublayer:_gradient];
+    return self;
+}
+
+- (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
+
+- (CGPathRef)newSliceFrom:(CGFloat)startAngle to:(CGFloat)endAngle center:(NSPoint)center {
+    // Longer than the screen diagonal, so the slice always ends at the edge.
+    CGFloat reach = hypot(NSWidth(self.bounds), NSHeight(self.bounds));
+    CGMutablePathRef path = CGPathCreateMutable();
+    CGPathMoveToPoint(path, NULL, center.x, center.y);
+    // A fixed number of points lets Core Animation morph one slice into the next.
+    for (int step = 0; step <= 24; step++) {
+        CGFloat angle = startAngle + (endAngle - startAngle) * step / 24.0;
+        CGPathAddLineToPoint(path, NULL, center.x + cos(angle) * reach, center.y + sin(angle) * reach);
+    }
+    CGPathCloseSubpath(path);
+    return path;
+}
+
+- (void)showSectorFrom:(CGFloat)startAngle to:(CGFloat)endAngle center:(NSPoint)center {
+    CGFloat midAngle = (startAngle + endAngle) / 2.0;
+    if (_visible) {
+        // Sweep the short way around instead of through the center.
+        CGFloat shift = round((_lastMidAngle - midAngle) / (2.0 * M_PI)) * 2.0 * M_PI;
+        startAngle += shift;
+        endAngle += shift;
+        midAngle += shift;
+    }
+    _lastMidAngle = midAngle;
+
+    CGPathRef path = [self newSliceFrom:startAngle to:endAngle center:center];
+    CGPathRef fromPath = NULL;
+    if (_visible) {
+        CAShapeLayer *shown = (CAShapeLayer *)_mask.presentationLayer;
+        fromPath = CGPathRetain(shown.path ?: _mask.path);
+    }
+    CGFloat width = MAX(1.0, NSWidth(self.bounds)), height = MAX(1.0, NSHeight(self.bounds));
+    CGFloat glowRadius = MAX(width, height) * 0.6;
+    float fromOpacity = ((CALayer *)_gradient.presentationLayer ?: _gradient).opacity;
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    _gradient.frame = self.layer.bounds;
+    _mask.frame = _gradient.bounds;
+    _gradient.startPoint = CGPointMake(center.x / width, center.y / height);
+    _gradient.endPoint = CGPointMake((center.x + glowRadius) / width, (center.y + glowRadius) / height);
+    _mask.path = path;
+    _gradient.opacity = 1.0;
+    [CATransaction commit];
+
+    if (fromPath) {
+        CABasicAnimation *sweep = [CABasicAnimation animationWithKeyPath:@"path"];
+        sweep.fromValue = (__bridge id)fromPath;
+        sweep.toValue = (__bridge id)path;
+        sweep.duration = 0.12;
+        sweep.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+        [_mask addAnimation:sweep forKey:@"sweep"];
+        CGPathRelease(fromPath);
+    }
+    if (!_visible || fromOpacity < 1.0) {
+        CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
+        fade.fromValue = @(fromOpacity);
+        fade.toValue = @1.0;
+        fade.duration = 0.15;
+        [_gradient addAnimation:fade forKey:@"fade"];
+    }
+    _visible = YES;
+    CGPathRelease(path);
+}
+
+- (void)hideAnimated:(BOOL)animated {
+    float fromOpacity = ((CALayer *)_gradient.presentationLayer ?: _gradient).opacity;
+    _visible = NO;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [_gradient removeAllAnimations];
+    [_mask removeAllAnimations];
+    _gradient.opacity = 0;
+    [CATransaction commit];
+    if (animated && fromOpacity > 0) {
+        CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
+        fade.fromValue = @(fromOpacity);
+        fade.toValue = @0.0;
+        fade.duration = 0.18;
+        [_gradient addAnimation:fade forKey:@"fade"];
+    }
+}
+@end
+
 @implementation RingView
 - (BOOL)isFlipped { return NO; }
 
@@ -234,36 +409,77 @@ static CGFloat safeCardWidthForRing(NSUInteger count, CGFloat radiusX, CGFloat r
     if (_selectedIndex == selectedIndex) return;
     _selectedIndex = selectedIndex;
     [self setNeedsDisplay:YES];
+    SectorGlowView *glow = (SectorGlowView *)self.glowView;
+    NSUInteger count = self.entries.count;
+    if (selectedIndex >= 0 && selectedIndex < (NSInteger)count) {
+        CGFloat startAngle = 0, endAngle = 0;
+        cardSector(selectedIndex, count, &startAngle, &endAngle);
+        [glow showSectorFrom:startAngle to:endAngle center:self.anchorPoint];
+        playRingSound(g_selectSound);
+    } else {
+        [glow hideAnimated:YES];
+    }
 }
 
-// The pointer is its own small layer, so following the fingers never redraws
-// the thumbnails.
+// The pointer (an arrow that turns to point away from the center, or a dot)
+// is its own small layer. Following the fingers never redraws the thumbnails.
+- (void)resetPointer {
+    [self.pointerView removeFromSuperview];
+    self.pointerView = nil;
+    self.pointerArrow = nil;
+}
+
 - (void)movePointerTo:(NSPoint)ringPoint {
     if (!self.pointerView) {
-        const CGFloat size = 16.0;
-        NSView *dot = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, size, size)];
-        dot.wantsLayer = YES;
-        dot.layer.cornerRadius = size / 2.0;
-        dot.layer.backgroundColor = [NSColor colorWithCalibratedWhite:1.0 alpha:0.92].CGColor;
-        dot.layer.borderColor = [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:1.0].CGColor;
-        dot.layer.borderWidth = 2.0;
-        dot.layer.shadowColor = [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:1.0].CGColor;
-        dot.layer.shadowOpacity = 0.8;
-        dot.layer.shadowRadius = 6.0;
-        dot.layer.shadowOffset = CGSizeZero;
-        [self addSubview:dot];
-        self.pointerView = dot;
+        const CGFloat size = 40.0;
+        NSView *holder = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, size, size)];
+        holder.wantsLayer = YES;
+        CAShapeLayer *arrow = [CAShapeLayer layer];
+        arrow.bounds = CGRectMake(-size / 2.0, -size / 2.0, size, size);
+        arrow.position = CGPointMake(size / 2.0, size / 2.0);
+        CGMutablePathRef path = CGPathCreateMutable();
+        if (atomic_load(&g_settingPointerStyle) == PointerStyleDot) {
+            CGPathAddEllipseInRect(path, NULL, CGRectMake(-8, -8, 16, 16));
+        } else {
+            CGPathMoveToPoint(path, NULL, 14, 0);
+            CGPathAddLineToPoint(path, NULL, -9, 10);
+            CGPathAddLineToPoint(path, NULL, -4, 0);
+            CGPathAddLineToPoint(path, NULL, -9, -10);
+            CGPathCloseSubpath(path);
+        }
+        arrow.path = path;
+        CGPathRelease(path);
+        arrow.fillColor = [NSColor colorWithCalibratedWhite:1.0 alpha:0.95].CGColor;
+        arrow.strokeColor = [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:1.0].CGColor;
+        arrow.lineWidth = 1.5;
+        arrow.lineJoin = kCALineJoinRound;
+        arrow.shadowColor = [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:1.0].CGColor;
+        arrow.shadowOpacity = 0.8;
+        arrow.shadowRadius = 6.0;
+        arrow.shadowOffset = CGSizeZero;
+        arrow.affineTransform = CGAffineTransformMakeRotation((CGFloat)M_PI_2);
+        [holder.layer addSublayer:arrow];
+        [self addSubview:holder];
+        self.pointerView = holder;
+        self.pointerArrow = arrow;
     }
+    // At the very center there is no direction; start pointing up.
+    CGFloat angle = hypot(ringPoint.x, ringPoint.y) > 0.001 ? (CGFloat)atan2(ringPoint.y, ringPoint.x) : (CGFloat)M_PI_2;
+    // The arrow never hides the icon in the hub: it rides on the hub's edge
+    // until the pointer moves further out.
+    CGFloat distance = MAX(hypot(ringPoint.x, ringPoint.y) * self.ringRadius, kHubRadius + 16.0);
     NSSize size = self.pointerView.frame.size;
-    [self.pointerView setFrameOrigin:NSMakePoint(self.anchorPoint.x + ringPoint.x * self.ringRadius - size.width / 2.0,
-                                                 self.anchorPoint.y + ringPoint.y * self.ringRadius - size.height / 2.0)];
+    [self.pointerView setFrameOrigin:NSMakePoint(self.anchorPoint.x + cos(angle) * distance - size.width / 2.0,
+                                                 self.anchorPoint.y + sin(angle) * distance - size.height / 2.0)];
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    self.pointerArrow.affineTransform = CGAffineTransformMakeRotation(angle);
+    [CATransaction commit];
 }
 
 - (void)drawRect:(NSRect)dirtyRect {
     [super drawRect:dirtyRect];
     NSRect bounds = self.bounds;
-    [[NSColor colorWithCalibratedWhite:0.02 alpha:0.27] setFill];
-    NSRectFill(bounds);
     NSPoint center = self.anchorPoint;
     NSUInteger count = self.entries.count;
     if (count == 0) {
@@ -279,13 +495,24 @@ static CGFloat safeCardWidthForRing(NSUInteger count, CGFloat radiusX, CGFloat r
     CGFloat radiusX = radius, radiusY = radius;
     ringEllipseRadii(count, radius, &radiusX, &radiusY);
 
-    // Faint center zone: lifting the fingers inside it cancels.
-    NSRect deadZone = NSMakeRect(center.x - radiusX * kPointerDeadZone, center.y - radiusY * kPointerDeadZone,
-                                 radiusX * kPointerDeadZone * 2.0, radiusY * kPointerDeadZone * 2.0);
-    NSBezierPath *deadZonePath = [NSBezierPath bezierPathWithOvalInRect:deadZone];
-    deadZonePath.lineWidth = 1.5;
-    [[NSColor colorWithCalibratedWhite:1.0 alpha:self.selectedIndex < 0 ? 0.30 : 0.14] setStroke];
-    [deadZonePath stroke];
+    NSInteger selectedIndex = self.selectedIndex;
+
+    // Center hub with the icon of the selected app, so the choice is readable
+    // where the eye already is.
+    CGFloat hubRadius = kHubRadius;
+    NSRect hubRect = NSMakeRect(center.x - hubRadius, center.y - hubRadius, hubRadius * 2.0, hubRadius * 2.0);
+    NSBezierPath *hub = [NSBezierPath bezierPathWithOvalInRect:hubRect];
+    [[NSColor colorWithCalibratedWhite:0.08 alpha:0.85] setFill];
+    [hub fill];
+    hub.lineWidth = 2.0;
+    [(selectedIndex >= 0 ? [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.9]
+                         : [NSColor colorWithCalibratedWhite:1.0 alpha:0.35]) setStroke];
+    [hub stroke];
+    if (selectedIndex >= 0 && selectedIndex < (NSInteger)count) {
+        CGFloat iconSize = hubRadius * 1.3;
+        [self.entries[(NSUInteger)selectedIndex].icon drawInRect:NSMakeRect(center.x - iconSize / 2.0, center.y - iconSize / 2.0,
+                                                                            iconSize, iconSize)];
+    }
 
     CGFloat cardWidth = safeCardWidthForRing(count, radiusX, radiusY, NSWidth(bounds));
     CGFloat previewWidth = cardWidth * 0.94;
@@ -320,8 +547,22 @@ static CGFloat safeCardWidthForRing(NSUInteger count, CGFloat radiusX, CGFloat r
             [NSGraphicsContext saveGraphicsState];
             NSBezierPath *clipPath = [NSBezierPath bezierPathWithRoundedRect:previewRect xRadius:8.0 yRadius:8.0];
             [clipPath addClip];
+            // Fill the card without stretching; trim the sides of wide windows
+            // and the bottom of tall ones, so the title bar stays visible.
+            NSSize imageSize = thumbnail.size;
+            NSRect sourceRect = NSMakeRect(0, 0, imageSize.width, imageSize.height);
+            CGFloat cardAspect = itemPreviewWidth / previewHeight;
+            if (imageSize.width > 0 && imageSize.height > 0) {
+                if (imageSize.width / imageSize.height > cardAspect) {
+                    sourceRect.size.width = imageSize.height * cardAspect;
+                    sourceRect.origin.x = (imageSize.width - sourceRect.size.width) / 2.0;
+                } else {
+                    sourceRect.size.height = imageSize.width / cardAspect;
+                    sourceRect.origin.y = imageSize.height - sourceRect.size.height;
+                }
+            }
             [thumbnail drawInRect:previewRect
-                         fromRect:NSZeroRect
+                         fromRect:sourceRect
                         operation:NSCompositingOperationSourceOver
                          fraction:1.0];
             [NSGraphicsContext restoreGraphicsState];
@@ -464,6 +705,8 @@ static CGFloat safeCardWidthForRing(NSUInteger count, CGFloat radiusX, CGFloat r
 
 static RingPanel *g_panel;
 static RingView *g_ringView;
+static SectorGlowView *g_glowView;
+static NSView *g_dimView;
 static NSArray<RingEntry *> *g_windowEntries = @[];
 static _Atomic(int) g_windowEntryCount = 0;
 static CFMutableArrayRef g_devices = NULL;
@@ -476,11 +719,9 @@ static _Atomic(bool) g_gestureEnding = false;
 static _Atomic(uint64_t) g_ringShownGeneration = 0;
 static double g_previousX = 0.0;
 static double g_previousY = 0.0;
-static double g_previousTimestamp = 0.0;
 // Virtual pointer in ring units: cards sit on the ellipse ringEllipseRadii(count, 1).
 static double g_pointerX = 0.0;
 static double g_pointerY = 0.0;
-static double g_pointerSpeed = 0.0;
 static double g_trackpadAspect = 0.68;
 static NSInteger g_selectedIndex = -1;
 static _Atomic(uint64_t) g_gestureGeneration = 0;
@@ -759,11 +1000,43 @@ static void ensurePanel(NSScreen *screen) {
     g_panel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
                                  NSWindowCollectionBehaviorFullScreenAuxiliary |
                                  NSWindowCollectionBehaviorStationary;
-    g_ringView = [[RingView alloc] initWithFrame:NSMakeRect(0, 0, NSWidth(screen.frame), NSHeight(screen.frame))];
+    // Backdrop (blur or plain dimming), the direction light, then the cards.
+    NSRect contentFrame = NSMakeRect(0, 0, NSWidth(screen.frame), NSHeight(screen.frame));
+    NSView *content = [[NSView alloc] initWithFrame:contentFrame];
+    content.wantsLayer = YES;
+    g_dimView = [[NSView alloc] initWithFrame:contentFrame];
+    g_dimView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    g_dimView.wantsLayer = YES;
+    [content addSubview:g_dimView];
+    g_glowView = [[SectorGlowView alloc] initWithFrame:contentFrame];
+    g_glowView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [content addSubview:g_glowView];
+    g_ringView = [[RingView alloc] initWithFrame:contentFrame];
     g_ringView.wantsLayer = YES;
+    g_ringView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    g_ringView.glowView = g_glowView;
     g_ringView.entries = g_windowEntries;
     g_ringView.selectedIndex = -1;
-    g_panel.contentView = g_ringView;
+    [content addSubview:g_ringView];
+    g_panel.contentView = content;
+}
+
+// The window server blurs what is behind the panel on the GPU, so the blur
+// costs no drawing in this process.
+static void setPanelBlur(int radius) {
+    if (g_panel) CGSSetWindowBackgroundBlurRadius(CGSMainConnectionID(), g_panel.windowNumber, radius);
+}
+
+// The blur grows over about 0.2 s instead of snapping in.
+static void animatePanelBlur(uint64_t generation, int radius) {
+    const int steps = 6;
+    for (int step = 1; step <= steps; step++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(step * 33 * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), ^{
+            if (atomic_load(&g_ringShownGeneration) != generation || !atomic_load(&g_ringOverlayVisible)) return;
+            setPanelBlur(radius * step / steps);
+        });
+    }
 }
 
 static CGFloat fittedRingRadius(NSSize size, NSUInteger count, CGFloat *centerOffsetY) {
@@ -810,7 +1083,13 @@ static void showRing(uint64_t generation) {
     g_ringView.selectedIndex = -1;
     g_ringView.anchorPoint = anchor;
     g_ringView.ringRadius = fittedRadius;
+    [g_glowView hideAnimated:NO];
     [g_ringView movePointerTo:NSZeroPoint];
+    // The backdrop fades in and the blur grows; the cards show at once.
+    int blurRadius = atomic_load(&g_settingBlurRadius);
+    setPanelBlur(0);
+    g_dimView.layer.backgroundColor = [NSColor colorWithCalibratedWhite:0.02 alpha:blurRadius > 0 ? 0.12 : 0.27].CGColor;
+    g_dimView.alphaValue = 0.0;
     for (RingEntry *entry in g_windowEntries) (void)resolvedThumbnail(entry);
     [g_ringView setNeedsDisplay:YES];
     // Avoid forcing a synchronous draw before the panel is ordered onscreen.
@@ -818,6 +1097,12 @@ static void showRing(uint64_t generation) {
     atomic_store(&g_ringOverlayVisible, true);
     [g_panel orderFrontRegardless];
     atomic_store(&g_ringShownGeneration, generation);
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
+        context.duration = 0.2;
+        context.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+        g_dimView.animator.alphaValue = 1.0;
+    } completionHandler:nil];
+    if (blurRadius > 0) animatePanelBlur(generation, blurRadius);
     fprintf(stderr, "[ring] overlay shown at screen center; %lu entries\n", (unsigned long)g_windowEntries.count);
 
     // The cached ring is already on screen. Fresh pictures of the visible
@@ -1021,6 +1306,7 @@ static void finishGesture(uint64_t generation, NSInteger selection) {
     if (!entry.application || entry.application.isTerminated) {
         return;
     }
+    playRingSound(g_activateSound);
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     // Activate the application without asking AppKit to bring every window
@@ -1310,6 +1596,18 @@ static BOOL axWindowBounds(AXUIElementRef window, CGRect *boundsOut) {
     return hasPosition && hasSize;
 }
 
+// Window titles are shortened differently by the app and by the window server
+// ("runs..." against "run…."), so a shared beginning also counts as a match.
+static BOOL windowTitlesMatch(NSString *a, NSString *b) {
+    if (!a.length || !b.length) return NO;
+    if ([a localizedCaseInsensitiveContainsString:b] || [b localizedCaseInsensitiveContainsString:a]) return YES;
+    NSCharacterSet *trim = [NSCharacterSet characterSetWithCharactersInString:@"….· "];
+    NSString *left = [[a lowercaseString] stringByTrimmingCharactersInSet:trim];
+    NSString *right = [[b lowercaseString] stringByTrimmingCharactersInSet:trim];
+    NSString *common = [left commonPrefixWithString:right options:0];
+    return common.length >= MIN((NSUInteger)16, MIN(left.length, right.length));
+}
+
 static CGWindowID matchingCGWindowID(pid_t pid, CGRect bounds, NSString *windowTitle,
                                      NSArray<NSDictionary *> *windowInfos, NSSet<NSNumber *> *usedIDs) {
     CGWindowID bestID = kCGNullWindowID;
@@ -1320,19 +1618,25 @@ static CGWindowID matchingCGWindowID(pid_t pid, CGRect bounds, NSString *windowT
         if ([usedIDs containsObject:windowNumber]) continue;
         NSDictionary *candidate = info[(id)kCGWindowBounds];
         if (![candidate isKindOfClass:[NSDictionary class]]) continue;
+        // Chrome keeps hidden helper surfaces (1x1, a 30 px strip, popups).
+        // They are never the browser window.
+        if ([candidate[@"Width"] doubleValue] < 100 || [candidate[@"Height"] doubleValue] < 60) continue;
         double score = fabs(bounds.origin.x - [candidate[@"X"] doubleValue]) +
             fabs(bounds.origin.y - [candidate[@"Y"] doubleValue]) +
             fabs(bounds.size.width - [candidate[@"Width"] doubleValue]) +
             fabs(bounds.size.height - [candidate[@"Height"] doubleValue]);
         NSString *candidateTitle = info[(id)kCGWindowName];
-        if (windowTitle.length && candidateTitle.length) {
-            if ([candidateTitle localizedCaseInsensitiveContainsString:windowTitle] ||
-                [windowTitle localizedCaseInsensitiveContainsString:candidateTitle]) {
+        if (windowTitle.length) {
+            if (windowTitlesMatch(candidateTitle, windowTitle)) {
                 score -= 1000000.0;
             } else {
+                // An untitled surface is no better than a window with another title.
                 score += 10000.0;
             }
         }
+        // Bounds can differ a lot (Stage Manager shrinks windows), so a window
+        // that is actually on screen beats a hidden one.
+        if (![info[(id)kCGWindowIsOnscreen] boolValue]) score += 5000.0;
         if (score < bestScore) {
             bestScore = score;
             bestID = windowNumber.unsignedIntValue;
@@ -1379,6 +1683,12 @@ static CGWindowID matchingTabCGWindowID(pid_t pid, CGRect bounds, NSString *tabT
         }
     }
     return bestID;
+}
+
+static CGWindowID axWindowID(AXUIElementRef window) {
+    CGWindowID windowID = kCGNullWindowID;
+    if (!window || _AXUIElementGetWindow(window, &windowID) != kAXErrorSuccess) return kCGNullWindowID;
+    return windowID;
 }
 
 static NSString *normalizedTabURL(NSString *urlString) {
@@ -1926,6 +2236,16 @@ static NSArray<RingEntry *> *collectOpenWindows(void) {
         NSString *cgTitle = windowInfo[(id)kCGWindowName];
         cgTitlesByWindowID[windowID] = [cgTitle isKindOfClass:[NSString class]] ? cgTitle : @"";
     }
+    // Apps that have a real titled window. Their untitled hidden windows are
+    // helpers (WhatsApp and Terminal keep a 500x500 one), not extra cards.
+    NSMutableSet<NSNumber *> *pidsWithTitledWindow = [NSMutableSet set];
+    for (NSDictionary *info in windowInfos) {
+        if ([info[(id)kCGWindowLayer] intValue] != 0) continue;
+        NSString *name = info[(id)kCGWindowName];
+        if ([name isKindOfClass:[NSString class]] && name.length && info[(id)kCGWindowOwnerPID]) {
+            [pidsWithTitledWindow addObject:info[(id)kCGWindowOwnerPID]];
+        }
+    }
     NSMutableArray<RingEntry *> *entries = [NSMutableArray array];
     // Window presence comes from the complete CG list. AX is used to enrich
     // windows with tab information, not to decide whether an app was handled.
@@ -1947,14 +2267,45 @@ static NSArray<RingEntry *> *collectOpenWindows(void) {
                     }
                 }
                 NSMutableDictionary<NSNumber *, NSNumber *> *chromeWindowIDs = [NSMutableDictionary dictionary];
+                // Chrome's AX window title holds the active tab title, and the
+                // AX window knows its exact ID. Needs Accessibility; without it
+                // the list stays empty and matching falls back to CG data.
+                NSMutableArray<NSDictionary *> *chromeAXWindows = [NSMutableArray array];
+                AXUIElementRef chromeElement = AXUIElementCreateApplication(app.processIdentifier);
+                if (chromeElement) {
+                    AXUIElementSetMessagingTimeout(chromeElement, 0.3f);
+                    CFTypeRef axWindowsValue = NULL;
+                    if (AXUIElementCopyAttributeValue(chromeElement, kAXWindowsAttribute, &axWindowsValue) == kAXErrorSuccess &&
+                        axWindowsValue && CFGetTypeID(axWindowsValue) == CFArrayGetTypeID()) {
+                        for (id axWindow in (__bridge NSArray *)axWindowsValue) {
+                            CGWindowID axID = axWindowID((__bridge AXUIElementRef)axWindow);
+                            NSString *axTitle = axStringAttribute((__bridge AXUIElementRef)axWindow, kAXTitleAttribute);
+                            if (axID != kCGNullWindowID && axTitle.length) {
+                                [chromeAXWindows addObject:@{@"id": @(axID), @"title": axTitle}];
+                            }
+                        }
+                    }
+                    if (axWindowsValue) CFRelease(axWindowsValue);
+                    CFRelease(chromeElement);
+                }
                 for (NSDictionary *tabInfo in chromeTabs) {
                     CGRect bounds = NSRectToCGRect([tabInfo[@"bounds"] rectValue]);
                     NSString *windowTitle = tabInfo[@"windowTitle"] ?: @"";
                     NSNumber *windowIndex = tabInfo[@"windowIndex"];
                     NSNumber *mappedWindowID = chromeWindowIDs[windowIndex];
-                    CGWindowID windowID = mappedWindowID
-                        ? mappedWindowID.unsignedIntValue
-                        : matchingCGWindowID(app.processIdentifier, bounds, windowTitle, windowInfos, matchedWindowIDs);
+                    CGWindowID windowID = mappedWindowID ? mappedWindowID.unsignedIntValue : kCGNullWindowID;
+                    if (!mappedWindowID) {
+                        for (NSDictionary *axWindow in chromeAXWindows) {
+                            if ([matchedWindowIDs containsObject:axWindow[@"id"]]) continue;
+                            if (!windowTitlesMatch(axWindow[@"title"], windowTitle)) continue;
+                            windowID = [axWindow[@"id"] unsignedIntValue];
+                            break;
+                        }
+                        if (windowID == kCGNullWindowID) {
+                            windowID = matchingCGWindowID(app.processIdentifier, bounds, windowTitle,
+                                                          windowInfos, matchedWindowIDs);
+                        }
+                    }
                     if (!mappedWindowID) chromeWindowIDs[windowIndex] = @(windowID);
                     if (windowID != kCGNullWindowID && !mappedWindowID) {
                         [matchedWindowIDs addObject:@(windowID)];
@@ -2015,8 +2366,11 @@ static NSArray<RingEntry *> *collectOpenWindows(void) {
                 axWindowBounds(axWindow, &bounds);
                 if (bounds.size.width < 100 || bounds.size.height < 60) continue;
                 NSString *windowTitle = axStringAttribute(axWindow, kAXTitleAttribute) ?: @"";
-                CGWindowID windowID = matchingCGWindowID(app.processIdentifier, bounds, windowTitle,
-                                                          windowInfos, matchedWindowIDs);
+                CGWindowID windowID = axWindowID(axWindow);
+                if (windowID == kCGNullWindowID || [matchedWindowIDs containsObject:@(windowID)]) {
+                    windowID = matchingCGWindowID(app.processIdentifier, bounds, windowTitle,
+                                                  windowInfos, matchedWindowIDs);
+                }
                 if (windowID != kCGNullWindowID) {
                     [matchedWindowIDs addObject:@(windowID)];
                     [handledTabWindowIDs addObject:@(windowID)];
@@ -2106,6 +2460,11 @@ static NSArray<RingEntry *> *collectOpenWindows(void) {
             CGFloat height = [bounds[@"Height"] doubleValue];
             if (width < 100 || height < 60) continue;
         } else {
+            continue;
+        }
+        if (!title.length && ![info[(id)kCGWindowIsOnscreen] boolValue] && [pidsWithTitledWindow containsObject:pid]) {
+            // Stage Manager shrinks the main window, so "inside the window"
+            // below no longer catches these helpers.
             continue;
         }
         if (!title.length) {
@@ -2307,6 +2666,19 @@ static void recordThumbnailCaptureSuccess(NSNumber *windowKey) {
 static const size_t kThumbnailPixelWidth = 640;
 static const size_t kThumbnailPixelHeight = 384;
 
+// Capture in the window's own proportions. A fixed 640x384 frame around a
+// narrower window (Stage Manager shrinks the active one) was padded with white.
+static void configureThumbnailSize(SCStreamConfiguration *configuration, SCWindow *window) {
+    CGFloat width = window.frame.size.width, height = window.frame.size.height;
+    size_t pixelHeight = kThumbnailPixelHeight;
+    if (width > 1 && height > 1) {
+        pixelHeight = (size_t)MIN(MAX(lround(kThumbnailPixelWidth * height / width), 120), 960);
+    }
+    configuration.width = kThumbnailPixelWidth;
+    configuration.height = pixelHeight;
+    configuration.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+}
+
 static NSData *encodedThumbnailFromCGImage(CGImageRef image) {
     if (!image) return nil;
     NSMutableData *data = [NSMutableData data];
@@ -2354,11 +2726,45 @@ static void releaseDecodedThumbnails(void) {
     }
 }
 
+static CGRect currentWindowBounds(CGWindowID windowID) {
+    CGRect bounds = CGRectNull;
+    const void *ids[] = { (const void *)(uintptr_t)windowID };
+    CFArrayRef idArray = CFArrayCreate(NULL, ids, 1, NULL);
+    CFArrayRef descriptions = idArray ? CGWindowListCreateDescriptionFromArray(idArray) : NULL;
+    if (descriptions && CFArrayGetCount(descriptions) > 0) {
+        NSDictionary *info = (__bridge NSDictionary *)CFArrayGetValueAtIndex(descriptions, 0);
+        CFDictionaryRef boundsDict = (__bridge CFDictionaryRef)info[(id)kCGWindowBounds];
+        if (boundsDict) CGRectMakeWithDictionaryRepresentation(boundsDict, &bounds);
+    }
+    if (descriptions) CFRelease(descriptions);
+    if (idArray) CFRelease(idArray);
+    return bounds;
+}
+
+static BOOL boundsClose(CGRect a, CGRect b) {
+    if (CGRectIsNull(a) || CGRectIsNull(b)) return NO;
+    return fabs(a.origin.x - b.origin.x) <= 2 && fabs(a.origin.y - b.origin.y) <= 2 &&
+           fabs(a.size.width - b.size.width) <= 2 && fabs(a.size.height - b.size.height) <= 2;
+}
+
+// A window in the middle of an animation (Stage Manager moving it to or from
+// its strip, a resize, app switching) gives a skewed picture on a black
+// background. The window must have the size ScreenCaptureKit listed and must
+// not move while it is captured; otherwise the old picture stays.
+static BOOL windowIsSettled(SCWindow *window, CGRect *boundsOut) {
+    CGRect bounds = currentWindowBounds(window.windowID);
+    if (boundsOut) *boundsOut = bounds;
+    return !CGRectIsNull(bounds) &&
+           fabs(bounds.size.width - window.frame.size.width) <= 2 &&
+           fabs(bounds.size.height - window.frame.size.height) <= 2;
+}
+
 static CGImageRef captureWindowImage(SCWindow *window) {
+    CGRect boundsBefore = CGRectNull;
+    if (!windowIsSettled(window, &boundsBefore)) return NULL;
     SCContentFilter *filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:window];
     SCStreamConfiguration *configuration = [SCStreamConfiguration new];
-    configuration.width = kThumbnailPixelWidth;
-    configuration.height = kThumbnailPixelHeight;
+    configureThumbnailSize(configuration, window);
     configuration.showsCursor = NO;
     configuration.ignoreShadowsSingleWindow = YES;
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
@@ -2375,6 +2781,10 @@ static CGImageRef captureWindowImage(SCWindow *window) {
     }];
     if (dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(800 * NSEC_PER_MSEC))) != 0) {
         atomic_store(&timedOut, true);
+    }
+    if (result && !boundsClose(boundsBefore, currentWindowBounds(window.windowID))) {
+        CGImageRelease(result);   // moved during the capture
+        result = NULL;
     }
     return result;
 }
@@ -2424,22 +2834,58 @@ static NSString *chromeActiveTab(NSString *windowID, NSString **urlOut) {
     return parts[0];
 }
 
+static NSMutableDictionary<NSNumber *, NSValue *> *g_windowFullSize;
+
+static BOOL stageManagerEnabled(void) {
+    static NSTimeInterval s_checkedAt = -10;
+    static BOOL s_enabled = NO;
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    if (now - s_checkedAt > 2.0) {
+        s_checkedAt = now;
+        CFPreferencesAppSynchronize(CFSTR("com.apple.WindowManager"));
+        Boolean valid = false;
+        s_enabled = CFPreferencesGetAppBooleanValue(CFSTR("GloballyEnabled"), CFSTR("com.apple.WindowManager"), &valid) && valid;
+    }
+    return s_enabled;
+}
+
+// On-screen windows worth a screenshot. Stage Manager keeps other windows on
+// screen as small tilted previews in its strip; capturing those gave cut-off
+// pictures with a white background. Such a window keeps its last full picture.
+static NSMutableSet<NSNumber *> *capturableOnScreenWindowIDs(void) {
+    NSMutableSet<NSNumber *> *windowIDs = [NSMutableSet set];
+    CFArrayRef onScreenWindows = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+    if (!onScreenWindows) return windowIDs;
+    BOOL stageManager = stageManagerEnabled();
+    @synchronized ([NSMutableDictionary class]) {
+        if (!g_windowFullSize) g_windowFullSize = [NSMutableDictionary dictionary];
+        for (CFIndex i = 0; i < CFArrayGetCount(onScreenWindows); i++) {
+            NSDictionary *info = (__bridge NSDictionary *)CFArrayGetValueAtIndex(onScreenWindows, i);
+            NSNumber *wid = info[(id)kCGWindowNumber];
+            NSDictionary *bounds = info[(id)kCGWindowBounds];
+            if (!wid || ![bounds isKindOfClass:[NSDictionary class]]) continue;
+            CGFloat width = [bounds[@"Width"] doubleValue], height = [bounds[@"Height"] doubleValue];
+            NSSize fullSize = g_windowFullSize[wid].sizeValue;
+            BOOL shrunk = width < fullSize.width * 0.6 || height < fullSize.height * 0.6;
+            BOOL stripSized = stageManager && width < 320 && height < 320;
+            if (shrunk || stripSized) continue;
+            if (width * height > fullSize.width * fullSize.height) {
+                g_windowFullSize[wid] = [NSValue valueWithSize:NSMakeSize(width, height)];
+            }
+            [windowIDs addObject:wid];
+        }
+    }
+    CFRelease(onScreenWindows);
+    return windowIDs;
+}
+
 // Captures visible windows right away instead of waiting for the periodic
 // planner: the app being left (onlyPID) or, when the ring opens, every visible
 // window whose picture is older than minAge. Results are stored in one pass so
 // an open ring redraws once.
 static void refreshThumbnailsNow(pid_t onlyPID, NSTimeInterval minAge) {
     if (!g_thumbnailPreviewsEnabled || !g_liveCaptureQueue || !CGPreflightScreenCaptureAccess()) return;
-    NSMutableSet<NSNumber *> *onScreenIDs = [NSMutableSet set];
-    CFArrayRef onScreenWindows = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
-    if (onScreenWindows) {
-        for (CFIndex i = 0; i < CFArrayGetCount(onScreenWindows); i++) {
-            NSDictionary *info = (__bridge NSDictionary *)CFArrayGetValueAtIndex(onScreenWindows, i);
-            NSNumber *wid = info[(id)kCGWindowNumber];
-            if (wid) [onScreenIDs addObject:wid];
-        }
-        CFRelease(onScreenWindows);
-    }
+    NSMutableSet<NSNumber *> *onScreenIDs = capturableOnScreenWindowIDs();
 
     pid_t frontPID = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
@@ -2656,17 +3102,7 @@ static void capturePendingThumbnails(NSArray<RingEntry *> *entries,
     NSMutableSet<NSNumber *> *wantedChromeIDs = [NSMutableSet set];
     NSMutableArray<RingEntry *> *wantedTabs = [NSMutableArray array];
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
-    NSMutableSet<NSNumber *> *onScreenIDs = [NSMutableSet set];
-    CFArrayRef onScreenWindows = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
-    if (onScreenWindows) {
-        CFIndex onScreenCount = CFArrayGetCount(onScreenWindows);
-        for (CFIndex i = 0; i < onScreenCount; i++) {
-            NSDictionary *info = (__bridge NSDictionary *)CFArrayGetValueAtIndex(onScreenWindows, i);
-            NSNumber *wid = info[(id)kCGWindowNumber];
-            if (wid) [onScreenIDs addObject:wid];
-        }
-        CFRelease(onScreenWindows);
-    }
+    NSMutableSet<NSNumber *> *onScreenIDs = capturableOnScreenWindowIDs();
 
     NSCountedSet<NSNumber *> *tabWindowIDCounts = [NSCountedSet set];
     for (RingEntry *entry in entries) {
@@ -2796,14 +3232,19 @@ static void capturePendingThumbnails(NSArray<RingEntry *> *entries,
             NSNumber *windowKey = @(window.windowID);
             if (![wantedIDs containsObject:windowKey]) continue;
             [foundIDs addObject:windowKey];
+            CGRect boundsBefore = CGRectNull;
+            BOOL settled = windowIsSettled(window, &boundsBefore);
             SCStreamConfiguration *configuration = [SCStreamConfiguration new];
-            configuration.width = kThumbnailPixelWidth;
-            configuration.height = kThumbnailPixelHeight;
+            configureThumbnailSize(configuration, window);
             configuration.showsCursor = NO;
             configuration.ignoreShadowsSingleWindow = YES;
             [SCScreenshotManager captureImageWithFilter:[[SCContentFilter alloc] initWithDesktopIndependentWindow:window]
                                        configuration:configuration
-                                       completionHandler:^(CGImageRef image, NSError *captureError) {
+                                       completionHandler:^(CGImageRef capturedImage, NSError *captureError) {
+                // A window that was animating keeps its previous picture and
+                // is tried again after the short failure backoff.
+                CGImageRef image = settled && boundsClose(boundsBefore, currentWindowBounds(window.windowID))
+                    ? capturedImage : NULL;
                 if (!image) {
                     if (captureError) NSLog(@"Could not capture window %u: %@", window.windowID, captureError.localizedDescription);
                     dispatch_async(dispatch_get_main_queue(), ^{
@@ -3027,48 +3468,40 @@ static void pruneThumbnailCaches(NSArray<RingEntry *> *entries) {
     }
 }
 
-// Finger travel moves a pointer, with acceleration like a mouse: slow motion
-// is fine enough to pick between neighboring cards, a fast flick reaches the
-// far side. dx and dy are in trackpad widths, so both axes move alike.
-static void moveRingPointer(double dx, double dy, double dt, NSInteger count) {
-    dt = MIN(MAX(dt, 0.004), 0.05);
-    double speed = hypot(dx, dy) / dt;
-    g_pointerSpeed = g_pointerSpeed * 0.7 + speed * 0.3;
-    const double kBaseGain = 1.0 / 0.08;   // about 8% of the trackpad width reaches the ring
-    double t = MIN(MAX((g_pointerSpeed - 0.08) / (0.60 - 0.08), 0.0), 1.0);
-    double gain = kBaseGain * (0.45 + 1.15 * t);
-    g_pointerX += dx * gain;
-    g_pointerY += dy * gain;
+// Finger travel moves the pointer at one constant speed, like a plain cursor.
+// Only the direction selects, so no acceleration is needed. dx and dy are in
+// trackpad widths, so both axes move alike.
+static void moveRingPointer(double dx, double dy, NSInteger count) {
+    const double kGain = 1.0 / 0.08;   // about 8% of the trackpad width reaches the ring
+    g_pointerX += dx * kGain;
+    g_pointerY += dy * kGain;
 
-    // Keep the pointer just past the cards; pushing further slides along the
-    // ring instead of wandering off screen.
+    // Keep the pointer inside the ring; pushing further slides it around the
+    // ring, which turns the selection to the neighboring card.
     CGFloat radiusX = 1.0, radiusY = 1.0;
     ringEllipseRadii((NSUInteger)MAX(count, 1), 1.0, &radiusX, &radiusY);
     double norm = hypot(g_pointerX / radiusX, g_pointerY / radiusY);
-    const double kMaxNorm = 1.08;
-    if (norm > kMaxNorm) {
-        g_pointerX *= kMaxNorm / norm;
-        g_pointerY *= kMaxNorm / norm;
+    if (norm > kPointerReach) {
+        g_pointerX *= kPointerReach / norm;
+        g_pointerY *= kPointerReach / norm;
     }
 }
 
-// The card closest to the pointer, with a small margin so the choice does not
-// flicker on the midline between two cards.
+// Selection by direction, like the CS buy wheel: as soon as the pointer leaves
+// the center circle, the card whose sector it points into is chosen. A small
+// margin keeps the choice from flickering on the line between two sectors.
 static NSInteger pointerSelection(NSInteger count, NSInteger currentIndex) {
-    if (count <= 0) return -1;
-    CGFloat radiusX = 1.0, radiusY = 1.0;
-    ringEllipseRadii((NSUInteger)count, 1.0, &radiusX, &radiusY);
-    if (hypot(g_pointerX / radiusX, g_pointerY / radiusY) < kPointerDeadZone) return -1;
+    if (count <= 0 || hypot(g_pointerX, g_pointerY) < kPointerDeadZone) return -1;
+    double pointerAngle = atan2(g_pointerY, g_pointerX);
     NSInteger best = -1;
-    double bestDistance = DBL_MAX, currentDistance = DBL_MAX;
+    double bestOffset = DBL_MAX, currentOffset = DBL_MAX;
     for (NSInteger i = 0; i < count; i++) {
-        CGFloat angle = rawItemAngle(i, (NSUInteger)count);
-        double distance = hypot(g_pointerX - cos(angle) * radiusX, g_pointerY - sin(angle) * radiusY);
-        if (i == currentIndex) currentDistance = distance;
-        if (distance < bestDistance) { bestDistance = distance; best = i; }
+        double offset = fabs(remainder(pointerAngle - cardScreenAngle(i, (NSUInteger)count), 2.0 * M_PI));
+        if (i == currentIndex) currentOffset = offset;
+        if (offset < bestOffset) { bestOffset = offset; best = i; }
     }
-    const double kSwitchMargin = 0.08;
-    if (currentIndex >= 0 && currentIndex < count && currentDistance - bestDistance < kSwitchMargin) return currentIndex;
+    double switchMargin = 0.18 * M_PI / (double)count;
+    if (currentIndex >= 0 && currentIndex < count && currentOffset - bestOffset < switchMargin) return currentIndex;
     return best;
 }
 
@@ -3142,10 +3575,8 @@ static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouche
             liftCompletionScheduled = NO;
             g_previousX = x;
             g_previousY = y;
-            g_previousTimestamp = timestamp;
             g_pointerX = 0.0;
             g_pointerY = 0.0;
-            g_pointerSpeed = 0.0;
             g_selectedIndex = -1;
             int surfaceWidth = 0, surfaceHeight = 0;
             if (MTDeviceGetSensorSurfaceDimensions(device, &surfaceWidth, &surfaceHeight) == 0 &&
@@ -3195,12 +3626,11 @@ static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouche
                 double x = sumX / 3.0, y = sumY / 3.0;
                 if (hadThreeFingers) {
                     moveRingPointer(x - g_previousX, (y - g_previousY) * g_trackpadAspect,
-                                    timestamp - g_previousTimestamp, atomic_load(&g_windowEntryCount));
+                                    atomic_load(&g_windowEntryCount));
                 }
                 // After a finger is lifted and put back, its new spot is not motion.
                 g_previousX = x;
                 g_previousY = y;
-                g_previousTimestamp = timestamp;
                 NSInteger selection = pointerSelection(atomic_load(&g_windowEntryCount), g_selectedIndex);
                 if (selection != g_selectedIndex) {
                     g_selectedIndex = selection;
@@ -3253,6 +3683,9 @@ static void startMultitouchDevices(void) {
 - (void)applicationDeactivated:(NSNotification *)notification {
     NSRunningApplication *app = notification.userInfo[NSWorkspaceApplicationKey];
     if (!app || app.processIdentifier == getpid() || atomic_load(&g_gestureActive)) return;
+    // With Stage Manager the window being left starts flying into the strip
+    // right now; the capture made when the ring opened covers it instead.
+    if (stageManagerEnabled()) return;
     refreshThumbnailsNow(app.processIdentifier, 1.0);
 }
 
@@ -3302,6 +3735,17 @@ static void loadSettings(void) {
                                            ? (int)titles : CardTitlesAll);
     atomic_store(&g_settingPauseVideo, settingBool(CFSTR("PauseVideoOnTabSwitch"), YES));
     atomic_store(&g_settingFinderTabsOneCard, settingBool(CFSTR("FinderTabsAsOneCard"), YES));
+    atomic_store(&g_settingSoundEffects, settingBool(CFSTR("SoundEffects"), NO));
+    Boolean pointerValid = false;
+    CFIndex pointerStyle = CFPreferencesGetAppIntegerValue(CFSTR("PointerStyle"), kSettingsID, &pointerValid);
+    atomic_store(&g_settingPointerStyle, pointerValid && pointerStyle == PointerStyleDot ? PointerStyleDot : PointerStyleArrow);
+    Boolean blurValid = false;
+    CFIndex blurRadius = CFPreferencesGetAppIntegerValue(CFSTR("BlurRadius"), kSettingsID, &blurValid);
+    atomic_store(&g_settingBlurRadius, blurValid ? (int)MIN(MAX(blurRadius, 0), 40) : 15);
+    g_selectSound = [[NSSound soundNamed:@"Tink"] copy];
+    g_selectSound.volume = 0.3;
+    g_activateSound = [[NSSound soundNamed:@"Pop"] copy];
+    g_activateSound.volume = 0.45;
     BOOL hideIcon = settingBool(CFSTR("HideMenuBarIcon"), NO);
     // Opening the app again while it runs is the way back to a hidden icon.
     if (hideIcon && g_replacedRunningInstance) {
@@ -3316,6 +3760,7 @@ static void loadSettings(void) {
 @property(nonatomic, strong) NSStatusItem *statusItem;
 @property(nonatomic, strong) NSPopover *popover;
 @property(nonatomic, strong) NSTextField *javaScriptHint;
+@property(nonatomic, strong) NSTextField *blurLabel;
 @end
 
 @implementation SettingsMenu
@@ -3354,6 +3799,15 @@ static void loadSettings(void) {
     titles.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
     titles.selectedSegment = atomic_load(&g_settingCardTitles);
 
+    NSTextField *pointerLabel = [self noteWithText:@"Pokazivač"];
+    NSSegmentedControl *pointer = [NSSegmentedControl segmentedControlWithLabels:@[@"Strelica", @"Krug"]
+                                                                    trackingMode:NSSegmentSwitchTrackingSelectOne
+                                                                          target:self
+                                                                          action:@selector(pointerStyleChanged:)];
+    pointer.controlSize = NSControlSizeSmall;
+    pointer.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+    pointer.selectedSegment = atomic_load(&g_settingPointerStyle);
+
     NSButton *pauseVideo = [NSButton checkboxWithTitle:@"Pauziraj video kad promeniš Chrome tab"
                                                 target:self action:@selector(pauseVideoChanged:)];
     pauseVideo.state = atomic_load(&g_settingPauseVideo) ? NSControlStateValueOn : NSControlStateValueOff;
@@ -3365,6 +3819,17 @@ static void loadSettings(void) {
                                                 target:self action:@selector(finderTabsChanged:)];
     finderTabs.state = atomic_load(&g_settingFinderTabsOneCard) ? NSControlStateValueOn : NSControlStateValueOff;
 
+    NSButton *sounds = [NSButton checkboxWithTitle:@"Zvučni efekti pri izboru i otvaranju"
+                                            target:self action:@selector(soundEffectsChanged:)];
+    sounds.state = atomic_load(&g_settingSoundEffects) ? NSControlStateValueOn : NSControlStateValueOff;
+
+    self.blurLabel = [self noteWithText:@""];
+    [self updateBlurLabel];
+    NSSlider *blur = [NSSlider sliderWithValue:atomic_load(&g_settingBlurRadius) minValue:0 maxValue:40
+                                        target:self action:@selector(blurRadiusChanged:)];
+    blur.controlSize = NSControlSizeSmall;
+    [blur.widthAnchor constraintEqualToConstant:312].active = YES;
+
     NSBox *separator = [NSBox new];
     separator.boxType = NSBoxSeparator;
 
@@ -3375,15 +3840,18 @@ static void loadSettings(void) {
     NSButton *quit = [NSButton buttonWithTitle:@"Ugasi Touchpad Switcher" target:NSApp action:@selector(terminate:)];
     quit.controlSize = NSControlSizeSmall;
 
-    NSStackView *stack = [NSStackView stackViewWithViews:@[title, titlesLabel, titles, pauseVideo, self.javaScriptHint,
-                                                           finderTabs, separator, hideIcon, hideNote, quit]];
+    NSStackView *stack = [NSStackView stackViewWithViews:@[title, titlesLabel, titles, pointerLabel, pointer, pauseVideo, self.javaScriptHint,
+                                                           finderTabs, sounds, self.blurLabel, blur, separator,
+                                                           hideIcon, hideNote, quit]];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeLeading;
     stack.spacing = 10;
     stack.edgeInsets = NSEdgeInsetsMake(14, 14, 14, 14);
     [stack setCustomSpacing:4 afterView:titlesLabel];
+    [stack setCustomSpacing:4 afterView:pointerLabel];
     [stack setCustomSpacing:4 afterView:pauseVideo];
     [stack setCustomSpacing:4 afterView:hideIcon];
+    [stack setCustomSpacing:4 afterView:self.blurLabel];
     [stack setCustomSpacing:14 afterView:hideNote];
     [stack.widthAnchor constraintEqualToConstant:340].active = YES;
     [separator.widthAnchor constraintEqualToConstant:312].active = YES;
@@ -3418,6 +3886,15 @@ static void loadSettings(void) {
     CFRelease(value);
 }
 
+- (void)pointerStyleChanged:(NSSegmentedControl *)control {
+    int style = control.selectedSegment == PointerStyleDot ? PointerStyleDot : PointerStyleArrow;
+    atomic_store(&g_settingPointerStyle, style);
+    CFNumberRef value = CFNumberCreate(NULL, kCFNumberIntType, &style);
+    storeSetting(CFSTR("PointerStyle"), value);
+    CFRelease(value);
+    [g_ringView resetPointer];   // rebuilt with the new shape on the next open
+}
+
 - (void)pauseVideoChanged:(NSButton *)button {
     BOOL on = button.state == NSControlStateValueOn;
     atomic_store(&g_settingPauseVideo, on);
@@ -3430,6 +3907,29 @@ static void loadSettings(void) {
     BOOL on = button.state == NSControlStateValueOn;
     atomic_store(&g_settingFinderTabsOneCard, on);
     storeSetting(CFSTR("FinderTabsAsOneCard"), on ? kCFBooleanTrue : kCFBooleanFalse);
+}
+
+- (void)soundEffectsChanged:(NSButton *)button {
+    BOOL on = button.state == NSControlStateValueOn;
+    atomic_store(&g_settingSoundEffects, on);
+    storeSetting(CFSTR("SoundEffects"), on ? kCFBooleanTrue : kCFBooleanFalse);
+    if (on) playRingSound(g_activateSound);
+}
+
+- (void)updateBlurLabel {
+    int radius = atomic_load(&g_settingBlurRadius);
+    self.blurLabel.stringValue = radius > 0
+        ? [NSString stringWithFormat:@"Zamućenje pozadine: %d", radius]
+        : @"Zamućenje pozadine: isključeno";
+}
+
+- (void)blurRadiusChanged:(NSSlider *)slider {
+    int radius = (int)lround(slider.doubleValue);
+    atomic_store(&g_settingBlurRadius, radius);
+    CFNumberRef value = CFNumberCreate(NULL, kCFNumberIntType, &radius);
+    storeSetting(CFSTR("BlurRadius"), value);
+    CFRelease(value);
+    [self updateBlurLabel];
 }
 
 - (void)hideIconChanged:(NSButton *)button {
