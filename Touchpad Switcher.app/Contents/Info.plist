@@ -8,11 +8,19 @@
 	<string>com.milev.touchpad-switcher</string>
 	<key>CFBundleName</key>
 	<string>Touchpad Switcher</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.9</string>
+	<key>CFBundleVersion</key>
+	<string>9</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>Touchpad Switcher uses Automation to switch to the Chrome tab you select.</string>
+	<string>Touchpad Switcher prebacuje na izabrani Chrome tab i po želji zaustavlja i pokreće video u tabovima.</string>
 	<key>NSScreenCaptureUsageDescription</key>
-	<string>Touchpad Switcher captures app window thumbnails for switcher previews.</string>
+	<string>Touchpad Switcher snima umanjene slike prozora za pregled u meniju.</string>
 </dict>
 </plist>

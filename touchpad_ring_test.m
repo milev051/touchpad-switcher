@@ -6,6 +6,7 @@
 #import <CoreFoundation/CoreFoundation.h>
 #import <ImageIO/ImageIO.h>
 #import <QuartzCore/QuartzCore.h>
+#import "ring_media.h"
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #include <math.h>
 #include <float.h>
@@ -21,6 +22,7 @@
 #include <sys/file.h>
 #include <libproc.h>
 #include <pthread.h>
+#include <dlfcn.h>
 
 typedef struct { float x, y; } MTPoint;
 typedef struct { MTPoint position, velocity; } MTVector;
@@ -117,8 +119,10 @@ static void noteChromeSelectionChanges(NSArray<RingEntry *> *entries);
 @property(nonatomic, strong) CAShapeLayer *pointerArrow;
 @property(nonatomic, weak) NSView *glowView;
 @property(nonatomic) NSPoint lastPointer;
+@property(nonatomic, strong) CALayer *focusLayer;
 - (void)movePointerTo:(NSPoint)ringPoint;
 - (void)resetPointer;
+- (void)resetSelectionVisuals;
 @end
 
 // Light in the direction of the fingers. It sits under the cards, reaches the
@@ -143,8 +147,7 @@ static const double kPointerReach = 0.80;
 #define kSettingsID CFSTR("com.milev.touchpad-switcher")
 typedef enum { CardTitlesAll = 0, CardTitlesFinderAndChrome = 1, CardTitlesNone = 2 } CardTitlesMode;
 static _Atomic(int) g_settingCardTitles = CardTitlesAll;
-static _Atomic(bool) g_settingAutoPauseMedia = true;
-static _Atomic(bool) g_settingAutoResumeMedia = true;
+static RingMediaOptions g_mediaOptions;   // main thread; the media module keeps its own copy
 static _Atomic(bool) g_settingFinderTabsOneCard = true;
 static _Atomic(bool) g_settingHideMenuIcon = false;
 static _Atomic(bool) g_settingSoundEffects = false;
@@ -161,7 +164,6 @@ static void playRingSound(NSSound *sound) {
     [sound stop];
     [sound play];
 }
-static _Atomic(bool) g_chromeJavaScriptBlocked = false;
 static BOOL g_replacedRunningInstance = NO;
 
 static BOOL shouldDrawCardLabel(RingEntry *entry) {
@@ -289,8 +291,14 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
 }
 
 @implementation SectorGlowView {
-    CAGradientLayer *_gradient;
-    CAShapeLayer *_mask;
+    CAGradientLayer *_gradient;   // radial: bright at the center, fading outward
+    CAGradientLayer *_beam;       // conic mask: soft-edged beam, turned by rotation
+    CADisplayLink *_displayLink;
+    CGFloat _targetAngle;
+    CGFloat _shownAngle;
+    CGFloat _beamWidth;
+    CFTimeInterval _lastFrame;
+    NSPoint _center;
     BOOL _visible;
 }
 
@@ -301,73 +309,107 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
     _gradient.type = kCAGradientLayerRadial;
     // Brightest at the center, fading out toward the edge of the screen.
     _gradient.colors = @[
-        (id)[NSColor colorWithCalibratedRed:0.60 green:0.92 blue:1.0 alpha:0.45].CGColor,
-        (id)[NSColor colorWithCalibratedRed:0.45 green:0.88 blue:1.0 alpha:0.18].CGColor,
+        (id)[NSColor colorWithCalibratedRed:0.60 green:0.92 blue:1.0 alpha:0.55].CGColor,
+        (id)[NSColor colorWithCalibratedRed:0.45 green:0.88 blue:1.0 alpha:0.22].CGColor,
         (id)[NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.0].CGColor
     ];
     _gradient.locations = @[@0.0, @0.40, @1.0];
     _gradient.opacity = 0;
-    _mask = [CAShapeLayer layer];
-    _gradient.mask = _mask;
+    _beam = [CAGradientLayer layer];
+    _beam.type = kCAGradientLayerConic;
+    _beam.startPoint = CGPointMake(0.5, 0.5);
+    _beam.endPoint = CGPointMake(1.0, 0.5);
+    _gradient.mask = _beam;
     [self.layer addSublayer:_gradient];
     return self;
 }
 
 - (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
 
-- (CGPathRef)newSliceFrom:(CGFloat)startAngle to:(CGFloat)endAngle center:(NSPoint)center reach:(CGFloat)reach {
-    CGMutablePathRef path = CGPathCreateMutable();
-    CGPathMoveToPoint(path, NULL, center.x, center.y);
-    for (int step = 0; step <= 24; step++) {
-        CGFloat angle = startAngle + (endAngle - startAngle) * step / 24.0;
-        CGPathAddLineToPoint(path, NULL, center.x + cos(angle) * reach, center.y + sin(angle) * reach);
-    }
-    CGPathCloseSubpath(path);
-    return path;
+// Beam centered on the conic gradient's half-way point, with edges that fade
+// out instead of ending in a hard line.
+- (void)setBeamWidth:(CGFloat)width {
+    if (fabs(width - _beamWidth) < 0.001) return;
+    _beamWidth = width;
+    CGFloat core = MIN(0.249, width * 0.38 / (2.0 * M_PI));
+    CGFloat edge = MIN(0.499, width * 0.85 / (2.0 * M_PI));
+    id clear = (id)[NSColor colorWithCalibratedWhite:1.0 alpha:0.0].CGColor;
+    id solid = (id)[NSColor colorWithCalibratedWhite:1.0 alpha:1.0].CGColor;
+    _beam.colors = @[clear, clear, solid, solid, clear, clear];
+    _beam.locations = @[@0.0, @(0.5 - edge), @(0.5 - core), @(0.5 + core), @(0.5 + edge), @1.0];
+}
+
+- (void)applyAngle:(CGFloat)angle {
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    // The beam's middle sits half a turn from the gradient's start direction.
+    _beam.affineTransform = CGAffineTransformMakeRotation(angle - (CGFloat)M_PI);
+    [CATransaction commit];
 }
 
 - (void)pointAt:(CGFloat)angle width:(CGFloat)width center:(NSPoint)center {
-    // Longer than the screen diagonal, so the slice always ends at the edge.
-    CGFloat reach = hypot(NSWidth(self.bounds), NSHeight(self.bounds));
-    CGPathRef path = [self newSliceFrom:angle - width / 2.0 to:angle + width / 2.0 center:center reach:reach];
-    BOOL appearing = !_visible;
+    _targetAngle = angle;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    if (appearing) {
-        CGFloat viewWidth = MAX(1.0, NSWidth(self.bounds)), viewHeight = MAX(1.0, NSHeight(self.bounds));
-        CGFloat glowRadius = MAX(viewWidth, viewHeight) * 0.6;
-        [_gradient removeAllAnimations];
-        _gradient.frame = self.layer.bounds;
-        _gradient.startPoint = CGPointMake(center.x / viewWidth, center.y / viewHeight);
-        _gradient.endPoint = CGPointMake((center.x + glowRadius) / viewWidth, (center.y + glowRadius) / viewHeight);
-        // Scale around the ring center, so the light can grow out of it.
-        _mask.bounds = _gradient.bounds;
-        _mask.anchorPoint = CGPointMake(center.x / viewWidth, center.y / viewHeight);
-        _mask.position = center;
-    }
-    _mask.path = path;
+    [self setBeamWidth:width];
+    [CATransaction commit];
+    if (_visible) return;
+
+    _visible = YES;
+    _center = center;
+    _shownAngle = angle;
+    CGFloat viewWidth = MAX(1.0, NSWidth(self.bounds)), viewHeight = MAX(1.0, NSHeight(self.bounds));
+    CGFloat glowRadius = MAX(viewWidth, viewHeight) * 0.6;
+    CGFloat side = hypot(viewWidth, viewHeight) * 2.0;   // covers the screen at any rotation
+    CGPoint fullEnd = CGPointMake((center.x + glowRadius) / viewWidth, (center.y + glowRadius) / viewHeight);
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [_gradient removeAllAnimations];
+    _gradient.frame = self.layer.bounds;
+    _gradient.startPoint = CGPointMake(center.x / viewWidth, center.y / viewHeight);
+    _gradient.endPoint = fullEnd;
+    _beam.bounds = CGRectMake(0, 0, side, side);
+    _beam.position = center;
     _gradient.opacity = 1.0;
     [CATransaction commit];
-    CGPathRelease(path);
-    if (appearing) {
-        // A new light shoots out of the center toward its card.
-        CABasicAnimation *grow = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
-        grow.fromValue = @0.05;
-        grow.toValue = @1.0;
-        grow.duration = 0.14;
-        grow.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
-        [_mask addAnimation:grow forKey:@"grow"];
+    [self applyAngle:angle];
+
+    // A new light shoots out of the center toward its card.
+    CABasicAnimation *grow = [CABasicAnimation animationWithKeyPath:@"endPoint"];
+    grow.fromValue = [NSValue valueWithPoint:NSMakePoint((center.x + kHubRadius) / viewWidth,
+                                                         (center.y + kHubRadius) / viewHeight)];
+    grow.toValue = [NSValue valueWithPoint:NSPointFromCGPoint(fullEnd)];
+    grow.duration = 0.16;
+    grow.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+    [_gradient addAnimation:grow forKey:@"grow"];
+
+    if (!_displayLink) {
+        _displayLink = [self displayLinkWithTarget:self selector:@selector(stepBeam:)];
+        [_displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
     }
-    _visible = YES;
+    _lastFrame = 0;
+    _displayLink.paused = NO;
+}
+
+// Each screen refresh eases the beam toward the finger direction. The finger
+// data is a little noisy; a 35 ms time constant removes the shake while the
+// light still keeps up with a fast flick.
+- (void)stepBeam:(CADisplayLink *)link {
+    CFTimeInterval now = link.timestamp;
+    CFTimeInterval dt = _lastFrame > 0 ? MIN(now - _lastFrame, 0.05) : 1.0 / 120.0;
+    _lastFrame = now;
+    CGFloat delta = (CGFloat)remainder(_targetAngle - _shownAngle, 2.0 * M_PI);
+    _shownAngle += delta * (CGFloat)(1.0 - exp(-dt / 0.035));
+    [self applyAngle:_shownAngle];
 }
 
 - (void)hideAnimated:(BOOL)animated {
     float fromOpacity = ((CALayer *)_gradient.presentationLayer ?: _gradient).opacity;
     _visible = NO;
+    _displayLink.paused = YES;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     [_gradient removeAllAnimations];
-    [_mask removeAllAnimations];
     _gradient.opacity = 0;
     [CATransaction commit];
     if (animated && fromOpacity > 0) {
@@ -388,31 +430,124 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
     return self;
 }
 
-// Area of one card including its shadow, glow and label.
-- (NSRect)redrawRectForCard:(NSInteger)index {
+// The drawn card, the same rectangle drawRect uses: a preview for windows with
+// a picture and for Chrome tabs, a smaller icon card otherwise.
+- (NSRect)cardRectForIndex:(NSInteger)index {
     NSUInteger count = self.entries.count;
     if (index < 0 || index >= (NSInteger)count) return NSZeroRect;
     CGFloat radiusX = self.ringRadius, radiusY = self.ringRadius;
     ringEllipseRadii(count, self.ringRadius, &radiusX, &radiusY);
-    CGFloat previewWidth = safeCardWidthForRing(count, radiusX, radiusY, NSWidth(self.bounds)) * 0.94;
+    CGFloat cardWidth = safeCardWidthForRing(count, radiusX, radiusY, NSWidth(self.bounds));
+    CGFloat previewWidth = cardWidth * 0.94;
     CGFloat rawAngle = rawItemAngle(index, count);
     NSPoint itemCenter = NSMakePoint(self.anchorPoint.x + cos(rawAngle) * radiusX,
                                      self.anchorPoint.y + sin(rawAngle) * radiusY);
-    CGFloat height = previewWidth * 0.60;
-    return NSInsetRect(NSMakeRect(itemCenter.x - previewWidth / 2.0, itemCenter.y - height / 2.0, previewWidth, height),
-                       -30.0, -30.0);
+    RingEntry *entry = self.entries[(NSUInteger)index];
+    BOOL preview = entry.thumbnail || entry.thumbnailData.length ||
+        [entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"];
+    if (preview) {
+        CGFloat height = previewWidth * 0.60;
+        return NSMakeRect(itemCenter.x - previewWidth / 2.0, itemCenter.y - height / 2.0, previewWidth, height);
+    }
+    CGFloat iconSize = MIN(140, MAX(54, cardWidth * 0.42));
+    return NSInsetRect(NSMakeRect(itemCenter.x - iconSize / 2.0, itemCenter.y - iconSize / 2.0, iconSize, iconSize),
+                       -8.0, -8.0);
+}
+
+// The selection outline is one layer that glides from card to card on a
+// spring, like focus on Apple TV, instead of jumping.
+- (void)updateFocusAnimated:(BOOL)animated {
+    if (!self.focusLayer) {
+        CALayer *focus = [CALayer layer];
+        NSColor *accent = [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.95];
+        focus.borderColor = accent.CGColor;
+        focus.borderWidth = 2.5;
+        focus.cornerRadius = 8.0;
+        focus.shadowColor = accent.CGColor;
+        focus.shadowOpacity = 0.9;
+        focus.shadowRadius = 9.0;
+        focus.shadowOffset = CGSizeZero;
+        focus.opacity = 0;
+        [self.layer addSublayer:focus];
+        self.focusLayer = focus;
+    }
+    CALayer *focus = self.focusLayer;
+    NSInteger index = self.selectedIndex;
+    if (index < 0 || index >= (NSInteger)self.entries.count) {
+        float fromOpacity = ((CALayer *)focus.presentationLayer ?: focus).opacity;
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        focus.opacity = 0;
+        [CATransaction commit];
+        if (animated && fromOpacity > 0) {
+            CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
+            fade.fromValue = @(fromOpacity);
+            fade.toValue = @0.0;
+            fade.duration = 0.12;
+            [focus addAnimation:fade forKey:@"fade"];
+        }
+        return;
+    }
+
+    NSRect rect = [self cardRectForIndex:index];
+    CGPoint position = CGPointMake(NSMidX(rect), NSMidY(rect));
+    CGRect bounds = CGRectMake(0, 0, NSWidth(rect), NSHeight(rect));
+    BOOL wasHidden = focus.opacity < 0.5;
+    if (!wasHidden && CGPointEqualToPoint(focus.position, position) && CGRectEqualToRect(focus.bounds, bounds)) return;
+    CALayer *shown = (CALayer *)focus.presentationLayer ?: focus;
+    NSValue *fromPosition = [NSValue valueWithPoint:NSPointFromCGPoint(shown.position)];
+    NSValue *fromBounds = [NSValue valueWithRect:NSRectFromCGRect(shown.bounds)];
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [focus removeAnimationForKey:@"fade"];
+    focus.position = position;
+    focus.bounds = bounds;
+    focus.opacity = 1;
+    [CATransaction commit];
+    if (!animated) return;
+
+    if (wasHidden) {
+        // First selection: a quick pop into place.
+        CASpringAnimation *pop = [CASpringAnimation animationWithKeyPath:@"transform.scale"];
+        pop.fromValue = @0.92;
+        pop.toValue = @1.0;
+        pop.stiffness = 420;
+        pop.damping = 26;
+        pop.duration = pop.settlingDuration;
+        [focus addAnimation:pop forKey:@"pop"];
+        return;
+    }
+    for (NSString *keyPath in @[@"position", @"bounds"]) {
+        CASpringAnimation *glide = [CASpringAnimation animationWithKeyPath:keyPath];
+        glide.fromValue = [keyPath isEqualToString:@"position"] ? fromPosition : fromBounds;
+        glide.toValue = [keyPath isEqualToString:@"position"]
+            ? [NSValue valueWithPoint:NSPointFromCGPoint(position)]
+            : [NSValue valueWithRect:NSRectFromCGRect(bounds)];
+        glide.stiffness = 380;
+        glide.damping = 32;      // settles in about a quarter second, a hint of overshoot
+        glide.duration = glide.settlingDuration;
+        [focus addAnimation:glide forKey:keyPath];
+    }
+}
+
+- (void)resetSelectionVisuals {
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [self.focusLayer removeAllAnimations];
+    self.focusLayer.opacity = 0;
+    [CATransaction commit];
+    [(SectorGlowView *)self.glowView hideAnimated:NO];
 }
 
 - (void)setSelectedIndex:(NSInteger)selectedIndex {
     if (_selectedIndex == selectedIndex) return;
-    NSInteger previousIndex = _selectedIndex;
     _selectedIndex = selectedIndex;
-    // Only the two cards and the hub change. Redrawing every thumbnail across
-    // a Retina screen on each change made the selection feel sluggish.
-    [self setNeedsDisplayInRect:[self redrawRectForCard:previousIndex]];
-    [self setNeedsDisplayInRect:[self redrawRectForCard:selectedIndex]];
+    // Cards no longer change when selected, only the hub icon does; the
+    // outline and the light are layers.
     [self setNeedsDisplayInRect:NSMakeRect(self.anchorPoint.x - kHubRadius - 6.0, self.anchorPoint.y - kHubRadius - 6.0,
                                            (kHubRadius + 6.0) * 2.0, (kHubRadius + 6.0) * 2.0)];
+    [self updateFocusAnimated:YES];
     if (selectedIndex >= 0 && selectedIndex < (NSInteger)self.entries.count) {
         [self updateGlow];
         playRingSound(g_selectSound);
@@ -474,6 +609,7 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
         arrow.affineTransform = CGAffineTransformMakeRotation((CGFloat)M_PI_2);
         [holder.layer addSublayer:arrow];
         holder.hidden = atomic_load(&g_settingPointerStyle) == PointerStyleHidden;
+        holder.layer.zPosition = 10;   // above the selection outline
         [self addSubview:holder];
         self.pointerView = holder;
         self.pointerArrow = arrow;
@@ -496,6 +632,10 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
 
 - (void)drawRect:(NSRect)dirtyRect {
     [super drawRect:dirtyRect];
+    if (self.selectedIndex >= 0) {
+        // A picture that just arrived can change the card's size.
+        dispatch_async(dispatch_get_main_queue(), ^{ [self updateFocusAnimated:YES]; });
+    }
     NSRect bounds = self.bounds;
     NSPoint center = self.anchorPoint;
     NSUInteger count = self.entries.count;
@@ -541,7 +681,8 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
         NSRect cardArea = NSInsetRect(NSMakeRect(itemCenter.x - previewWidth / 2.0, itemCenter.y - cardHeight / 2.0,
                                                  previewWidth, cardHeight), -30.0, -30.0);
         if (!NSIntersectsRect(cardArea, dirtyRect)) continue;
-        BOOL selected = ((NSInteger)i == self.selectedIndex);
+        // The glide-in outline layer marks the selection; cards draw unselected.
+        BOOL selected = NO;
         RingEntry *entry = self.entries[i];
         NSImage *thumbnail = resolvedThumbnail(entry);
         if (thumbnail) {
@@ -1072,6 +1213,26 @@ static CGFloat fittedRingRadius(NSSize size, NSUInteger count, CGFloat *centerOf
         CGFloat bottomLimit = (size.height / 2.0 - 20 + finalOffsetY - bottomContent) / scaleY;
         finalRadius = MAX(0, MIN(radius, MIN(horizontalLimit, MIN(topLimit, bottomLimit))));
     }
+    if (count <= 3) {
+        // With three cards or fewer the full-screen ring left a wide empty
+        // middle. Pull the cards in until they keep a clear gap to each other
+        // and to the hub.
+        const CGFloat gap = 48.0;
+        CGFloat previewWidth = safeCardWidthForRing(count, finalRadius, finalRadius, size.width) * 0.94;
+        CGFloat previewHeight = previewWidth * 0.60;
+        CGFloat needed = previewHeight / 2.0 + kHubRadius + gap;   // top card clears the hub
+        if (count == 3) {
+            // Lower cards sit at -30 and -150 degrees.
+            needed = MAX(needed, (previewWidth + gap) / (2.0 * cos(M_PI / 6.0)));
+            needed = MAX(needed, (previewHeight + gap) / 1.5);
+            // Their inner corner must clear the hub too: either the top edge
+            // passes below it or the inner edge passes beside it.
+            CGFloat clearBelow = 2.0 * (previewHeight / 2.0 + kHubRadius + gap);
+            CGFloat clearBeside = (previewWidth / 2.0 + kHubRadius + gap) / cos(M_PI / 6.0);
+            needed = MAX(needed, MIN(clearBelow, clearBeside));
+        }
+        finalRadius = MIN(finalRadius, needed);
+    }
     if (centerOffsetY) *centerOffsetY = finalOffsetY;
     return finalRadius;
 }
@@ -1092,7 +1253,7 @@ static void showRing(uint64_t generation) {
     g_ringView.selectedIndex = -1;
     g_ringView.anchorPoint = anchor;
     g_ringView.ringRadius = fittedRadius;
-    [g_glowView hideAnimated:NO];
+    [g_ringView resetSelectionVisuals];
     [g_ringView movePointerTo:NSZeroPoint];
     // Blur and dimming appear at once with the cards, no fade.
     int blurRadius = atomic_load(&g_settingBlurRadius);
@@ -1121,24 +1282,74 @@ static void showRing(uint64_t generation) {
 }
 
 static AXUIElementRef findTabButton(AXUIElementRef parent, NSString *title, int depth);
-static BOOL setChromeActiveTabWithIndex(NSString *windowID, NSString *tabID, NSUInteger tabIndex1Based,
-                                        BOOL pauseLeavingTab, BOOL resumeTargetTab);
+static BOOL setChromeActiveTabWithIndex(NSString *windowID, NSString *tabID, NSUInteger tabIndex1Based);
+
+static void activateApplication(NSRunningApplication *application) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    // Only the application, not every one of its windows.
+    [application activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+#pragma clang diagnostic pop
+}
+
+// Brings one exact window to the front and switches to its Space, including
+// a full-screen space, the way AltTab does. Needs no Accessibility access.
+// Private SkyLight calls, looked up at run time; missing ones just return NO.
+typedef CGError (*SetFrontProcessWithOptionsFunction)(ProcessSerialNumber *, CGWindowID, uint32_t);
+typedef CGError (*PostEventRecordToFunction)(ProcessSerialNumber *, uint8_t *);
+static BOOL focusWindowExactly(pid_t pid, CGWindowID windowID) {
+    static SetFrontProcessWithOptionsFunction setFrontProcess;
+    static PostEventRecordToFunction postEventRecord;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY);
+        setFrontProcess = (SetFrontProcessWithOptionsFunction)dlsym(RTLD_DEFAULT, "_SLPSSetFrontProcessWithOptions");
+        postEventRecord = (PostEventRecordToFunction)dlsym(RTLD_DEFAULT, "SLPSPostEventRecordTo");
+    });
+    if (!setFrontProcess || !postEventRecord || windowID == kCGNullWindowID) return NO;
+    ProcessSerialNumber process = {0, 0};
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    if (GetProcessForPID(pid, &process) != noErr) return NO;
+#pragma clang diagnostic pop
+    const uint32_t kUserGenerated = 0x200;
+    if (setFrontProcess(&process, windowID, kUserGenerated) != kCGErrorSuccess) return NO;
+    // Make it the key window of its app (the event record AltTab and yabai use).
+    uint8_t record[0xf8] = {0};
+    record[0x04] = 0xf8;
+    record[0x3a] = 0x10;
+    memcpy(record + 0x3c, &windowID, sizeof(windowID));
+    memset(record + 0x20, 0xff, 0x10);
+    record[0x08] = 0x01;
+    postEventRecord(&process, record);
+    record[0x08] = 0x02;
+    postEventRecord(&process, record);
+    return YES;
+}
 
 static void raiseWindowForEntry(RingEntry *entry, uint64_t generation) {
     if (generation != atomic_load(&g_gestureGeneration)) return;
     if (!entry.application || entry.application.isTerminated) return;
+    pid_t pid = entry.application.processIdentifier;
 
     // Chrome profiles are separate windows in one app. Activating Chrome keeps
     // the last used profile in front unless that window is made index 1.
     if (generation == atomic_load(&g_gestureGeneration) && entry.isTab &&
         entry.chromeWindowID.length) {
         BOOL switched = setChromeActiveTabWithIndex(entry.chromeWindowID, entry.chromeTabID,
-                                                    entry.tabIndex + 1, atomic_load(&g_settingAutoPauseMedia),
-                                                    atomic_load(&g_settingAutoResumeMedia));
-        if (switched) return;
+                                                    entry.tabIndex + 1);
+        if (switched) {
+            focusWindowExactly(pid, entry.windowID);
+            RingMediaTabSwitchedByRing();
+            return;
+        }
         NSLog(@"[Chrome tabs] could not activate window %@ tab %@ index %lu",
               entry.chromeWindowID, entry.chromeTabID, (unsigned long)(entry.tabIndex + 1));
     }
+
+    // The exact window, even in another Space or full screen. The AX raise
+    // below still runs when Accessibility is allowed, for apps that need it.
+    focusWindowExactly(pid, entry.windowID);
 
     AXUIElementRef bestWindow = NULL;
     if (entry.accessibilityWindowObject) {
@@ -1277,6 +1488,18 @@ static BOOL chromePrefetchIsHeld(void) {
     }
 }
 
+// With three-finger drag turned on, macOS moves the cursor while the fingers
+// pick a card. Put it back where it was when the gesture began.
+static void restoreCursorAfterGesture(void) {
+    CGEventRef event = CGEventCreate(NULL);
+    if (!event) return;
+    CGPoint now = CGEventGetLocation(event);
+    CFRelease(event);
+    if (hypot(now.x - g_cursorAtGestureStart.x, now.y - g_cursorAtGestureStart.y) < 2.0) return;
+    CGWarpMouseCursorPosition(g_cursorAtGestureStart);
+    CGAssociateMouseAndMouseCursorPosition(true);
+}
+
 static void finishGesture(uint64_t generation, NSInteger selection) {
     if (generation != atomic_load(&g_gestureGeneration)) return;
     // Block background Chrome tab cycling before the overlay goes away.
@@ -1300,6 +1523,7 @@ static void finishGesture(uint64_t generation, NSInteger selection) {
     atomic_store(&g_gestureEnding, false);
     if (g_panel) [g_panel orderOut:nil];
     atomic_store(&g_ringOverlayVisible, false);
+    restoreCursorAfterGesture();
     releaseDecodedThumbnails();
     if (selection < 0 || selection >= (NSInteger)g_windowEntries.count) {
         return;
@@ -1310,13 +1534,10 @@ static void finishGesture(uint64_t generation, NSInteger selection) {
         return;
     }
     playRingSound(g_activateSound);
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    // Activate the application without asking AppKit to bring every window
-    // forward. For Chrome entries, raiseWindowForEntry below raises the one
-    // window that owns the selected tab.
-    [entry.application activateWithOptions:NSApplicationActivateIgnoringOtherApps];
-#pragma clang diagnostic pop
+    // Activate first, from the main thread, as before: a background app may
+    // not bring another app forward otherwise. raiseWindowForEntry then puts
+    // the exact window in front, in its own Space if needed.
+    activateApplication(entry.application);
     BOOL captureChromeAfterRaise =
         [entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"] &&
         entry.windowID != kCGNullWindowID;
@@ -2136,26 +2357,6 @@ static BOOL ensureChromeAutomation(BOOL askUser) {
     return NO;
 }
 
-// Media that this app paused is marked in the page, so coming back resumes
-// only what was playing, never something the user had stopped.
-static NSString *const kPauseMediaJS =
-    @"document.querySelectorAll('video,audio').forEach(function(m){if(!m.paused&&!m.ended){m.pause();m.dataset.touchpadSwitcherPaused='1';}})";
-static NSString *const kResumeMediaJS =
-    @"document.querySelectorAll('video,audio').forEach(function(m){if(m.dataset.touchpadSwitcherPaused==='1'){delete m.dataset.touchpadSwitcherPaused;m.play();}})";
-
-// AppleScript that runs JavaScript in one tab. Chrome allows it only with
-// View > Developer > Allow JavaScript from Apple Events; the result is noted
-// in jsStatus so the menu can show that hint.
-static NSString *chromeJavaScriptStep(NSString *tabExpression, NSString *javaScript) {
-    return [NSString stringWithFormat:
-        @"try\n"
-         "execute %@ javascript \"%@\"\n"
-         "if jsStatus is \"ok\" then set jsStatus to \"ok-js\"\n"
-         "on error errorMessage\n"
-         "if errorMessage contains \"JavaScript\" then set jsStatus to \"ok-js-blocked\"\n"
-         "end try\n", tabExpression, javaScript];
-}
-
 static BOOL runChromeScript(NSString *source) {
     NSAppleScript *script = [[NSAppleScript alloc] initWithSource:source];
     NSDictionary *error = nil;
@@ -2164,96 +2365,67 @@ static BOOL runChromeScript(NSString *source) {
         result = [script executeAndReturnError:&error];
     }
     if (error) {
-        NSLog(@"[Chrome tabs] script failed: %@", error[NSAppleScriptErrorMessage] ?: error);
+        NSLog(@"[Chrome tabs] switch script failed: %@", error[NSAppleScriptErrorMessage] ?: error);
         return NO;
     }
-    NSString *status = result.stringValue ?: @"";
-    if ([status isEqualToString:@"ok-js-blocked"]) {
-        if (!atomic_exchange(&g_chromeJavaScriptBlocked, true)) {
-            NSLog(@"[Chrome tabs] media control needs View > Developer > Allow JavaScript from Apple Events in Chrome");
-        }
-    } else if ([status isEqualToString:@"ok-js"]) {
-        atomic_store(&g_chromeJavaScriptBlocked, false);
-    }
-    return [status hasPrefix:@"ok"];
+    return [result.stringValue isEqualToString:@"ok"];
 }
 
-// Pause or resume media in the tab on screen in Chrome's front window. Used
-// when Chrome itself is left or entered.
-static dispatch_queue_t g_mediaQueue;
-static void runChromeMediaScript(NSString *javaScript) {
-    if (!g_mediaQueue) g_mediaQueue = dispatch_queue_create("touchpad.ring.media", DISPATCH_QUEUE_SERIAL);
-    NSString *source = [NSString stringWithFormat:
-        @"tell application \"Google Chrome\"\n"
-         "try\n"
-         "set jsStatus to \"ok\"\n"
-         "if (count of windows) is 0 then return jsStatus\n"
-         "%@"
-         "return jsStatus\n"
-         "end try\n"
-         "end tell\n"
-         "return \"failed\"", chromeJavaScriptStep(@"(active tab of window 1)", javaScript)];
-    dispatch_async(g_mediaQueue, ^{
-        if (ensureChromeAutomation(NO)) runChromeScript(source);
-    });
-}
-
-static BOOL setChromeActiveTabWithIndex(NSString *windowID, NSString *tabID, NSUInteger tabIndex1Based,
-                                        BOOL pauseLeavingTab, BOOL resumeTargetTab) {
+// Video and audio in the tabs are handled by ring_media.m, which notices the
+// switch on its own.
+static BOOL setChromeActiveTabWithIndex(NSString *windowID, NSString *tabID, NSUInteger tabIndex1Based) {
     if (!validChromeID(windowID)) return NO;
     BOOL haveTabID = validChromeID(tabID);
     if (!haveTabID && tabIndex1Based == 0) return NO;
-    // The tab being replaced pauses its media; the tab being opened resumes
-    // what this app paused there earlier. Either step failing never blocks the
-    // switch itself.
-    NSMutableString *afterSwitch = [NSMutableString string];
-    if (pauseLeavingTab) {
-        [afterSwitch appendFormat:@"if leavingID is not (id of active tab of targetWindow) then\n%@end if\n",
-         chromeJavaScriptStep(@"(first tab of targetWindow whose id is leavingID)", kPauseMediaJS)];
-    }
-    if (resumeTargetTab) {
-        [afterSwitch appendString:chromeJavaScriptStep(@"(active tab of targetWindow)", kResumeMediaJS)];
-    }
     // Chrome exposes window and tab ids as text, not integers. Comparing a
     // text id with an unquoted number never matches, so the previously
     // selected tab (often YouTube) stayed in front for every card.
     NSMutableString *source = [NSMutableString stringWithFormat:
         @"tell application \"Google Chrome\"\n"
          "try\n"
-         "set jsStatus to \"ok\"\n"
          "set targetWindow to first window whose id is \"%@\"\n"
-         "set leavingID to id of active tab of targetWindow\n", windowID];
-    if (pauseLeavingTab) {
-        // Moving to another Chrome window leaves the front window's tab too.
-        [source appendFormat:@"if (id of window 1) is not (id of targetWindow) then\n%@end if\n",
-         chromeJavaScriptStep(@"(active tab of window 1)", kPauseMediaJS)];
-    }
-    [source appendString:@"set index of targetWindow to 1\n"];
+         "set index of targetWindow to 1\n", windowID];
     if (haveTabID) {
         [source appendFormat:
          @"repeat with tabIndex from 1 to count of tabs of targetWindow\n"
           "if (id of tab tabIndex of targetWindow) as text is \"%@\" then\n"
           "set active tab index of targetWindow to tabIndex\n"
-          "%@"
-          "return jsStatus\n"
+          "return \"ok\"\n"
           "end if\n"
-          "end repeat\n", tabID, afterSwitch];
+          "end repeat\n", tabID];
     }
     if (tabIndex1Based > 0) {
         [source appendFormat:
          @"set tabCount to count of tabs of targetWindow\n"
           "if %@ <= tabCount then\n"
           "set active tab index of targetWindow to %@\n"
-          "%@"
-          "return jsStatus\n"
-          "end if\n", @(tabIndex1Based), @(tabIndex1Based), afterSwitch];
+          "return \"ok\"\n"
+          "end if\n", @(tabIndex1Based), @(tabIndex1Based)];
     }
     [source appendString:
-         @"return jsStatus\n"
+         @"return \"ok\"\n"
           "end try\n"
           "end tell\n"
           "return \"failed\""];
     return runChromeScript(source);
+}
+
+// A second surface of an already listed window: no title and mostly inside
+// it, or the same title in practically the same frame. Affinity adds one when
+// a document opens; without this check it became a duplicate card. Callers
+// compare only windows that are both visible or both hidden, so two maximized
+// windows with one title in different Spaces stay two cards.
+static BOOL isTwinSurface(CGRect bounds, NSString *title, RingEntry *listed) {
+    CGRect overlap = CGRectIntersection(bounds, listed.windowBounds);
+    if (CGRectIsNull(overlap) || bounds.size.width <= 0 || bounds.size.height <= 0) return NO;
+    if (!title.length) {
+        return overlap.size.width * overlap.size.height >= bounds.size.width * bounds.size.height * 0.85;
+    }
+    BOOL sameFrame = fabs(bounds.origin.x - listed.windowBounds.origin.x) <= 12 &&
+                     fabs(bounds.origin.y - listed.windowBounds.origin.y) <= 12 &&
+                     fabs(bounds.size.width - listed.windowBounds.size.width) <= 12 &&
+                     fabs(bounds.size.height - listed.windowBounds.size.height) <= 12;
+    return sameFrame && [listed.windowTitle isEqualToString:title];
 }
 
 static NSArray<RingEntry *> *collectOpenWindows(void) {
@@ -2291,6 +2463,12 @@ static NSArray<RingEntry *> *collectOpenWindows(void) {
         NSString *name = info[(id)kCGWindowName];
         if ([name isKindOfClass:[NSString class]] && name.length && info[(id)kCGWindowOwnerPID]) {
             [pidsWithTitledWindow addObject:info[(id)kCGWindowOwnerPID]];
+        }
+    }
+    NSMutableSet<NSNumber *> *onScreenWindowIDs = [NSMutableSet set];
+    for (NSDictionary *info in windowInfos) {
+        if ([info[(id)kCGWindowIsOnscreen] boolValue] && info[(id)kCGWindowNumber]) {
+            [onScreenWindowIDs addObject:info[(id)kCGWindowNumber]];
         }
     }
     NSMutableArray<RingEntry *> *entries = [NSMutableArray array];
@@ -2542,6 +2720,14 @@ static NSArray<RingEntry *> *collectOpenWindows(void) {
             }
             if (hiddenSurfaceInsideWindow) continue;
         }
+        BOOL twin = NO;
+        BOOL onScreen = [info[(id)kCGWindowIsOnscreen] boolValue];
+        for (RingEntry *listed in entries) {
+            if (listed.application.processIdentifier != pid.intValue || listed.isTab) continue;
+            if ([onScreenWindowIDs containsObject:@(listed.windowID)] != onScreen) continue;
+            if (isTwinSurface(windowBounds, title, listed)) { twin = YES; break; }
+        }
+        if (twin) continue;   // the window list is front to back, so the first one stays
         RingEntry *entry = [RingEntry new];
         entry.application = app;
         entry.windowTitle = title.length ? title : (app.localizedName ?: @"Window");
@@ -3733,8 +3919,6 @@ static void startMultitouchDevices(void) {
     NSLog(@"[touch] listening on %ld trackpad device(s)", (long)CFArrayGetCount(g_devices));
 }
 
-static BOOL g_frontWasChrome = NO;
-
 @interface TouchpadWakeObserver : NSObject
 @end
 @implementation TouchpadWakeObserver
@@ -3744,27 +3928,6 @@ static BOOL g_frontWasChrome = NO;
         NSLog(@"[touch] wake: restarting trackpad listeners");
         startMultitouchDevices();
     });
-}
-
-// Leaving Chrome pauses the tab on screen, coming back resumes it. Our own
-// menu bar panel does not count as leaving.
-- (void)applicationActivated:(NSNotification *)notification {
-    NSRunningApplication *app = notification.userInfo[NSWorkspaceApplicationKey];
-    if (!app || app.processIdentifier == getpid()) return;
-    BOOL isChrome = [app.bundleIdentifier isEqualToString:@"com.google.Chrome"];
-    if (g_frontWasChrome && !isChrome && atomic_load(&g_settingAutoPauseMedia)) {
-        runChromeMediaScript(kPauseMediaJS);
-    }
-    if (isChrome && !g_frontWasChrome && atomic_load(&g_settingAutoResumeMedia)) {
-        // A ring selection switches the tab right after activating Chrome;
-        // resume whatever tab is on screen once that is done.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-            if ([NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier isEqualToString:@"com.google.Chrome"]) {
-                runChromeMediaScript(kResumeMediaJS);
-            }
-        });
-    }
-    g_frontWasChrome = isChrome;
 }
 
 // The app being left is still on screen for a moment, so its picture matches
@@ -3823,9 +3986,13 @@ static void loadSettings(void) {
     atomic_store(&g_settingCardTitles, valid && titles >= CardTitlesAll && titles <= CardTitlesNone
                                            ? (int)titles : CardTitlesAll);
     // AutoPauseMedia replaces PauseVideoOnTabSwitch and keeps its old value.
-    atomic_store(&g_settingAutoPauseMedia, settingBool(CFSTR("AutoPauseMedia"),
-                                                       settingBool(CFSTR("PauseVideoOnTabSwitch"), YES)));
-    atomic_store(&g_settingAutoResumeMedia, settingBool(CFSTR("AutoResumeMedia"), YES));
+    g_mediaOptions.pauseWhenLeaving = settingBool(CFSTR("AutoPauseMedia"),
+                                                  settingBool(CFSTR("PauseVideoOnTabSwitch"), YES));
+    g_mediaOptions.resumeWhenReturning = settingBool(CFSTR("AutoResumeMedia"), YES);
+    g_mediaOptions.resumeManuallyPaused = settingBool(CFSTR("MediaResumeManuallyPaused"), NO);
+    g_mediaOptions.followAllTabChanges = settingBool(CFSTR("MediaFollowAllTabChanges"), YES);
+    g_mediaOptions.onlyWhenNextTabHasVideo = settingBool(CFSTR("MediaOnlyWhenNextTabHasVideo"), NO);
+    g_mediaOptions.rewindAfterLongPause = settingBool(CFSTR("MediaRewindAfterLongPause"), YES);
     atomic_store(&g_settingFinderTabsOneCard, settingBool(CFSTR("FinderTabsAsOneCard"), YES));
     atomic_store(&g_settingSoundEffects, settingBool(CFSTR("SoundEffects"), NO));
     Boolean pointerValid = false;
@@ -3848,12 +4015,103 @@ static void loadSettings(void) {
     atomic_store(&g_settingHideMenuIcon, hideIcon);
 }
 
+// macOS gestures that also use three fingers: three-finger drag moves the
+// cursor during a pick, three-finger swipes switch Spaces or open Mission
+// Control at the same time. Built-in and Magic Trackpad keep separate values.
+static BOOL threeFingerSystemGesturesOn(void) {
+    CFStringRef domains[] = {CFSTR("com.apple.AppleMultitouchTrackpad"),
+                             CFSTR("com.apple.driver.AppleBluetoothMultitouch.trackpad")};
+    for (size_t i = 0; i < sizeof(domains) / sizeof(domains[0]); i++) {
+        CFStringRef domain = domains[i];
+        CFPreferencesAppSynchronize(domain);
+        Boolean valid = false;
+        if (CFPreferencesGetAppBooleanValue(CFSTR("TrackpadThreeFingerDrag"), domain, &valid) && valid) return YES;
+        if (CFPreferencesGetAppIntegerValue(CFSTR("TrackpadThreeFingerHorizSwipeGesture"), domain, &valid) == 2 && valid) return YES;
+        if (CFPreferencesGetAppIntegerValue(CFSTR("TrackpadThreeFingerVertSwipeGesture"), domain, &valid) == 2 && valid) return YES;
+    }
+    return NO;
+}
+
+// Media switches in the order the panel shows them; the tag of each checkbox
+// is its index here.
+typedef struct { CFStringRef key; NSString *title; } MediaOptionRow;
+static BOOL *mediaOptionField(RingMediaOptions *options, NSInteger row) {
+    switch (row) {
+        case 0: return &options->pauseWhenLeaving;
+        case 1: return &options->resumeWhenReturning;
+        case 2: return &options->resumeManuallyPaused;
+        case 3: return &options->followAllTabChanges;
+        case 4: return &options->onlyWhenNextTabHasVideo;
+        default: return &options->rewindAfterLongPause;
+    }
+}
+static MediaOptionRow mediaOptionRow(NSInteger row) {
+    switch (row) {
+        case 0: return (MediaOptionRow){CFSTR("AutoPauseMedia"), @"Zaustavi video kad napustiš tab ili Chrome"};
+        case 1: return (MediaOptionRow){CFSTR("AutoResumeMedia"), @"Pokreni ga ponovo kad se vratiš"};
+        case 2: return (MediaOptionRow){CFSTR("MediaResumeManuallyPaused"), @"Pokreni i video koji si sam pauzirao"};
+        case 3: return (MediaOptionRow){CFSTR("MediaFollowAllTabChanges"), @"Važi i za klik na tab i prečice"};
+        case 4: return (MediaOptionRow){CFSTR("MediaOnlyWhenNextTabHasVideo"), @"Zaustavi samo ako novi tab ima video"};
+        default: return (MediaOptionRow){CFSTR("MediaRewindAfterLongPause"), @"Posle duže pauze vrati malo unazad"};
+    }
+}
+static const NSInteger kMediaOptionRowCount = 6;
+
+// Updating from GitHub. `make install-ring` stores the folder the app was
+// built from; the Update button pulls there, rebuilds and starts the new
+// version, which replaces this one (single instance).
+static NSString *sourceRepositoryPath(void) {
+    NSString *path = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("SourceRepository"), kSettingsID));
+    if (![path isKindOfClass:[NSString class]]) return nil;
+    BOOL isFolder = NO;
+    NSString *gitFolder = [path stringByAppendingPathComponent:@".git"];
+    return [NSFileManager.defaultManager fileExistsAtPath:gitFolder isDirectory:&isFolder] && isFolder ? path : nil;
+}
+
+static int runTool(NSString *folder, NSArray<NSString *> *arguments, NSString **outputOut) {
+    NSTask *task = [NSTask new];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/env"];
+    task.arguments = arguments;
+    task.currentDirectoryURL = [NSURL fileURLWithPath:folder];
+    NSMutableDictionary *environment = [NSProcessInfo.processInfo.environment mutableCopy];
+    // Apps started from Finder get a short PATH; git's GitHub login helper
+    // (gh) usually lives in Homebrew.
+    environment[@"PATH"] = @"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+    environment[@"GIT_TERMINAL_PROMPT"] = @"0";   // never wait for a password nobody can type
+    task.environment = environment;
+    NSPipe *pipe = [NSPipe pipe];
+    task.standardOutput = pipe;
+    task.standardError = pipe;
+    NSError *error = nil;
+    if (![task launchAndReturnError:&error]) {
+        if (outputOut) *outputOut = error.localizedDescription;
+        return -1;
+    }
+    NSData *data = [pipe.fileHandleForReading readDataToEndOfFile];
+    [task waitUntilExit];
+    if (outputOut) *outputOut = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+    return task.terminationStatus;
+}
+
+// Last line of a tool's output, short enough for the panel.
+static NSString *lastOutputLine(NSString *output) {
+    NSArray<NSString *> *lines = [output componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet];
+    for (NSString *line in lines.reverseObjectEnumerator) {
+        NSString *trimmed = [line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if (trimmed.length) return trimmed.length > 160 ? [[trimmed substringToIndex:160] stringByAppendingString:@"…"] : trimmed;
+    }
+    return @"nepoznata greška";
+}
+
 // Menu bar icon with a small panel of switches, the same shape as Limiti.
 @interface SettingsMenu : NSObject
 @property(nonatomic, strong) NSStatusItem *statusItem;
 @property(nonatomic, strong) NSPopover *popover;
 @property(nonatomic, strong) NSTextField *javaScriptHint;
 @property(nonatomic, strong) NSTextField *blurLabel;
+@property(nonatomic, strong) NSTextField *gestureWarning;
+@property(nonatomic, strong) NSButton *updateButton;
+@property(nonatomic, strong) NSTextField *updateStatus;
 @end
 
 @implementation SettingsMenu
@@ -3883,6 +4141,12 @@ static void loadSettings(void) {
     NSTextField *title = [NSTextField labelWithString:@"Touchpad Switcher"];
     title.font = [NSFont boldSystemFontOfSize:13];
 
+    self.gestureWarning = [self noteWithText:
+        @"macOS takođe koristi tri prsta (prevlačenje ili prelazak između ekrana), pa se kursor ili ekran pomera dok biraš. "
+         "Isključi prevlačenje sa tri prsta u System Settings > Accessibility > Pointer Control > Trackpad Options, "
+         "a pokrete za Mission Control i ekrane prebaci na četiri prsta u System Settings > Trackpad > More Gestures."];
+    self.gestureWarning.textColor = NSColor.systemOrangeColor;
+
     NSTextField *titlesLabel = [self noteWithText:@"Naslovi na karticama"];
     NSSegmentedControl *titles = [NSSegmentedControl segmentedControlWithLabels:@[@"Svi prozori", @"Finder i Chrome", @"Bez naslova"]
                                                                    trackingMode:NSSegmentSwitchTrackingSelectOne
@@ -3901,14 +4165,19 @@ static void loadSettings(void) {
     pointer.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
     pointer.selectedSegment = atomic_load(&g_settingPointerStyle);
 
-    NSButton *pauseVideo = [NSButton checkboxWithTitle:@"Automatski zaustavi video kad izađeš"
-                                                target:self action:@selector(pauseVideoChanged:)];
-    pauseVideo.state = atomic_load(&g_settingAutoPauseMedia) ? NSControlStateValueOn : NSControlStateValueOff;
-    NSButton *resumeVideo = [NSButton checkboxWithTitle:@"Automatski pokreni video kad se vratiš"
-                                                 target:self action:@selector(resumeVideoChanged:)];
-    resumeVideo.state = atomic_load(&g_settingAutoResumeMedia) ? NSControlStateValueOn : NSControlStateValueOff;
-    NSTextField *resumeNote = [self noteWithText:
-        @"Važi za Chrome: pri prelasku na drugi tab i pri izlasku iz Chrome-a. Pokreće se samo video koji je ova aplikacija zaustavila."];
+    NSTextField *mediaLabel = [self noteWithText:@"Video u Chrome-u"];
+    NSMutableArray<NSView *> *mediaRows = [NSMutableArray array];
+    for (NSInteger row = 0; row < kMediaOptionRowCount; row++) {
+        NSButton *box = [NSButton checkboxWithTitle:mediaOptionRow(row).title
+                                             target:self action:@selector(mediaOptionChanged:)];
+        box.tag = row;
+        box.state = *mediaOptionField(&g_mediaOptions, row) ? NSControlStateValueOn : NSControlStateValueOff;
+        [mediaRows addObject:box];
+    }
+    NSTextField *mediaNote = [self noteWithText:
+        @"Bez treće opcije pokreće se samo video koji je ova aplikacija zaustavila. Sa opcijom „samo ako novi tab ima video“ "
+         "stari video svira dalje dok ne pređeš na tab sa videom, a izlazak iz Chrome-a ga ne zaustavlja. "
+         "Unazad: 2 s posle pola minuta, 5 s posle 5 minuta."];
     self.javaScriptHint = [self noteWithText:
         @"Chrome ne dozvoljava upravljanje videom. U Chrome-u uključi View > Developer > Allow JavaScript from Apple Events."];
     self.javaScriptHint.textColor = NSColor.systemOrangeColor;
@@ -3937,19 +4206,30 @@ static void loadSettings(void) {
 
     NSButton *quit = [NSButton buttonWithTitle:@"Ugasi Touchpad Switcher" target:NSApp action:@selector(terminate:)];
     quit.controlSize = NSControlSizeSmall;
+    self.updateButton = [NSButton buttonWithTitle:@"Ažuriraj sa GitHub-a" target:self action:@selector(updateApp:)];
+    self.updateButton.controlSize = NSControlSizeSmall;
+    self.updateStatus = [self noteWithText:@""];
+    self.updateStatus.hidden = YES;
+    // Only a copy built from the repository folder can update itself.
+    self.updateButton.hidden = sourceRepositoryPath() == nil;
+    NSStackView *buttons = [NSStackView stackViewWithViews:@[self.updateButton, quit]];
+    buttons.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    buttons.spacing = 8;
 
-    NSStackView *stack = [NSStackView stackViewWithViews:@[title, titlesLabel, titles, pointerLabel, pointer, pauseVideo, resumeVideo, resumeNote, self.javaScriptHint,
-                                                           finderTabs, sounds, self.blurLabel, blur, separator,
-                                                           hideIcon, hideNote, quit]];
+    NSMutableArray<NSView *> *rows = [@[title, self.gestureWarning, titlesLabel, titles, pointerLabel, pointer, mediaLabel] mutableCopy];
+    [rows addObjectsFromArray:mediaRows];
+    [rows addObjectsFromArray:@[mediaNote, self.javaScriptHint, finderTabs, sounds, self.blurLabel, blur, separator,
+                                hideIcon, hideNote, buttons, self.updateStatus]];
+    NSStackView *stack = [NSStackView stackViewWithViews:rows];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeLeading;
     stack.spacing = 10;
     stack.edgeInsets = NSEdgeInsetsMake(14, 14, 14, 14);
     [stack setCustomSpacing:4 afterView:titlesLabel];
     [stack setCustomSpacing:4 afterView:pointerLabel];
-    [stack setCustomSpacing:4 afterView:pauseVideo];
-    [stack setCustomSpacing:4 afterView:resumeVideo];
-    [stack setCustomSpacing:4 afterView:resumeNote];
+    [stack setCustomSpacing:4 afterView:mediaLabel];
+    for (NSView *row in mediaRows) [stack setCustomSpacing:4 afterView:row];
+    [stack setCustomSpacing:4 afterView:mediaNote];
     [stack setCustomSpacing:4 afterView:hideIcon];
     [stack setCustomSpacing:4 afterView:self.blurLabel];
     [stack setCustomSpacing:14 afterView:hideNote];
@@ -3975,11 +4255,52 @@ static void loadSettings(void) {
         self.popover.contentSize = controller.view.fittingSize;
         self.popover.behavior = NSPopoverBehaviorTransient;
     }
+    self.gestureWarning.hidden = !threeFingerSystemGesturesOn();
     [self updateJavaScriptHint];
     self.popover.contentSize = self.popover.contentViewController.view.fittingSize;
     NSButton *button = self.statusItem.button;
     [self.popover showRelativeToRect:button.bounds ofView:button preferredEdge:NSRectEdgeMinY];
     [NSApp activate];
+}
+
+- (void)setUpdateMessage:(NSString *)message done:(BOOL)done {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.updateStatus.stringValue = message;
+        self.updateStatus.hidden = NO;
+        if (done) self.updateButton.enabled = YES;
+        self.popover.contentSize = self.popover.contentViewController.view.fittingSize;
+    });
+}
+
+- (void)updateApp:(NSButton *)button {
+    NSString *repository = sourceRepositoryPath();
+    if (!repository) return;
+    button.enabled = NO;
+    [self setUpdateMessage:@"Proveravam izmene na GitHub-u…" done:NO];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *output = nil;
+        if (runTool(repository, @[@"git", @"fetch", @"--quiet"], &output) != 0) {
+            [self setUpdateMessage:[@"GitHub nije dostupan: " stringByAppendingString:lastOutputLine(output)] done:YES];
+            return;
+        }
+        runTool(repository, @[@"git", @"rev-list", @"--count", @"HEAD..@{u}"], &output);
+        if (output.integerValue == 0) {
+            [self setUpdateMessage:@"Imaš najnoviju verziju." done:YES];
+            return;
+        }
+        [self setUpdateMessage:@"Preuzimam izmene i pravim novu verziju…" done:NO];
+        if (runTool(repository, @[@"git", @"pull", @"--ff-only"], &output) != 0) {
+            [self setUpdateMessage:[@"Preuzimanje nije uspelo: " stringByAppendingString:lastOutputLine(output)] done:YES];
+            return;
+        }
+        if (runTool(repository, @[@"make", @"install-ring"], &output) != 0) {
+            [self setUpdateMessage:[@"Pravljenje nije uspelo: " stringByAppendingString:lastOutputLine(output)] done:YES];
+            return;
+        }
+        [self setUpdateMessage:@"Gotovo, pokrećem novu verziju…" done:NO];
+        // The new instance ends this one as it starts.
+        runTool(repository, @[@"open", @"-n", @"/Applications/Touchpad Switcher.app"], NULL);
+    });
 }
 
 - (void)cardTitlesChanged:(NSSegmentedControl *)control {
@@ -3999,23 +4320,17 @@ static void loadSettings(void) {
     [g_ringView resetPointer];   // rebuilt with the new shape on the next open
 }
 
-- (void)pauseVideoChanged:(NSButton *)button {
+- (void)mediaOptionChanged:(NSButton *)button {
     BOOL on = button.state == NSControlStateValueOn;
-    atomic_store(&g_settingAutoPauseMedia, on);
-    storeSetting(CFSTR("AutoPauseMedia"), on ? kCFBooleanTrue : kCFBooleanFalse);
-    [self updateJavaScriptHint];
-}
-
-- (void)resumeVideoChanged:(NSButton *)button {
-    BOOL on = button.state == NSControlStateValueOn;
-    atomic_store(&g_settingAutoResumeMedia, on);
-    storeSetting(CFSTR("AutoResumeMedia"), on ? kCFBooleanTrue : kCFBooleanFalse);
+    *mediaOptionField(&g_mediaOptions, button.tag) = on;
+    storeSetting(mediaOptionRow(button.tag).key, on ? kCFBooleanTrue : kCFBooleanFalse);
+    RingMediaSetOptions(g_mediaOptions);
     [self updateJavaScriptHint];
 }
 
 - (void)updateJavaScriptHint {
-    self.javaScriptHint.hidden = !(atomic_load(&g_chromeJavaScriptBlocked) &&
-                                   (atomic_load(&g_settingAutoPauseMedia) || atomic_load(&g_settingAutoResumeMedia)));
+    self.javaScriptHint.hidden = !(RingMediaJavaScriptBlocked() &&
+                                   (g_mediaOptions.pauseWhenLeaving || g_mediaOptions.resumeWhenReturning));
     self.popover.contentSize = self.popover.contentViewController.view.fittingSize;
 }
 
@@ -4089,6 +4404,7 @@ int main(int argc, const char *argv[]) {
         loadSettings();
         g_settingsMenu = [SettingsMenu new];
         if (!atomic_load(&g_settingHideMenuIcon)) [g_settingsMenu showIcon];
+        RingMediaStart(g_mediaOptions);
         signal(SIGINT, handleSignal);
         signal(SIGTERM, handleSignal);
         BOOL accessibilityTrusted = AXIsProcessTrusted();
@@ -4164,12 +4480,6 @@ int main(int argc, const char *argv[]) {
         [workspaceCenter addObserver:g_wakeObserver
                             selector:@selector(didWake:)
                                 name:NSWorkspaceScreensDidWakeNotification
-                              object:nil];
-        g_frontWasChrome = [NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier
-                               isEqualToString:@"com.google.Chrome"];
-        [workspaceCenter addObserver:g_wakeObserver
-                            selector:@selector(applicationActivated:)
-                                name:NSWorkspaceDidActivateApplicationNotification
                               object:nil];
         [workspaceCenter addObserver:g_wakeObserver
                             selector:@selector(applicationDeactivated:)

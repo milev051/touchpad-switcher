@@ -166,6 +166,13 @@ python3 touchpad_switcher.py --align right
 make run-python
 ```
 
+## Instalacija i ažuriranje
+
+Dupli klik na `Instaliraj.command` napravi aplikaciju i stavi je u
+`/Applications`. Ažuriranje: ikonica šake > **Ažuriraj sa GitHub-a**, dupli klik
+na `Ažuriraj.command` ili `make update`. Dozvole, trackpad i Chrome:
+[INSTALACIJA.md](INSTALACIJA.md).
+
 ## Eksperimentalni troprstni kružni meni
 
 Zaseban prototip prikazuje otvorene prozore oko centra ekrana kada detektuje tri
@@ -228,14 +235,37 @@ Ikonica šake u gornjoj traci otvara panel sa podešavanjima:
 
 | podešavanje | šta radi | podrazumevano |
 |---|---|---|
-| Naslovi na karticama | svi prozori, samo Finder i Chrome, ili bez naslova | svi prozori |
-| Pauziraj video kad promeniš Chrome tab | tab koji se zamenjuje u istom prozoru pauzira video i zvuk | uključeno |
-| Finder tabovi jednog prozora kao jedna kartica | tabovi jednog Finder prozora daju jednu karticu, zasebni prozori ostaju zasebni | uključeno |
+| Naslovi, pokazivač, zvuci, zamućenje | izgled menija | svi naslovi, nevidljiv pokazivač, bez zvuka, zamućenje 15 |
+| Finder tabovi jednog prozora kao jedna kartica | tabovi jednog Finder prozora daju jednu karticu | uključeno |
 | Sakrij ikonicu iz gornje trake | uklanja ikonicu | isključeno |
 
-Pauza radi preko JavaScript-a u Chrome-u, pa u Chrome-u mora biti uključeno
-**View > Developer > Allow JavaScript from Apple Events**. Bez toga se tab i
-dalje menja, a panel ispisuje upozorenje.
+### Video u Chrome-u
+
+Pravila za video su u zasebnom fajlu `ring_media.m`, odvojeno od biranja
+prozora. Dok je Chrome napred, tab na ekranu se proverava nekoliko puta u
+sekundi jednim kratkim Apple Event-om. Kad se tab promeni (meni, klik na tab,
+prečica) ili se Chrome napusti, pokreće se JavaScript u tabu:
+
+| opcija | šta radi | podrazumevano |
+|---|---|---|
+| Zaustavi video kad napustiš tab ili Chrome | pauzira video i zvuk u tabu koji nije više na ekranu | uključeno |
+| Pokreni ga ponovo kad se vratiš | nastavlja samo ono što je aplikacija sama zaustavila | uključeno |
+| Pokreni i video koji si sam pauzirao | pri povratku na tab pokreće i video koji je korisnik ručno zaustavio | isključeno |
+| Važi i za klik na tab i prečice | bez ove opcije pravila važe samo za prelazak preko menija | uključeno |
+| Zaustavi samo ako novi tab ima video | stari video svira dalje dok ne pređeš na tab sa već pokrenutim videom, a izlazak iz Chrome-a ga ne zaustavlja | isključeno |
+| Posle duže pauze vrati malo unazad | 2 s unazad posle pola minuta pauze, 5 s posle 5 minuta | uključeno |
+
+Pauzirani video dobija oznaku sa vremenom pauze u samoj stranici, pa se zna
+šta je zaustavila aplikacija, a šta korisnik. Sve ovo radi tek kad je u
+Chrome-u uključeno **View > Developer > Allow JavaScript from Apple Events**;
+do tada panel ispisuje upozorenje. Video u drugim programima (Safari, Spotify)
+nije pokriven: macOS ne daje opšti način da se to uradi.
+
+### Prelazak na prozor
+
+Izabrani prozor se dovodi napred tačno po ID-ju, preko istog sistemskog poziva
+koji koristi AltTab. Tako se prelazi i na prozor u drugom Space-u ili u full
+screen-u, i bez Accessibility dozvole.
 
 Sakrivena ikonica se vraća kad se aplikacija ponovo otvori dok već radi (npr.
 iz Spotlight-a ili `/Applications`). Podešavanja se čuvaju pod
