@@ -155,6 +155,8 @@ static _Atomic(int) g_settingBlurRadius = 15;   // 0 turns the blur off
 // -1 disables mouse activation. Values 2...31 are Quartz mouse button numbers
 // (middle is 2, the usual side buttons 3 and 4); kMouseActivationKeyBase plus a
 // key code is a recorded key, such as F18 sent by Logi Options+.
+// kMouseActivationSwipeBack/Forward are the side buttons with Logi Options+'s
+// default Back/Forward assignment, which arrive as a synthetic swipe.
 static _Atomic(int) g_settingMouseButton = -1;
 typedef enum { PointerStyleArrow = 0, PointerStyleDot = 1, PointerStyleHidden = 2 } PointerStyle;
 static _Atomic(int) g_settingPointerStyle = PointerStyleHidden;
@@ -883,6 +885,13 @@ static _Atomic(int) g_mouseGestureButton = -1;
 static _Atomic(bool) g_mouseButtonLearning = false;
 static _Atomic(int) g_learnedButtonAwaitingUp = -1;
 static _Atomic(int) g_learnedKeyAwaitingUp = -1;
+// A Logi Back/Forward swipe has no press duration, so it opens the ring and
+// the ring stays open until the same button or a left click picks the card.
+static _Atomic(bool) g_swipeGestureActive = false;
+static _Atomic(bool) g_swallowLeftMouseUp = false;
+// The swipe's direction is only known at its end, so its start is held back
+// and posted again when the swipe turns out not to be the activation.
+static CGEventRef g_heldSwipeBegin = NULL;
 static _Atomic(bool) g_systemCursorHidden = false;
 static _Atomic(bool) g_ringOverlayVisible = false;
 static _Atomic(bool) g_scrollSuppressionActive = false;
@@ -1041,7 +1050,13 @@ static void moveRingPointer(double dx, double dy, NSInteger count);
 static NSInteger pointerSelection(NSInteger count, NSInteger currentIndex);
 static void scheduleSelectionUpdate(uint64_t generation, NSInteger selection, NSPoint pointer);
 static void finishGesture(uint64_t generation, NSInteger selection);
-enum { kMouseActivationLegacyF18 = 100, kMouseActivationKeyBase = 1000 };
+enum {
+    kMouseActivationLegacyF18 = 100,
+    kMouseActivationKeyBase = 1000,
+    kMouseActivationSwipeBack = 2001,
+    kMouseActivationSwipeForward = 2002,
+};
+static const CGEventType kGestureEventType = (CGEventType)29;   // NSEventTypeGesture
 static const CGKeyCode kEscapeKeyCode = 53;
 static NSString *const kMouseButtonLearnedNotification = @"TouchpadSwitcherMouseButtonLearned";
 
@@ -1101,6 +1116,37 @@ static void beginKeyboardGesture(CGEventRef event) {
     dispatch_async(dispatch_get_main_queue(), ^{ showRing(generation); });
 }
 
+// Logi Options+ posts its Back/Forward button actions as a swipe from its own
+// agent; trackpad gestures come from the Window Server (pid 0). Returns the
+// swipe's phase and, once it ends, the activation value of its direction.
+static BOOL logiSwipe(CGEventRef event, CGEventType type, NSEventPhase *phase, int *activation) {
+    if (type != kGestureEventType) return NO;
+    if (CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) == 0) return NO;
+    NSEvent *swipe = [NSEvent eventWithCGEvent:event];
+    if (swipe.type != NSEventTypeSwipe) return NO;
+    *phase = swipe.phase;
+    // A positive deltaX is a swipe to the left, which AppKit treats as Back.
+    *activation = swipe.deltaX > 0 ? kMouseActivationSwipeBack
+        : swipe.deltaX < 0 ? kMouseActivationSwipeForward : -1;
+    return YES;
+}
+
+static void releaseHeldSwipeBegin(CGEventTapProxy proxy, BOOL post) {
+    if (!g_heldSwipeBegin) return;
+    if (post) CGEventTapPostEvent(proxy, g_heldSwipeBegin);
+    CFRelease(g_heldSwipeBegin);
+    g_heldSwipeBegin = NULL;
+}
+
+static void finishMouseDrivenGesture(NSInteger selection) {
+    atomic_store(&g_mouseGestureActive, false);
+    atomic_store(&g_swipeGestureActive, false);
+    atomic_store(&g_mouseGestureButton, -1);
+    atomic_store(&g_gestureEnding, true);
+    uint64_t generation = atomic_load(&g_gestureGeneration);
+    dispatch_async(dispatch_get_main_queue(), ^{ finishGesture(generation, selection); });
+}
+
 static void updateMouseGesture(CGEventRef event) {
     // Quartz deltas are screen points and positive Y points down. Roughly 80
     // points of travel reaches the cards, matching the short trackpad motion.
@@ -1136,6 +1182,65 @@ static CGEventRef filterScrollDuringRing(CGEventTapProxy proxy, CGEventType type
         ? (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) : UINT16_MAX;
     BOOL keyRepeat = type == kCGEventKeyDown &&
         CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat) != 0;
+    NSEventPhase swipePhase = NSEventPhaseNone;
+    int swipeActivation = -1;
+    if (logiSwipe(event, type, &swipePhase, &swipeActivation)) {
+        BOOL watching = atomic_load(&g_mouseButtonLearning) ||
+            configuredButton == kMouseActivationSwipeBack ||
+            configuredButton == kMouseActivationSwipeForward;
+        if (!watching) return event;
+        if (swipePhase == NSEventPhaseBegan) {
+            releaseHeldSwipeBegin(proxy, YES);
+            g_heldSwipeBegin = (CGEventRef)CFRetain(event);
+            return NULL;
+        }
+        if (swipeActivation == -1) {
+            releaseHeldSwipeBegin(proxy, YES);
+            return event;
+        }
+        if (atomic_exchange(&g_mouseButtonLearning, false)) {
+            releaseHeldSwipeBegin(proxy, NO);
+            persistMouseActivationSetting(swipeActivation);
+            NSLog(@"[mouse] learned activation %d", swipeActivation);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [[NSNotificationCenter defaultCenter]
+                    postNotificationName:kMouseButtonLearnedNotification
+                                  object:nil
+                                userInfo:@{@"button": @(swipeActivation)}];
+            });
+            return NULL;
+        }
+        if (swipeActivation != configuredButton) {
+            releaseHeldSwipeBegin(proxy, YES);
+            return event;
+        }
+        releaseHeldSwipeBegin(proxy, NO);
+        if (atomic_load(&g_swipeGestureActive)) {
+            finishMouseDrivenGesture(g_selectedIndex);
+        } else if (!atomic_load(&g_gestureActive)) {
+            beginMouseGesture(event, configuredButton);
+            if (atomic_load(&g_mouseGestureActive)) atomic_store(&g_swipeGestureActive, true);
+        }
+        return NULL;
+    }
+    if (type == kCGEventLeftMouseUp && atomic_exchange(&g_swallowLeftMouseUp, false)) {
+        return NULL;
+    }
+    if (atomic_load(&g_swipeGestureActive)) {
+        if (type == kCGEventMouseMoved || type == kCGEventLeftMouseDragged) {
+            updateMouseGesture(event);
+            return NULL;
+        }
+        if (type == kCGEventLeftMouseDown) {
+            atomic_store(&g_swallowLeftMouseUp, true);
+            finishMouseDrivenGesture(g_selectedIndex);
+            return NULL;
+        }
+        if (type == kCGEventKeyDown && keyCode == kEscapeKeyCode) {
+            finishMouseDrivenGesture(-1);
+            return NULL;
+        }
+    }
     // While recording, the next mouse button or key press (for example the
     // shortcut Logi Options+ sends for a side button) becomes the activation.
     // Escape cancels recording.
@@ -1170,7 +1275,8 @@ static CGEventRef filterScrollDuringRing(CGEventTapProxy proxy, CGEventType type
         atomic_store(&g_learnedKeyAwaitingUp, -1);
         return NULL;
     }
-    int configuredKey = configuredButton >= kMouseActivationKeyBase
+    int configuredKey = configuredButton >= kMouseActivationKeyBase &&
+        configuredButton < kMouseActivationSwipeBack
         ? configuredButton - kMouseActivationKeyBase : -1;
     if (configuredKey >= 0 && type == kCGEventKeyDown && keyCode == configuredKey) {
         if (!keyRepeat && !atomic_load(&g_gestureActive)) beginKeyboardGesture(event);
@@ -1195,17 +1301,12 @@ static CGEventRef filterScrollDuringRing(CGEventTapProxy proxy, CGEventType type
         beginMouseGesture(event, configuredButton);
         return NULL;
     }
-    if (atomic_load(&g_mouseGestureActive)) {
+    if (atomic_load(&g_mouseGestureActive) && !atomic_load(&g_swipeGestureActive)) {
         if (type == kCGEventMouseMoved || type == kCGEventOtherMouseDragged) {
             updateMouseGesture(event);
         } else if (type == kCGEventOtherMouseUp &&
                    eventButton == atomic_load(&g_mouseGestureButton)) {
-            atomic_store(&g_mouseGestureActive, false);
-            atomic_store(&g_mouseGestureButton, -1);
-            atomic_store(&g_gestureEnding, true);
-            uint64_t generation = atomic_load(&g_gestureGeneration);
-            NSInteger selection = g_selectedIndex;
-            dispatch_async(dispatch_get_main_queue(), ^{ finishGesture(generation, selection); });
+            finishMouseDrivenGesture(g_selectedIndex);
         }
         return NULL;
     }
@@ -1266,7 +1367,8 @@ static void *runScrollEventTap(void *unused) {
                                          CGEventMaskBit(kCGEventOtherMouseUp) |
                                          CGEventMaskBit(kCGEventOtherMouseDragged) |
                                          CGEventMaskBit(kCGEventKeyDown) |
-                                         CGEventMaskBit(kCGEventKeyUp);
+                                         CGEventMaskBit(kCGEventKeyUp) |
+                                         CGEventMaskBit(kGestureEventType);
         g_scrollEventTap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
                                             kCGEventTapOptionDefault, protectedInputMask,
                                             filterScrollDuringRing, NULL);
@@ -4187,7 +4289,8 @@ static void loadSettings(void) {
         mouseButton = kMouseActivationKeyBase + 79;   // earlier builds stored F18 as 100
     }
     BOOL mouseButtonKnown = (mouseButton >= 2 && mouseButton <= 31) ||
-        (mouseButton >= kMouseActivationKeyBase && mouseButton <= kMouseActivationKeyBase + 127);
+        (mouseButton >= kMouseActivationKeyBase && mouseButton <= kMouseActivationKeyBase + 127) ||
+        mouseButton == kMouseActivationSwipeBack || mouseButton == kMouseActivationSwipeForward;
     atomic_store(&g_settingMouseButton, mouseButtonValid && mouseButtonKnown ? (int)mouseButton : -1);
     g_selectSound = [[NSSound soundNamed:@"Tink"] copy];
     g_selectSound.volume = 0.3;
@@ -4320,6 +4423,8 @@ static NSString *lastOutputLine(NSString *output) {
 }
 
 - (NSString *)mouseActivationTitle:(int)value {
+    if (value == kMouseActivationSwipeBack) return @"bočno dugme Back";
+    if (value == kMouseActivationSwipeForward) return @"bočno dugme Forward";
     if (value >= kMouseActivationKeyBase) {
         int keyCode = value - kMouseActivationKeyBase;
         static const struct { int code; const char *name; } functionKeys[] = {
@@ -4426,7 +4531,7 @@ static NSString *lastOutputLine(NSString *output) {
     self.mouseLearnStatus = [self noteWithText:@""];
     self.mouseLearnStatus.hidden = YES;
     NSTextField *mouseNote = [self noteWithText:
-        @"Klikni „Snimi dugme“, pa pritisni željeno dugme miša (Esc otkazuje). Ako Logi Options+ presreće dugme, tamo mu dodeli Middle button ili prečicu poput F18, pa ga snimi. Zatim drži dugme, pomeri miš ka kartici i pusti ga."];
+        @"Klikni „Snimi dugme“, pa pritisni željeno dugme miša (Esc otkazuje). Bočna dugmad sa Logi podešavanjem Back/Forward rade direktno: klik otvara meni, pomeri miš ka kartici, pa isto dugme ili levi klik bira. Ostala dugmad se drže dok se miš pomera i puštaju na kartici."];
 
     NSTextField *mediaLabel = [self noteWithText:@"Video u Chrome-u"];
     NSMutableArray<NSView *> *mediaRows = [NSMutableArray array];

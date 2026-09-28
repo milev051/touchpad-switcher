@@ -218,9 +218,11 @@ zahteva Accessibility dozvolu; posle uključivanja dozvole ponovo pokreni
 Touchpad Switcher. Sistemski kursor ostaje zaključan na mestu pritiska dok
 pomeranje miša upravlja pokazivačem kružnog menija.
 
-Snimanje pamti stvarni signal koji stiže: broj dugmeta miša ili taster. Ako
-softver miša presreće bočnu dugmad (na primer Logi Options+), dodeli željenom
-dugmetu **Middle button** ili Keyboard shortcut poput **F18**, pa ga snimi.
+Snimanje pamti stvarni signal koji stiže: broj dugmeta miša, taster ili
+Logi bočno dugme. Uz podrazumevano Logi Options+ podešavanje bočna dugmad su
+**Back** i **Forward** i rade direktno: klik otvara meni, pomeri miš ka kartici,
+pa isto dugme ili levi klik bira (Esc otkazuje). Tada se Back/Forward ne
+izvršava. Za srednji klik ne treba ništa menjati u Logi Options+.
 
 ### Sličice
 

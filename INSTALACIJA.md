@@ -68,8 +68,9 @@ Ako se koristi miš, u panelu ikonice šake pod **Aktivacija mišem** klikne se
 pamti signal koji stiže. **Isključi** gasi aktivaciju mišem. Dugme se drži dok
 se miš pomera ka kartici, a puštanje je aktivira. Za ovu opciju je potrebna
 Accessibility dozvola i ponovno pokretanje aplikacije posle njenog uključivanja.
-Ako Logi Options+ pretvara bočnu dugmad u Back/Forward, željenom dugmetu se tamo
-dodeli **Middle button** ili prečica poput **F18**, pa se ono snimi.
+Logi bočna dugmad sa podešavanjem **Back/Forward** rade direktno: klik otvara
+meni, pomeri se miš, pa isto dugme ili levi klik bira. U Logi Options+ ne treba
+im dodeljivati Middle button.
 Sistemski kursor je sakriven dok je kružni meni otvoren i ponovo se prikazuje
 čim se izbor završi ili otkaže.
 
