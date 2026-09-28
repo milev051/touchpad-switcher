@@ -69,7 +69,8 @@ kartici, a puštanje je aktivira. Za ovu opciju je potrebna Accessibility dozvol
 i ponovno pokretanje aplikacije posle njenog uključivanja.
 Ako Logi Options+ pretvara bočnu dugmad u Back/Forward, željeno bočno dugme se
 tamo mapira na **Middle button**, a u panelu Touchpad Switcher-a bira se
-**Srednji klik**.
+**Srednji klik / Logi bočno**. Opcije **Direktno dugme 4/5** koriste se samo
+ako miš ta dugmad šalje bez dodatnog mapiranja.
 Sistemski kursor je sakriven dok je kružni meni otvoren i ponovo se prikazuje
 čim se izbor završi ili otkaže.
 

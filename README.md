@@ -220,7 +220,8 @@ pomeranje miša upravlja pokazivačem kružnog menija.
 
 Ako softver miša presreće bočnu dugmad (na primer Logi Options+), mapiraj željeno
 bočno dugme na **Middle button**, a u panelu Touchpad Switcher-a izaberi
-**Srednji klik**.
+**Srednji klik / Logi bočno**. Stavke **Direktno dugme 4/5** namenjene su
+miševima koji šalju ta dugmad bez dodatnog softverskog mapiranja.
 
 ### Sličice
 

@@ -4259,7 +4259,8 @@ static NSString *lastOutputLine(NSString *output) {
 
     NSTextField *mouseLabel = [self noteWithText:@"Aktivacija mišem"];
     NSPopUpButton *mouseButton = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
-    NSArray<NSString *> *mouseButtonTitles = @[@"Isključeno", @"Srednji klik", @"Bočno dugme 4", @"Bočno dugme 5"];
+    NSArray<NSString *> *mouseButtonTitles = @[@"Isključeno", @"Srednji klik / Logi bočno",
+                                                @"Direktno dugme 4", @"Direktno dugme 5"];
     NSInteger mouseButtonTags[] = {-1, 2, 3, 4};
     for (NSUInteger i = 0; i < mouseButtonTitles.count; i++) {
         [mouseButton addItemWithTitle:mouseButtonTitles[i]];
@@ -4270,7 +4271,7 @@ static NSString *lastOutputLine(NSString *output) {
     mouseButton.target = self;
     mouseButton.action = @selector(mouseButtonChanged:);
     NSTextField *mouseNote = [self noteWithText:
-        @"Drži izabrano dugme, pomeri miš ka kartici i pusti dugme. Za Logitech miš u Logi Options+ mapiraj željeno bočno dugme na Middle button, pa ovde izaberi Srednji klik. Zahteva Accessibility dozvolu i ponovno pokretanje aplikacije posle njenog uključivanja."];
+        @"Na MX Master 3S je Forward bočno dugme u Logi Options+ mapirano na Middle button, zato ovde ostavi „Srednji klik / Logi bočno“. Drži dugme, pomeri miš ka kartici i pusti ga. Direktno dugme 4/5 služi za miševe bez takvog mapiranja."];
 
     NSTextField *mediaLabel = [self noteWithText:@"Video u Chrome-u"];
     NSMutableArray<NSView *> *mediaRows = [NSMutableArray array];
