@@ -67,6 +67,9 @@ Ako se koristi miš, u panelu ikonice šake pod **Aktivacija mišem** može da s
 izabere srednji klik ili bočno dugme 4/5. Dugme se drži dok se miš pomera ka
 kartici, a puštanje je aktivira. Za ovu opciju je potrebna Accessibility dozvola
 i ponovno pokretanje aplikacije posle njenog uključivanja.
+Najlakše je kliknuti **Snimi sledeće dugme**, pa pritisnuti željeno dugme miša;
+aplikacija tada sama pamti signal koji macOS šalje. Dostupna je i ručna opcija
+**F18 / Logi prečica**.
 Ako Logi Options+ pretvara bočnu dugmad u Back/Forward, željeno bočno dugme se
 tamo mapira na **Middle button**, a u panelu Touchpad Switcher-a bira se
 **Srednji klik / Logi bočno**. Opcije **Direktno dugme 4/5** koriste se samo

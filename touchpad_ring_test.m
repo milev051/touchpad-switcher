@@ -877,7 +877,10 @@ static _Atomic(int) g_windowEntryCount = 0;
 static CFMutableArrayRef g_devices = NULL;
 static _Atomic(bool) g_gestureActive = false;
 static _Atomic(bool) g_mouseGestureActive = false;
+static _Atomic(bool) g_keyboardGestureActive = false;
 static _Atomic(int) g_mouseGestureButton = -1;
+static _Atomic(bool) g_mouseButtonLearning = false;
+static _Atomic(int) g_learnedButtonAwaitingUp = -1;
 static _Atomic(bool) g_systemCursorHidden = false;
 static _Atomic(bool) g_ringOverlayVisible = false;
 static _Atomic(bool) g_scrollSuppressionActive = false;
@@ -1036,6 +1039,17 @@ static void moveRingPointer(double dx, double dy, NSInteger count);
 static NSInteger pointerSelection(NSInteger count, NSInteger currentIndex);
 static void scheduleSelectionUpdate(uint64_t generation, NSInteger selection, NSPoint pointer);
 static void finishGesture(uint64_t generation, NSInteger selection);
+enum { kMouseActivationF18 = 100 };
+static const CGKeyCode kMouseShortcutKeyCode = 79;
+static NSString *const kMouseButtonLearnedNotification = @"TouchpadSwitcherMouseButtonLearned";
+
+static void persistMouseActivationSetting(int value) {
+    atomic_store(&g_settingMouseButton, value);
+    CFNumberRef number = CFNumberCreate(NULL, kCFNumberIntType, &value);
+    CFPreferencesSetAppValue(CFSTR("MouseActivationButton"), number, kSettingsID);
+    CFPreferencesAppSynchronize(kSettingsID);
+    CFRelease(number);
+}
 
 static void hideSystemCursorForGesture(void) {
     if (!atomic_exchange(&g_systemCursorHidden, true)) {
@@ -1070,6 +1084,21 @@ static void beginMouseGesture(CGEventRef event, int button) {
     dispatch_async(dispatch_get_main_queue(), ^{ showRing(generation); });
 }
 
+static void beginKeyboardGesture(CGEventRef event) {
+    if (atomic_load(&g_gestureActive) || atomic_load(&g_ringOverlayVisible)) return;
+    atomic_store(&g_keyboardGestureActive, true);
+    atomic_store(&g_gestureActive, true);
+    atomic_store(&g_gestureEnding, false);
+    hideSystemCursorForGesture();
+    g_pointerX = 0.0;
+    g_pointerY = 0.0;
+    g_selectedIndex = -1;
+    g_cursorAtGestureStart = CGEventGetLocation(event);
+    uint64_t generation = atomic_fetch_add(&g_gestureGeneration, 1) + 1;
+    NSLog(@"[mouse] F18 gesture started");
+    dispatch_async(dispatch_get_main_queue(), ^{ showRing(generation); });
+}
+
 static void updateMouseGesture(CGEventRef event) {
     // Quartz deltas are screen points and positive Y points down. Roughly 80
     // points of travel reaches the cards, matching the short trackpad motion.
@@ -1101,7 +1130,45 @@ static CGEventRef filterScrollDuringRing(CGEventTapProxy proxy, CGEventType type
     int configuredButton = atomic_load(&g_settingMouseButton);
     int eventButton = mouseButtonEvent(type)
         ? (int)CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber) : -1;
-    if (configuredButton >= 2 && type == kCGEventOtherMouseDown &&
+    if (type == kCGEventOtherMouseDown && atomic_exchange(&g_mouseButtonLearning, false)) {
+        persistMouseActivationSetting(eventButton);
+        atomic_store(&g_learnedButtonAwaitingUp, eventButton);
+        NSLog(@"[mouse] learned button %d", eventButton + 1);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[NSNotificationCenter defaultCenter]
+                postNotificationName:kMouseButtonLearnedNotification
+                              object:nil
+                            userInfo:@{@"button": @(eventButton)}];
+        });
+        return NULL;
+    }
+    if (type == kCGEventOtherMouseUp &&
+        eventButton == atomic_load(&g_learnedButtonAwaitingUp)) {
+        atomic_store(&g_learnedButtonAwaitingUp, -1);
+        return NULL;
+    }
+    CGKeyCode keyCode = (type == kCGEventKeyDown || type == kCGEventKeyUp)
+        ? (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) : UINT16_MAX;
+    if (configuredButton == kMouseActivationF18 && type == kCGEventKeyDown &&
+        keyCode == kMouseShortcutKeyCode && !atomic_load(&g_gestureActive)) {
+        beginKeyboardGesture(event);
+        return NULL;
+    }
+    if (atomic_load(&g_keyboardGestureActive)) {
+        if (type == kCGEventMouseMoved || type == kCGEventLeftMouseDragged ||
+            type == kCGEventRightMouseDragged || type == kCGEventOtherMouseDragged) {
+            updateMouseGesture(event);
+        } else if (type == kCGEventKeyUp && keyCode == kMouseShortcutKeyCode) {
+            atomic_store(&g_keyboardGestureActive, false);
+            atomic_store(&g_gestureEnding, true);
+            uint64_t generation = atomic_load(&g_gestureGeneration);
+            NSInteger selection = g_selectedIndex;
+            dispatch_async(dispatch_get_main_queue(), ^{ finishGesture(generation, selection); });
+        }
+        return NULL;
+    }
+    if (configuredButton >= 2 && configuredButton < kMouseActivationF18 &&
+        type == kCGEventOtherMouseDown &&
         eventButton == configuredButton && !atomic_load(&g_gestureActive)) {
         beginMouseGesture(event, configuredButton);
         return NULL;
@@ -1175,7 +1242,9 @@ static void *runScrollEventTap(void *unused) {
                                          CGEventMaskBit(kCGEventRightMouseDragged) |
                                          CGEventMaskBit(kCGEventOtherMouseDown) |
                                          CGEventMaskBit(kCGEventOtherMouseUp) |
-                                         CGEventMaskBit(kCGEventOtherMouseDragged);
+                                         CGEventMaskBit(kCGEventOtherMouseDragged) |
+                                         CGEventMaskBit(kCGEventKeyDown) |
+                                         CGEventMaskBit(kCGEventKeyUp);
         g_scrollEventTap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
                                             kCGEventTapOptionDefault, protectedInputMask,
                                             filterScrollDuringRing, NULL);
@@ -4093,7 +4162,8 @@ static void loadSettings(void) {
     CFIndex mouseButton = CFPreferencesGetAppIntegerValue(CFSTR("MouseActivationButton"), kSettingsID,
                                                           &mouseButtonValid);
     atomic_store(&g_settingMouseButton,
-                 mouseButtonValid && mouseButton >= 2 && mouseButton <= 4 ? (int)mouseButton : -1);
+                 mouseButtonValid && ((mouseButton >= 2 && mouseButton <= 31) || mouseButton == kMouseActivationF18)
+                     ? (int)mouseButton : -1);
     g_selectSound = [[NSSound soundNamed:@"Tink"] copy];
     g_selectSound.volume = 0.3;
     g_activateSound = [[NSSound soundNamed:@"Pop"] copy];
@@ -4202,11 +4272,74 @@ static NSString *lastOutputLine(NSString *output) {
 @property(nonatomic, strong) NSTextField *javaScriptHint;
 @property(nonatomic, strong) NSTextField *blurLabel;
 @property(nonatomic, strong) NSTextField *gestureWarning;
+@property(nonatomic, strong) NSPopUpButton *mouseButtonPopup;
+@property(nonatomic, strong) NSTextField *mouseLearnStatus;
 @property(nonatomic, strong) NSButton *updateButton;
 @property(nonatomic, strong) NSTextField *updateStatus;
 @end
 
 @implementation SettingsMenu
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        [NSNotificationCenter.defaultCenter addObserver:self
+                                               selector:@selector(mouseButtonLearned:)
+                                                   name:kMouseButtonLearnedNotification
+                                                 object:nil];
+    }
+    return self;
+}
+
+- (void)dealloc {
+    [NSNotificationCenter.defaultCenter removeObserver:self];
+}
+
+- (NSString *)mouseActivationTitle:(int)value {
+    switch (value) {
+        case -1: return @"Isključeno";
+        case 2: return @"Srednji klik / Logi bočno";
+        case 3: return @"Direktno dugme 4";
+        case 4: return @"Direktno dugme 5";
+        case kMouseActivationF18: return @"F18 / Logi prečica";
+        default: return value >= 2
+            ? [NSString stringWithFormat:@"Snimljeno dugme %d", value + 1]
+            : @"Isključeno";
+    }
+}
+
+- (void)refreshMouseButtonPopup {
+    if (!self.mouseButtonPopup) return;
+    [self.mouseButtonPopup removeAllItems];
+    int values[] = {-1, 2, 3, 4, kMouseActivationF18};
+    int current = atomic_load(&g_settingMouseButton);
+    for (NSUInteger i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+        int value = values[i];
+        [self.mouseButtonPopup addItemWithTitle:[self mouseActivationTitle:value]];
+        self.mouseButtonPopup.lastItem.tag = value;
+    }
+    BOOL known = current == -1 || current == 2 || current == 3 || current == 4 || current == kMouseActivationF18;
+    if (!known && current >= 2) {
+        [self.mouseButtonPopup addItemWithTitle:[self mouseActivationTitle:current]];
+        self.mouseButtonPopup.lastItem.tag = current;
+    }
+    for (NSMenuItem *item in self.mouseButtonPopup.itemArray) {
+        if (item.tag == current) {
+            [self.mouseButtonPopup selectItem:item];
+            break;
+        }
+    }
+}
+
+- (void)mouseButtonLearned:(NSNotification *)notification {
+    int button = [notification.userInfo[@"button"] intValue];
+    [self refreshMouseButtonPopup];
+    self.mouseLearnStatus.stringValue = [NSString stringWithFormat:@"Snimljeno: %@.",
+                                         [self mouseActivationTitle:button]];
+    self.mouseLearnStatus.textColor = NSColor.systemGreenColor;
+    self.mouseLearnStatus.hidden = NO;
+    if (self.popover.isShown) self.popover.contentSize = self.popover.contentViewController.view.fittingSize;
+}
+
 - (void)showIcon {
     if (self.statusItem) return;
     self.statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
@@ -4258,20 +4391,19 @@ static NSString *lastOutputLine(NSString *output) {
     pointer.selectedSegment = atomic_load(&g_settingPointerStyle);
 
     NSTextField *mouseLabel = [self noteWithText:@"Aktivacija mišem"];
-    NSPopUpButton *mouseButton = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
-    NSArray<NSString *> *mouseButtonTitles = @[@"Isključeno", @"Srednji klik / Logi bočno",
-                                                @"Direktno dugme 4", @"Direktno dugme 5"];
-    NSInteger mouseButtonTags[] = {-1, 2, 3, 4};
-    for (NSUInteger i = 0; i < mouseButtonTitles.count; i++) {
-        [mouseButton addItemWithTitle:mouseButtonTitles[i]];
-        mouseButton.lastItem.tag = mouseButtonTags[i];
-        if (mouseButtonTags[i] == atomic_load(&g_settingMouseButton)) [mouseButton selectItem:mouseButton.lastItem];
-    }
-    mouseButton.controlSize = NSControlSizeSmall;
-    mouseButton.target = self;
-    mouseButton.action = @selector(mouseButtonChanged:);
+    self.mouseButtonPopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    self.mouseButtonPopup.controlSize = NSControlSizeSmall;
+    self.mouseButtonPopup.target = self;
+    self.mouseButtonPopup.action = @selector(mouseButtonChanged:);
+    [self refreshMouseButtonPopup];
+    NSButton *learnMouseButton = [NSButton buttonWithTitle:@"Snimi sledeće dugme"
+                                                   target:self
+                                                   action:@selector(learnMouseButton:)];
+    learnMouseButton.controlSize = NSControlSizeSmall;
+    self.mouseLearnStatus = [self noteWithText:@""];
+    self.mouseLearnStatus.hidden = YES;
     NSTextField *mouseNote = [self noteWithText:
-        @"Na MX Master 3S je Forward bočno dugme u Logi Options+ mapirano na Middle button, zato ovde ostavi „Srednji klik / Logi bočno“. Drži dugme, pomeri miš ka kartici i pusti ga. Direktno dugme 4/5 služi za miševe bez takvog mapiranja."];
+        @"Klikni „Snimi sledeće dugme“, pa pritisni željeno dugme miša. Za MX Master 3S ga u Logi Options+ prvo mapiraj na Middle button. Alternativa je F18 / Logi prečica. Zatim drži dugme, pomeri miš ka kartici i pusti ga."];
 
     NSTextField *mediaLabel = [self noteWithText:@"Video u Chrome-u"];
     NSMutableArray<NSView *> *mediaRows = [NSMutableArray array];
@@ -4325,7 +4457,8 @@ static NSString *lastOutputLine(NSString *output) {
     buttons.spacing = 8;
 
     NSMutableArray<NSView *> *rows = [@[title, self.gestureWarning, titlesLabel, titles, pointerLabel, pointer,
-                                         mouseLabel, mouseButton, mouseNote, mediaLabel] mutableCopy];
+                                         mouseLabel, self.mouseButtonPopup, learnMouseButton,
+                                         self.mouseLearnStatus, mouseNote, mediaLabel] mutableCopy];
     [rows addObjectsFromArray:mediaRows];
     [rows addObjectsFromArray:@[mediaNote, self.javaScriptHint, finderTabs, sounds, self.blurLabel, blur, separator,
                                 hideIcon, hideNote, buttons, self.updateStatus]];
@@ -4337,7 +4470,9 @@ static NSString *lastOutputLine(NSString *output) {
     [stack setCustomSpacing:4 afterView:titlesLabel];
     [stack setCustomSpacing:4 afterView:pointerLabel];
     [stack setCustomSpacing:4 afterView:mouseLabel];
-    [stack setCustomSpacing:4 afterView:mouseButton];
+    [stack setCustomSpacing:4 afterView:self.mouseButtonPopup];
+    [stack setCustomSpacing:4 afterView:learnMouseButton];
+    [stack setCustomSpacing:4 afterView:self.mouseLearnStatus];
     [stack setCustomSpacing:4 afterView:mediaLabel];
     for (NSView *row in mediaRows) [stack setCustomSpacing:4 afterView:row];
     [stack setCustomSpacing:4 afterView:mediaNote];
@@ -4433,10 +4568,17 @@ static NSString *lastOutputLine(NSString *output) {
 
 - (void)mouseButtonChanged:(NSPopUpButton *)button {
     int mouseButton = (int)button.selectedItem.tag;
-    atomic_store(&g_settingMouseButton, mouseButton);
-    CFNumberRef value = CFNumberCreate(NULL, kCFNumberIntType, &mouseButton);
-    storeSetting(CFSTR("MouseActivationButton"), value);
-    CFRelease(value);
+    persistMouseActivationSetting(mouseButton);
+    self.mouseLearnStatus.hidden = YES;
+}
+
+- (void)learnMouseButton:(NSButton *)button {
+    (void)button;
+    atomic_store(&g_mouseButtonLearning, true);
+    self.mouseLearnStatus.stringValue = @"Čekam dugme… pritisni željeno bočno ili srednje dugme miša.";
+    self.mouseLearnStatus.textColor = NSColor.systemOrangeColor;
+    self.mouseLearnStatus.hidden = NO;
+    self.popover.contentSize = self.popover.contentViewController.view.fittingSize;
 }
 
 - (void)mediaOptionChanged:(NSButton *)button {

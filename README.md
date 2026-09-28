@@ -218,10 +218,16 @@ zahteva Accessibility dozvolu; posle uključivanja dozvole ponovo pokreni
 Touchpad Switcher. Sistemski kursor ostaje zaključan na mestu pritiska dok
 pomeranje miša upravlja pokazivačem kružnog menija.
 
+Najlakše podešavanje je **Snimi sledeće dugme**: klikni ga, zatim pritisni
+željeno srednje ili bočno dugme, pa aplikacija pamti stvarni broj koji macOS
+šalje. Ručni izbor i **F18 / Logi prečica** ostaju dostupni kao alternativa.
+
 Ako softver miša presreće bočnu dugmad (na primer Logi Options+), mapiraj željeno
 bočno dugme na **Middle button**, a u panelu Touchpad Switcher-a izaberi
 **Srednji klik / Logi bočno**. Stavke **Direktno dugme 4/5** namenjene su
-miševima koji šalju ta dugmad bez dodatnog softverskog mapiranja.
+miševima koji šalju ta dugmad bez dodatnog softverskog mapiranja. Ako se u
+Logi Options+ koristi Keyboard shortcut F18, u panelu izaberi **F18 / Logi
+prečica**.
 
 ### Sličice
 
