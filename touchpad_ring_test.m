@@ -7,6 +7,7 @@
 #import <ImageIO/ImageIO.h>
 #import <QuartzCore/QuartzCore.h>
 #import "ring_media.h"
+#import "ring_favicons.h"
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #include <math.h>
 #include <float.h>
@@ -99,7 +100,9 @@ static NSString *chromeDisplayTitle(RingEntry *entry);
 static NSString *chromeHostFromEntry(RingEntry *entry);
 static NSString *youtubeVideoIDFromURL(NSString *urlString);
 static NSString *cardLabelText(RingEntry *entry);
-static void drawCardLabel(NSString *text, NSRect cardRect, BOOL truncateMiddle);
+static void drawCardLabel(NSString *text, NSRect cardRect, BOOL truncateMiddle, CGFloat leading);
+static CGFloat drawCardBadgeIcon(RingEntry *entry, NSRect cardRect);
+static const CGFloat kCardBadgeIconSize = 40.0;
 static NSImage *resolvedThumbnail(RingEntry *entry);
 static void applyThumbnailDataToEntry(RingEntry *entry, NSData *data);
 static void releaseDecodedThumbnails(void);
@@ -108,6 +111,7 @@ static BOOL ensureChromeAutomation(BOOL askUser);
 static void schedulePendingThumbnailCapture(NSArray<RingEntry *> *entries);
 static void scheduleChromeBackgroundPrefetch(NSArray<RingEntry *> *entries);
 static void refreshThumbnailsNow(pid_t onlyPID, NSTimeInterval minAge);
+static void scanWindowsNow(void);
 static void noteChromeSelectionChanges(NSArray<RingEntry *> *entries);
 
 @interface RingView : NSView
@@ -137,8 +141,9 @@ static void noteChromeSelectionChanges(NSArray<RingEntry *> *entries);
 // units, about half a millimeter of finger travel) the direction counts.
 // Lifting before any motion still selects nothing.
 static const double kPointerDeadZone = 0.05;
-// Radius of the drawn center circle in points; the arrow rides on its edge.
-static const CGFloat kHubRadius = 26.0;
+// Half the size of the center area in points: the selected app's icon lives
+// there, the arrow rides on its edge and the light starts from it.
+static const CGFloat kHubRadius = 56.0;
 // The pointer stays inside the ring of cards; only its direction matters.
 static const double kPointerReach = 0.80;
 
@@ -149,11 +154,15 @@ typedef enum { CardTitlesAll = 0, CardTitlesFinderAndChrome = 1, CardTitlesNone 
 static _Atomic(int) g_settingCardTitles = CardTitlesAll;
 static RingMediaOptions g_mediaOptions;   // main thread; the media module keeps its own copy
 static _Atomic(bool) g_settingFinderTabsOneCard = true;
+typedef enum { CardGroupingWindows = 0, CardGroupingApps = 1 } CardGrouping;
+static _Atomic(int) g_settingCardGrouping = CardGroupingWindows;
 static _Atomic(bool) g_settingHideMenuIcon = false;
 static _Atomic(bool) g_settingSoundEffects = false;
 // Mouse activation by holding the button and releasing it on a card. Off: one
 // click opens the ring and a second click (or a left click) picks the card.
 static _Atomic(bool) g_settingMouseHoldToSelect = true;
+static _Atomic(bool) g_settingShowSiteIcons = true;   // Chrome tabs: the site's icon
+static _Atomic(bool) g_settingShowAppIcons = true;    // other windows: the app's icon
 static _Atomic(int) g_settingBlurRadius = 15;   // 0 turns the blur off
 // -1 disables mouse activation. Values 2...31 are Quartz mouse button numbers
 // (middle is 2, the usual side buttons 3 and 4); kMouseActivationKeyBase plus a
@@ -554,8 +563,10 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
     _selectedIndex = selectedIndex;
     // Cards no longer change when selected, only the hub icon does; the
     // outline and the light are layers.
-    [self setNeedsDisplayInRect:NSMakeRect(self.anchorPoint.x - kHubRadius - 6.0, self.anchorPoint.y - kHubRadius - 6.0,
-                                           (kHubRadius + 6.0) * 2.0, (kHubRadius + 6.0) * 2.0)];
+    // The center icon with its shadow can reach about 1.2 hub radii out.
+    CGFloat iconReach = kHubRadius * 1.2 + 16.0;
+    [self setNeedsDisplayInRect:NSMakeRect(self.anchorPoint.x - iconReach, self.anchorPoint.y - iconReach,
+                                           iconReach * 2.0, iconReach * 2.0)];
     [self updateFocusAnimated:YES];
     if (selectedIndex >= 0 && selectedIndex < (NSInteger)self.entries.count) {
         [self updateGlow];
@@ -663,21 +674,26 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
 
     NSInteger selectedIndex = self.selectedIndex;
 
-    // Center hub with the icon of the selected app, so the choice is readable
-    // where the eye already is.
+    // The icon of the selected app in the center, on its own without a
+    // circle behind it, so the choice is readable where the eye already is.
     CGFloat hubRadius = kHubRadius;
-    NSRect hubRect = NSMakeRect(center.x - hubRadius, center.y - hubRadius, hubRadius * 2.0, hubRadius * 2.0);
-    NSBezierPath *hub = [NSBezierPath bezierPathWithOvalInRect:hubRect];
-    [[NSColor colorWithCalibratedWhite:0.08 alpha:0.85] setFill];
-    [hub fill];
-    hub.lineWidth = 2.0;
-    [(selectedIndex >= 0 ? [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.9]
-                         : [NSColor colorWithCalibratedWhite:1.0 alpha:0.35]) setStroke];
-    [hub stroke];
     if (selectedIndex >= 0 && selectedIndex < (NSInteger)count) {
-        CGFloat iconSize = hubRadius * 1.3;
-        [self.entries[(NSUInteger)selectedIndex].icon drawInRect:NSMakeRect(center.x - iconSize / 2.0, center.y - iconSize / 2.0,
-                                                                            iconSize, iconSize)];
+        // A Chrome tab shows its site's icon here too, when site icons are on.
+        RingEntry *selectedEntry = self.entries[(NSUInteger)selectedIndex];
+        NSImage *siteIcon = [selectedEntry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"] &&
+                            atomic_load(&g_settingShowSiteIcons) ? RingFaviconForURL(selectedEntry.tabURL) : nil;
+        // App icons carry their own margin, site icons do not.
+        CGFloat iconSize = siteIcon ? hubRadius * 1.25 : hubRadius * 1.8;
+        [NSGraphicsContext saveGraphicsState];
+        [NSGraphicsContext currentContext].imageInterpolation = NSImageInterpolationHigh;
+        NSShadow *iconShadow = [NSShadow new];
+        iconShadow.shadowBlurRadius = 12.0;
+        iconShadow.shadowOffset = NSMakeSize(0, -2);
+        iconShadow.shadowColor = [NSColor colorWithCalibratedWhite:0.0 alpha:0.55];
+        [iconShadow set];
+        [(siteIcon ?: selectedEntry.icon) drawInRect:NSMakeRect(center.x - iconSize / 2.0, center.y - iconSize / 2.0,
+                                                                iconSize, iconSize)];
+        [NSGraphicsContext restoreGraphicsState];
     }
 
     CGFloat cardWidth = safeCardWidthForRing(count, radiusX, radiusY, NSWidth(bounds));
@@ -739,8 +755,9 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
             [NSGraphicsContext restoreGraphicsState];
 
             BOOL isFinderEntry = [entry.application.bundleIdentifier isEqualToString:@"com.apple.finder"];
+            CGFloat badgeWidth = drawCardBadgeIcon(entry, previewRect);
             if (shouldDrawCardLabel(entry)) {
-                drawCardLabel(cardLabelText(entry), previewRect, isFinderEntry && entry.folderPath.length > 0);
+                drawCardLabel(cardLabelText(entry), previewRect, isFinderEntry && entry.folderPath.length > 0, badgeWidth);
             }
 
             // 4. Draw clean border around the card
@@ -788,9 +805,10 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
 
             CGFloat inset = MIN(20.0, previewWidth * 0.07);
             CGFloat iconSize = MIN(38.0, cardHeight * 0.25);
-            [entry.icon drawInRect:NSMakeRect(NSMinX(cardRect) + inset,
-                                              NSMaxY(cardRect) - inset - iconSize,
-                                              iconSize, iconSize)];
+            NSImage *siteIcon = atomic_load(&g_settingShowSiteIcons) ? RingFaviconForURL(entry.tabURL) : nil;
+            [(siteIcon ?: entry.icon) drawInRect:NSMakeRect(NSMinX(cardRect) + inset,
+                                                            NSMaxY(cardRect) - inset - iconSize,
+                                                            iconSize, iconSize)];
             NSMutableParagraphStyle *titleStyle = [NSMutableParagraphStyle new];
             titleStyle.lineBreakMode = NSLineBreakByTruncatingTail;
             NSDictionary *titleAttributes = @{
@@ -841,7 +859,7 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
             [entry.icon drawInRect:iconRect];
             BOOL isFinderIcon = [entry.application.bundleIdentifier isEqualToString:@"com.apple.finder"];
             if (shouldDrawCardLabel(entry)) {
-                drawCardLabel(cardLabelText(entry), iconCardRect, isFinderIcon && entry.folderPath.length > 0);
+                drawCardLabel(cardLabelText(entry), iconCardRect, isFinderIcon && entry.folderPath.length > 0, 0);
             }
 
             [NSGraphicsContext saveGraphicsState];
@@ -1637,7 +1655,6 @@ static void raiseWindowForEntry(RingEntry *entry, uint64_t generation) {
                                                     entry.tabIndex + 1);
         if (switched) {
             focusWindowExactly(pid, entry.windowID);
-            RingMediaTabSwitchedByRing();
             return;
         }
         NSLog(@"[Chrome tabs] could not activate window %@ tab %@ index %lu",
@@ -1823,6 +1840,8 @@ static void finishGesture(uint64_t generation, NSInteger selection) {
     showSystemCursorAfterGesture();
     restoreCursorAfterGesture();
     releaseDecodedThumbnails();
+    // Changes that happened while the ring was open were not applied.
+    scanWindowsNow();
     if (selection < 0 || selection >= (NSInteger)g_windowEntries.count) {
         return;
     }
@@ -1832,6 +1851,11 @@ static void finishGesture(uint64_t generation, NSInteger selection) {
         return;
     }
     playRingSound(g_activateSound);
+    // Tell the media rules right away, before Chrome even switches, so the
+    // video starts without waiting for a tab check.
+    if (entry.isTab && entry.chromeWindowID.length) {
+        RingMediaTabSwitchedByRing(entry.chromeWindowID, entry.chromeTabID);
+    }
     // Activate first, from the main thread, as before: a background app may
     // not bring another app forward otherwise. raiseWindowForEntry then puts
     // the exact window in front, in its own Space if needed.
@@ -1891,6 +1915,10 @@ static NSString *cardLabelText(RingEntry *entry) {
     if ([entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"]) {
         return chromeDisplayTitle(entry);
     }
+    // With one card per app, the app name says it all.
+    if (atomic_load(&g_settingCardGrouping) == CardGroupingApps) {
+        return entry.application.localizedName ?: @"Aplikacija";
+    }
     if (entry.folderPath.length) return entry.folderPath;
     NSString *title = entry.tabTitle.length ? entry.tabTitle : (entry.windowTitle ?: @"");
     title = visibleTabTitle(title);
@@ -1905,8 +1933,35 @@ static NSString *cardLabelText(RingEntry *entry) {
     return appName.length ? appName : @"Window";
 }
 
-static void drawCardLabel(NSString *text, NSRect cardRect, BOOL truncateMiddle) {
+// The icon in a picture card's lower left corner: the site's icon for a
+// Chrome tab (Chrome's own when the site has none), the app icon for other
+// windows. Returns the width it takes, so the title starts after it.
+static CGFloat drawCardBadgeIcon(RingEntry *entry, NSRect cardRect) {
+    NSImage *icon = nil;
+    if ([entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"] && atomic_load(&g_settingShowSiteIcons)) {
+        icon = RingFaviconForURL(entry.tabURL) ?: entry.icon;
+    } else if (atomic_load(&g_settingShowAppIcons)) {
+        icon = entry.icon;
+    }
+    if (!icon) return 0;
+    // No backing plate; a soft shadow keeps it readable on light pictures.
+    NSRect iconRect = NSMakeRect(NSMinX(cardRect) + 8.0, NSMinY(cardRect) + 6.0, kCardBadgeIconSize, kCardBadgeIconSize);
+    [NSGraphicsContext saveGraphicsState];
+    NSShadow *shadow = [NSShadow new];
+    shadow.shadowBlurRadius = 6.0;
+    shadow.shadowOffset = NSMakeSize(0, -1);
+    shadow.shadowColor = [NSColor colorWithCalibratedWhite:0.0 alpha:0.55];
+    [shadow set];
+    [icon drawInRect:iconRect fromRect:NSZeroRect
+           operation:NSCompositingOperationSourceOver fraction:1.0 respectFlipped:YES hints:nil];
+    [NSGraphicsContext restoreGraphicsState];
+    return kCardBadgeIconSize + 6.0;
+}
+
+static void drawCardLabel(NSString *text, NSRect cardRect, BOOL truncateMiddle, CGFloat leading) {
     if (!text.length) return;
+    cardRect.origin.x += leading;
+    cardRect.size.width -= leading;
     NSDictionary *measure = @{
         NSFontAttributeName: [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium],
         NSForegroundColorAttributeName: [NSColor colorWithCalibratedWhite:0.95 alpha:1.0]
@@ -1915,7 +1970,9 @@ static void drawCardLabel(NSString *text, NSRect cardRect, BOOL truncateMiddle) 
     CGFloat maxBadgeW = MAX(24.0, NSWidth(cardRect) - 16.0);
     CGFloat badgeW = MIN(maxBadgeW, textSize.width + 16.0);
     CGFloat badgeH = 22.0;
-    NSRect badgeRect = NSMakeRect(NSMinX(cardRect) + 8.0, NSMinY(cardRect) + 8.0, badgeW, badgeH);
+    // Next to an icon the title sits on the icon's middle line.
+    CGFloat badgeY = leading > 0 ? NSMinY(cardRect) + 6.0 + (kCardBadgeIconSize - badgeH) / 2.0 : NSMinY(cardRect) + 8.0;
+    NSRect badgeRect = NSMakeRect(NSMinX(cardRect) + 8.0, badgeY, badgeW, badgeH);
     NSBezierPath *pill = [NSBezierPath bezierPathWithRoundedRect:badgeRect xRadius:5.0 yRadius:5.0];
     [[NSColor colorWithCalibratedWhite:0.06 alpha:0.78] setFill];
     [pill fill];
@@ -2297,8 +2354,48 @@ static void populateThumbnailsFromCache(NSArray<RingEntry *> *entries) {
     }
 }
 
+// "windowID:tabID" of every open Chrome tab, or nil when that cannot be known
+// right now (Chrome not running, no Automation access, script error).
+static NSSet<NSString *> *liveChromeTabs(void) {
+    BOOL chromeRunning = [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.google.Chrome"].count > 0;
+    if (!chromeRunning || !ensureChromeAutomation(NO)) return nil;
+    static NSAppleScript *s_script;
+    if (!s_script) {
+        s_script = [[NSAppleScript alloc] initWithSource:
+            @"set output to \"\"\n"
+             "tell application \"Google Chrome\"\n"
+             "repeat with chromeWindow in windows\n"
+             "set windowID to (id of chromeWindow) as text\n"
+             "set tabIDs to id of every tab of chromeWindow\n"
+             "repeat with tabIndex from 1 to count of tabIDs\n"
+             "set output to output & windowID & \":\" & ((item tabIndex of tabIDs) as text) & linefeed\n"
+             "end repeat\n"
+             "end repeat\n"
+             "end tell\n"
+             "return output"];
+        [s_script compileAndReturnError:nil];
+    }
+    NSDictionary *error = nil;
+    NSAppleEventDescriptor *result = nil;
+    @synchronized ([NSAppleScript class]) {
+        result = [s_script executeAndReturnError:&error];
+    }
+    if (error || !result.stringValue.length) return nil;
+    NSMutableSet<NSString *> *tabs = [NSMutableSet set];
+    for (NSString *line in [result.stringValue componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+        if (line.length) [tabs addObject:line];
+    }
+    return tabs;
+}
+
 static void pruneDeadWindowEntriesLive(void) {
     if (!g_windowEntries || !g_windowEntries.count) return;
+    // A tab closed in Chrome keeps its window, so the CG check below misses it.
+    BOOL hasChromeTabs = NO;
+    for (RingEntry *entry in g_windowEntries) {
+        if (entry.chromeTabID.length) { hasChromeTabs = YES; break; }
+    }
+    NSSet<NSString *> *openChromeTabs = hasChromeTabs ? liveChromeTabs() : nil;
 
     CFArrayRef allWindows = CGWindowListCopyWindowInfo(kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
     BOOL canCheckWindowIDs = (allWindows != NULL);
@@ -2343,6 +2440,13 @@ static void pruneDeadWindowEntriesLive(void) {
             changed = YES;
             [deadWindowIDs addObject:@(entry.windowID)];
             if (entry.isTab) [deadTabKeys addObject:tabThumbnailKey(entry)];
+            continue;
+        }
+
+        if (openChromeTabs && entry.chromeTabID.length && entry.chromeWindowID.length &&
+            ![openChromeTabs containsObject:[NSString stringWithFormat:@"%@:%@", entry.chromeWindowID, entry.chromeTabID]]) {
+            changed = YES;
+            [deadTabKeys addObject:tabThumbnailKey(entry)];
             continue;
         }
 
@@ -3160,6 +3264,41 @@ static NSArray<RingEntry *> *collectOpenWindows(void) {
             [mergedFinderEntries addObject:entry];
         }
         entries = mergedFinderEntries;
+    }
+    // "Only apps": one card per app, showing the window used last. Chrome
+    // keeps a card per window, because separate windows are usually separate
+    // profiles.
+    if (atomic_load(&g_settingCardGrouping) == CardGroupingApps) {
+        NSMutableDictionary<NSNumber *, NSNumber *> *stackOrder = [NSMutableDictionary dictionary];
+        [windowInfos enumerateObjectsUsingBlock:^(NSDictionary *info, NSUInteger index, BOOL *stop) {
+            (void)stop;
+            if (info[(id)kCGWindowNumber]) stackOrder[info[(id)kCGWindowNumber]] = @(index);   // front to back
+        }];
+        NSMutableDictionary<NSString *, RingEntry *> *cardByGroup = [NSMutableDictionary dictionary];
+        NSMutableArray<NSString *> *groups = [NSMutableArray array];
+        for (RingEntry *entry in entries) {
+            BOOL isChrome = [entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"];
+            NSString *group = isChrome
+                ? [NSString stringWithFormat:@"%d:%u", entry.application.processIdentifier, entry.windowID]
+                : [NSString stringWithFormat:@"%d", entry.application.processIdentifier];
+            RingEntry *current = cardByGroup[group];
+            if (!current) {
+                [groups addObject:group];
+                cardByGroup[group] = entry;
+                continue;
+            }
+            // The tab on screen beats hidden tabs; then the window in front wins.
+            BOOL entryShown = !entry.isTab || entry.isSelectedTab;
+            BOOL currentShown = !current.isTab || current.isSelectedTab;
+            NSInteger entryDepth = stackOrder[@(entry.windowID)] ? stackOrder[@(entry.windowID)].integerValue : NSIntegerMax;
+            NSInteger currentDepth = stackOrder[@(current.windowID)] ? stackOrder[@(current.windowID)].integerValue : NSIntegerMax;
+            if ((entryShown && !currentShown) || (entryShown == currentShown && entryDepth < currentDepth)) {
+                cardByGroup[group] = entry;
+            }
+        }
+        NSMutableArray<RingEntry *> *appCards = [NSMutableArray arrayWithCapacity:groups.count];
+        for (NSString *group in groups) [appCards addObject:cardByGroup[group]];
+        entries = appCards;
     }
     [entries sortUsingComparator:^NSComparisonResult(RingEntry *a, RingEntry *b) {
         NSComparisonResult appOrder = [a.application.localizedName localizedCaseInsensitiveCompare:b.application.localizedName];
@@ -4244,6 +4383,22 @@ static void startMultitouchDevices(void) {
     refreshThumbnailsNow(app.processIdentifier, 1.0);
 }
 
+- (void)applicationTerminated:(NSNotification *)notification {
+    NSRunningApplication *app = notification.userInfo[NSWorkspaceApplicationKey];
+    if (!app || atomic_load(&g_gestureActive)) return;
+    pid_t pid = app.processIdentifier;
+    NSIndexSet *remaining = [g_windowEntries indexesOfObjectsPassingTest:^BOOL(RingEntry *entry, NSUInteger index, BOOL *stop) {
+        (void)index; (void)stop;
+        return entry.application.processIdentifier != pid;
+    }];
+    if (remaining.count != g_windowEntries.count) {
+        g_windowEntries = [g_windowEntries objectsAtIndexes:remaining];
+        atomic_store(&g_windowEntryCount, (int)g_windowEntries.count);
+        if (g_ringView) g_ringView.entries = g_windowEntries;
+    }
+    scanWindowsNow();
+}
+
 - (void)appearanceChanged:(NSNotification *)notification {
     (void)notification;
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -4272,6 +4427,65 @@ static void startMultitouchDevices(void) {
 
 static TouchpadWakeObserver *g_wakeObserver;
 
+// Full window scan (AX, AppleScript, CG) on the scan queue. Runs every two
+// seconds and at once when something changes. Never during a gesture: the
+// ring keeps the list it opened with.
+static void scanWindowsNow(void) {
+    dispatch_async(g_windowScanQueue, ^{
+        if (atomic_load(&g_gestureActive)) return;
+        if (atomic_exchange(&g_isScanning, true)) return;
+        @autoreleasepool {
+            NSArray<RingEntry *> *entries = collectOpenWindows();
+            pruneThumbnailCaches(entries);
+            populateThumbnailsFromCache(entries);
+            noteChromeSelectionChanges(entries);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (!atomic_load(&g_gestureActive)) {
+                    g_windowEntries = entries;
+                    atomic_store(&g_windowEntryCount, (int)entries.count);
+                    if (g_ringView) g_ringView.entries = entries;
+                    if (atomic_load(&g_settingShowSiteIcons)) {
+                        for (RingEntry *entry in entries) if (entry.tabURL.length) (void)RingFaviconForURL(entry.tabURL);
+                    }
+                    if (g_thumbnailPreviewsEnabled) schedulePendingThumbnailCapture(entries);
+                    if (g_thumbnailPreviewsEnabled) scheduleChromeBackgroundPrefetch(entries);
+                }
+                atomic_store(&g_isScanning, false);
+            });
+        }
+    });
+}
+
+// A closed window or app should leave the ring at once, not after the next
+// two-second scan. The visible windows and their titles are cheap to read, so
+// they are compared a few times a second; closing a Chrome tab changes its
+// window's title. Any change starts a full scan.
+static dispatch_source_t g_windowChangeTimer;
+static void startWindowChangeWatch(void) {
+    static NSString *s_lastSignature;
+    dispatch_queue_t queue = dispatch_queue_create("touchpad.ring.window-watch", DISPATCH_QUEUE_SERIAL);
+    g_windowChangeTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+    dispatch_source_set_timer(g_windowChangeTimer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(NSEC_PER_SEC / 3)),
+                              NSEC_PER_SEC / 3, 50 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(g_windowChangeTimer, ^{
+        if (atomic_load(&g_gestureActive)) return;
+        @autoreleasepool {
+            CFArrayRef windows = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+                                                            kCGNullWindowID);
+            if (!windows) return;
+            NSMutableString *signature = [NSMutableString string];
+            for (NSDictionary *info in (__bridge NSArray *)windows) {
+                if ([info[(id)kCGWindowLayer] intValue] != 0) continue;
+                [signature appendFormat:@"%@|%@\n", info[(id)kCGWindowNumber], info[(id)kCGWindowName] ?: @""];
+            }
+            CFRelease(windows);
+            if (s_lastSignature && ![signature isEqualToString:s_lastSignature]) scanWindowsNow();
+            s_lastSignature = signature;
+        }
+    });
+    dispatch_resume(g_windowChangeTimer);
+}
+
 static BOOL settingBool(CFStringRef key, BOOL fallback) {
     Boolean valid = false;
     Boolean value = CFPreferencesGetAppBooleanValue(key, kSettingsID, &valid);
@@ -4297,8 +4511,13 @@ static void loadSettings(void) {
     g_mediaOptions.onlyWhenNextTabHasVideo = settingBool(CFSTR("MediaOnlyWhenNextTabHasVideo"), NO);
     g_mediaOptions.rewindAfterLongPause = settingBool(CFSTR("MediaRewindAfterLongPause"), YES);
     atomic_store(&g_settingFinderTabsOneCard, settingBool(CFSTR("FinderTabsAsOneCard"), YES));
+    Boolean groupingValid = false;
+    CFIndex grouping = CFPreferencesGetAppIntegerValue(CFSTR("CardGrouping"), kSettingsID, &groupingValid);
+    atomic_store(&g_settingCardGrouping, groupingValid && grouping == CardGroupingApps ? CardGroupingApps : CardGroupingWindows);
     atomic_store(&g_settingSoundEffects, settingBool(CFSTR("SoundEffects"), NO));
     atomic_store(&g_settingMouseHoldToSelect, settingBool(CFSTR("MouseHoldToSelect"), YES));
+    atomic_store(&g_settingShowSiteIcons, settingBool(CFSTR("ShowSiteIcons"), YES));
+    atomic_store(&g_settingShowAppIcons, settingBool(CFSTR("ShowAppIcons"), YES));
     Boolean pointerValid = false;
     CFIndex pointerStyle = CFPreferencesGetAppIntegerValue(CFSTR("PointerStyle"), kSettingsID, &pointerValid);
     atomic_store(&g_settingPointerStyle, pointerValid && pointerStyle >= PointerStyleArrow && pointerStyle <= PointerStyleHidden
@@ -4542,6 +4761,15 @@ static NSString *lastOutputLine(NSString *output) {
          "a pokrete za Mission Control i ekrane prebaci na četiri prsta u System Settings > Trackpad > More Gestures."];
     self.gestureWarning.textColor = NSColor.systemOrangeColor;
 
+    NSTextField *groupingLabel = [self noteWithText:@"Kartice"];
+    NSSegmentedControl *grouping = [NSSegmentedControl segmentedControlWithLabels:@[@"Prozori i tabovi", @"Samo aplikacije"]
+                                                                     trackingMode:NSSegmentSwitchTrackingSelectOne
+                                                                           target:self
+                                                                           action:@selector(cardGroupingChanged:)];
+    grouping.controlSize = NSControlSizeSmall;
+    grouping.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+    grouping.selectedSegment = atomic_load(&g_settingCardGrouping);
+
     NSTextField *titlesLabel = [self noteWithText:@"Naslovi na karticama"];
     NSSegmentedControl *titles = [NSSegmentedControl segmentedControlWithLabels:@[@"Svi prozori", @"Finder i Chrome", @"Bez naslova"]
                                                                    trackingMode:NSSegmentSwitchTrackingSelectOne
@@ -4550,6 +4778,13 @@ static NSString *lastOutputLine(NSString *output) {
     titles.controlSize = NSControlSizeSmall;
     titles.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
     titles.selectedSegment = atomic_load(&g_settingCardTitles);
+
+    NSButton *siteIcons = [NSButton checkboxWithTitle:@"Ikonice sajtova na Chrome karticama"
+                                               target:self action:@selector(siteIconsChanged:)];
+    siteIcons.state = atomic_load(&g_settingShowSiteIcons) ? NSControlStateValueOn : NSControlStateValueOff;
+    NSButton *appIcons = [NSButton checkboxWithTitle:@"Ikonice aplikacija na karticama"
+                                              target:self action:@selector(appIconsChanged:)];
+    appIcons.state = atomic_load(&g_settingShowAppIcons) ? NSControlStateValueOn : NSControlStateValueOff;
 
     NSTextField *pointerLabel = [self noteWithText:@"Pokazivač"];
     NSSegmentedControl *pointer = [NSSegmentedControl segmentedControlWithLabels:@[@"Strelica", @"Krug", @"Nevidljiv"]
@@ -4635,7 +4870,8 @@ static NSString *lastOutputLine(NSString *output) {
     buttons.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     buttons.spacing = 8;
 
-    NSMutableArray<NSView *> *rows = [@[title, self.gestureWarning, titlesLabel, titles, pointerLabel, pointer,
+    NSMutableArray<NSView *> *rows = [@[title, self.gestureWarning, groupingLabel, grouping, titlesLabel, titles,
+                                         siteIcons, appIcons, pointerLabel, pointer,
                                          mouseLabel, self.mouseActivationLabel, mouseButtons, holdToSelect,
                                          self.mouseLearnStatus, mouseNote, mediaLabel] mutableCopy];
     [rows addObjectsFromArray:mediaRows];
@@ -4647,6 +4883,7 @@ static NSString *lastOutputLine(NSString *output) {
     stack.spacing = 10;
     stack.edgeInsets = NSEdgeInsetsMake(14, 14, 14, 14);
     [stack setCustomSpacing:4 afterView:titlesLabel];
+    [stack setCustomSpacing:4 afterView:groupingLabel];
     [stack setCustomSpacing:4 afterView:pointerLabel];
     [stack setCustomSpacing:4 afterView:mouseLabel];
     [stack setCustomSpacing:4 afterView:self.mouseActivationLabel];
@@ -4791,6 +5028,27 @@ static NSString *lastOutputLine(NSString *output) {
     CFRelease(value);
 }
 
+- (void)siteIconsChanged:(NSButton *)button {
+    BOOL on = button.state == NSControlStateValueOn;
+    atomic_store(&g_settingShowSiteIcons, on);
+    storeSetting(CFSTR("ShowSiteIcons"), on ? kCFBooleanTrue : kCFBooleanFalse);
+}
+
+- (void)appIconsChanged:(NSButton *)button {
+    BOOL on = button.state == NSControlStateValueOn;
+    atomic_store(&g_settingShowAppIcons, on);
+    storeSetting(CFSTR("ShowAppIcons"), on ? kCFBooleanTrue : kCFBooleanFalse);
+}
+
+- (void)cardGroupingChanged:(NSSegmentedControl *)control {
+    int grouping = control.selectedSegment == CardGroupingApps ? CardGroupingApps : CardGroupingWindows;
+    atomic_store(&g_settingCardGrouping, grouping);
+    CFNumberRef value = CFNumberCreate(NULL, kCFNumberIntType, &grouping);
+    storeSetting(CFSTR("CardGrouping"), value);
+    CFRelease(value);
+    scanWindowsNow();   // the next ring already shows the new cards
+}
+
 - (void)pointerStyleChanged:(NSSegmentedControl *)control {
     int style = (int)MIN(MAX(control.selectedSegment, PointerStyleArrow), PointerStyleHidden);
     atomic_store(&g_settingPointerStyle, style);
@@ -4909,6 +5167,9 @@ int main(int argc, const char *argv[]) {
         g_settingsMenu = [SettingsMenu new];
         if (!atomic_load(&g_settingHideMenuIcon)) [g_settingsMenu showIcon];
         RingMediaStart(g_mediaOptions);
+        RingFaviconsSetLoadedHandler(^{
+            if (g_ringView && atomic_load(&g_ringOverlayVisible)) [g_ringView setNeedsDisplay:YES];
+        });
         signal(SIGINT, handleSignal);
         signal(SIGTERM, handleSignal);
         BOOL accessibilityTrusted = AXIsProcessTrusted();
@@ -4986,6 +5247,10 @@ int main(int argc, const char *argv[]) {
                                 name:NSWorkspaceScreensDidWakeNotification
                               object:nil];
         [workspaceCenter addObserver:g_wakeObserver
+                            selector:@selector(applicationTerminated:)
+                                name:NSWorkspaceDidTerminateApplicationNotification
+                              object:nil];
+        [workspaceCenter addObserver:g_wakeObserver
                             selector:@selector(applicationDeactivated:)
                                 name:NSWorkspaceDidDeactivateApplicationNotification
                               object:nil];
@@ -4999,35 +5264,8 @@ int main(int argc, const char *argv[]) {
                                   dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                                   (uint64_t)(2.0 * NSEC_PER_SEC),
                                   (uint64_t)(100 * NSEC_PER_MSEC));
-        dispatch_source_set_event_handler(g_scanTimer, ^{
-            // Skip this tick if the user is gesturing or a previous scan has
-            // not completed; never start a full AX/AppleScript pass mid-gesture.
-            if (atomic_load(&g_gestureActive)) return;
-            if (atomic_load(&g_isScanning)) return;
-            atomic_store(&g_isScanning, true);
-            if (atomic_load(&g_gestureActive)) {
-                atomic_store(&g_isScanning, false);
-                return;
-            }
-            @autoreleasepool {
-                NSArray<RingEntry *> *entries = collectOpenWindows();
-                pruneThumbnailCaches(entries);
-                populateThumbnailsFromCache(entries);
-                noteChromeSelectionChanges(entries);
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    if (!atomic_load(&g_gestureActive)) {
-                        g_windowEntries = entries;
-                        atomic_store(&g_windowEntryCount, (int)entries.count);
-                        if (g_ringView) {
-                            g_ringView.entries = entries;
-                        }
-                        if (g_thumbnailPreviewsEnabled) schedulePendingThumbnailCapture(entries);
-                        if (g_thumbnailPreviewsEnabled) scheduleChromeBackgroundPrefetch(entries);
-                    }
-                    atomic_store(&g_isScanning, false);
-                });
-            }
-        });
+        dispatch_source_set_event_handler(g_scanTimer, ^{ scanWindowsNow(); });
+        startWindowChangeWatch();
         dispatch_resume(g_scanTimer);
         [NSApp run];
     }

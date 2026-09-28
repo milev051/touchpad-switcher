@@ -17,7 +17,7 @@ typedef struct {
 // Call once from the main thread after the app has launched.
 void RingMediaStart(RingMediaOptions options);
 void RingMediaSetOptions(RingMediaOptions options);
-// The ring just switched Chrome's tab or window.
-void RingMediaTabSwitchedByRing(void);
+// The ring just put this Chrome tab on screen (ids as Chrome reports them).
+void RingMediaTabSwitchedByRing(NSString *windowID, NSString *tabID);
 // Chrome refused JavaScript from Apple Events (menu shows how to allow it).
 BOOL RingMediaJavaScriptBlocked(void);

@@ -17,7 +17,10 @@
 #include <stdatomic.h>
 
 static NSString *const kChromeBundleID = @"com.google.Chrome";
-static const NSTimeInterval kPollInterval = 0.35;
+// The tab on screen is checked every 0.2 s (about 50 ms per check). Whether
+// it plays is a slower JavaScript check, done every fifth time.
+static const NSTimeInterval kPollInterval = 0.2;
+static const int kPlayingCheckEvery = 5;
 // A tab change seen this soon after the ring switched counts as the ring's.
 static const NSTimeInterval kRingSwitchWindow = 1.5;
 
@@ -84,6 +87,23 @@ static NSString *runCompiledScript(NSAppleScript *script) {
 
 static NSString *runAppleScript(NSString *source) {
     return runCompiledScript([[NSAppleScript alloc] initWithSource:source]);
+}
+
+// "windowID:tabID" of the tab on screen in Chrome's front window. Only ids,
+// no JavaScript, so it is quick enough to run several times a second.
+static NSString *chromeFrontTabQuick(void) {
+    if (!chromeAutomationAllowed()) return nil;
+    static NSAppleScript *s_script;
+    if (!s_script) {
+        s_script = [[NSAppleScript alloc] initWithSource:
+            @"tell application \"Google Chrome\"\n"
+             "if (count of windows) is 0 then return \"\"\n"
+             "return ((id of window 1) as text) & \":\" & ((id of active tab of window 1) as text)\n"
+             "end tell"];
+        [s_script compileAndReturnError:nil];
+    }
+    NSString *result = runCompiledScript(s_script);
+    return result.length ? result : nil;
 }
 
 static NSString *isPlayingJavaScript(void) {
@@ -190,15 +210,19 @@ static void chromeLeft(void) {
 }
 
 static void chromeEntered(void) {
-    NSString *tab = chromeFrontTab(NULL);
+    // The ring already handled the tab it opened.
+    if (NSProcessInfo.processInfo.systemUptime < g_ringSwitchUntil) return;
+    NSString *tab = chromeFrontTabQuick();
     if (tab && g_options.resumeWhenReturning && !g_options.onlyWhenNextTabHasVideo) returnToTab(tab);
     if (tab) g_lastTab = tab;
 }
 
 static void pollFrontTab(void) {
     if (!g_chromeInFront || !anyMediaRuleOn()) return;
+    static int s_pollCount;
+    BOOL checkPlaying = ++s_pollCount % kPlayingCheckEvery == 0;
     BOOL playing = NO;
-    NSString *tab = chromeFrontTab(&playing);
+    NSString *tab = checkPlaying ? chromeFrontTab(&playing) : chromeFrontTabQuick();
     if (!tab) return;
     if (g_lastTab && ![tab isEqualToString:g_lastTab]) {
         BOOL byRing = NSProcessInfo.processInfo.systemUptime < g_ringSwitchUntil;
@@ -230,9 +254,9 @@ void RingMediaStart(RingMediaOptions options) {
             if (wasChrome && !isChrome) chromeLeft();
         });
         if (isChrome) {
-            // The ring switches the tab right after activating Chrome; act on
-            // the tab that ends up on screen.
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC), g_queue, ^{
+            // Cmd-Tab or a click: resume the tab on screen. A short wait lets a
+            // ring selection report its tab first, so that one is not handled twice.
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC), g_queue, ^{
                 if (g_chromeInFront && anyMediaRuleOn()) chromeEntered();
             });
         }
@@ -250,11 +274,19 @@ void RingMediaSetOptions(RingMediaOptions options) {
     dispatch_async(g_queue, ^{ g_options = options; });
 }
 
-void RingMediaTabSwitchedByRing(void) {
-    if (!g_queue) return;
+void RingMediaTabSwitchedByRing(NSString *windowID, NSString *tabID) {
+    if (!g_queue || !windowID.length || !tabID.length) return;
+    NSString *tab = [NSString stringWithFormat:@"%@:%@", windowID, tabID];
     dispatch_async(g_queue, ^{
         g_ringSwitchUntil = NSProcessInfo.processInfo.systemUptime + kRingSwitchWindow;
-        pollFrontTab();
+        if (!anyMediaRuleOn()) return;
+        // Act at once on the tab the ring opened instead of waiting for a poll.
+        if (!g_lastTab || ![tab isEqualToString:g_lastTab]) {
+            tabChanged(g_lastTab, tab, YES);
+        } else if (g_options.resumeWhenReturning && !g_options.onlyWhenNextTabHasVideo) {
+            returnToTab(tab);   // same tab, coming back from another app
+        }
+        g_lastTab = tab;
     });
 }
 

@@ -259,8 +259,11 @@ Ikonica šake u gornjoj traci otvara panel sa podešavanjima:
 
 | podešavanje | šta radi | podrazumevano |
 |---|---|---|
+| Kartice | prozori i tabovi, ili samo aplikacije (jedna kartica po aplikaciji, Chrome po prozoru, jer su prozori obično različiti profili) | prozori i tabovi |
 | Naslovi, pokazivač, zvuci, zamućenje | izgled menija | svi naslovi, nevidljiv pokazivač, bez zvuka, zamućenje 15 |
 | Finder tabovi jednog prozora kao jedna kartica | tabovi jednog Finder prozora daju jednu karticu | uključeno |
+| Ikonice sajtova na Chrome karticama | ikonica sajta u donjem levom uglu (Chrome ikonica kad sajt nema svoju); preuzima se sa samog sajta, bez drugih servisa (`ring_favicons.m`) | uključeno |
+| Ikonice aplikacija na karticama | ikonica aplikacije u donjem levom uglu ostalih kartica | uključeno |
 | Sakrij ikonicu iz gornje trake | uklanja ikonicu | isključeno |
 
 ### Video u Chrome-u
