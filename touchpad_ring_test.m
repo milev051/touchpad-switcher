@@ -152,6 +152,9 @@ static _Atomic(bool) g_settingFinderTabsOneCard = true;
 static _Atomic(bool) g_settingHideMenuIcon = false;
 static _Atomic(bool) g_settingSoundEffects = false;
 static _Atomic(int) g_settingBlurRadius = 15;   // 0 turns the blur off
+// -1 disables mouse activation. Cocoa/Quartz numbers the middle button as 2
+// and the two usual side buttons as 3 and 4.
+static _Atomic(int) g_settingMouseButton = -1;
 typedef enum { PointerStyleArrow = 0, PointerStyleDot = 1, PointerStyleHidden = 2 } PointerStyle;
 static _Atomic(int) g_settingPointerStyle = PointerStyleHidden;
 static NSSound *g_selectSound;
@@ -873,6 +876,9 @@ static NSArray<RingEntry *> *g_windowEntries = @[];
 static _Atomic(int) g_windowEntryCount = 0;
 static CFMutableArrayRef g_devices = NULL;
 static _Atomic(bool) g_gestureActive = false;
+static _Atomic(bool) g_mouseGestureActive = false;
+static _Atomic(int) g_mouseGestureButton = -1;
+static _Atomic(bool) g_systemCursorHidden = false;
 static _Atomic(bool) g_ringOverlayVisible = false;
 static _Atomic(bool) g_scrollSuppressionActive = false;
 static _Atomic(uint64_t) g_scrollSuppressionUntilNanos = 0;
@@ -1025,6 +1031,62 @@ static BOOL claimSingleInstance(void) {
     return YES;
 }
 
+static void showRing(uint64_t generation);
+static void moveRingPointer(double dx, double dy, NSInteger count);
+static NSInteger pointerSelection(NSInteger count, NSInteger currentIndex);
+static void scheduleSelectionUpdate(uint64_t generation, NSInteger selection, NSPoint pointer);
+static void finishGesture(uint64_t generation, NSInteger selection);
+
+static void hideSystemCursorForGesture(void) {
+    if (!atomic_exchange(&g_systemCursorHidden, true)) {
+        CGDisplayHideCursor(CGMainDisplayID());
+    }
+}
+
+static void showSystemCursorAfterGesture(void) {
+    if (atomic_exchange(&g_systemCursorHidden, false)) {
+        CGDisplayShowCursor(CGMainDisplayID());
+    }
+}
+
+static BOOL mouseButtonEvent(CGEventType type) {
+    return type == kCGEventOtherMouseDown || type == kCGEventOtherMouseUp ||
+           type == kCGEventOtherMouseDragged;
+}
+
+static void beginMouseGesture(CGEventRef event, int button) {
+    if (atomic_load(&g_gestureActive) || atomic_load(&g_ringOverlayVisible)) return;
+    atomic_store(&g_mouseGestureActive, true);
+    atomic_store(&g_mouseGestureButton, button);
+    atomic_store(&g_gestureActive, true);
+    atomic_store(&g_gestureEnding, false);
+    hideSystemCursorForGesture();
+    g_pointerX = 0.0;
+    g_pointerY = 0.0;
+    g_selectedIndex = -1;
+    g_cursorAtGestureStart = CGEventGetLocation(event);
+    uint64_t generation = atomic_fetch_add(&g_gestureGeneration, 1) + 1;
+    NSLog(@"[mouse] button %d gesture started", button + 1);
+    dispatch_async(dispatch_get_main_queue(), ^{ showRing(generation); });
+}
+
+static void updateMouseGesture(CGEventRef event) {
+    // Quartz deltas are screen points and positive Y points down. Roughly 80
+    // points of travel reaches the cards, matching the short trackpad motion.
+    double dx = CGEventGetIntegerValueField(event, kCGMouseEventDeltaX) / 1000.0;
+    double dy = -CGEventGetIntegerValueField(event, kCGMouseEventDeltaY) / 1000.0;
+    moveRingPointer(dx, dy, atomic_load(&g_windowEntryCount));
+    NSInteger selection = pointerSelection(atomic_load(&g_windowEntryCount), g_selectedIndex);
+    if (selection != g_selectedIndex) g_selectedIndex = selection;
+    scheduleSelectionUpdate(atomic_load(&g_gestureGeneration), g_selectedIndex,
+                            NSMakePoint(g_pointerX, g_pointerY));
+    // An event tap can consume the movement while still letting the Window
+    // Server advance the visible cursor on some mouse drivers. Pin it to the
+    // press location after reading the raw deltas used by the ring.
+    CGWarpMouseCursorPosition(g_cursorAtGestureStart);
+    CGAssociateMouseAndMouseCursorPosition(true);
+}
+
 static CGEventRef filterScrollDuringRing(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon) {
     (void)proxy;
     (void)event;
@@ -1036,6 +1098,29 @@ static CGEventRef filterScrollDuringRing(CGEventTapProxy proxy, CGEventType type
         }
         return event;
     }
+    int configuredButton = atomic_load(&g_settingMouseButton);
+    int eventButton = mouseButtonEvent(type)
+        ? (int)CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber) : -1;
+    if (configuredButton >= 2 && type == kCGEventOtherMouseDown &&
+        eventButton == configuredButton && !atomic_load(&g_gestureActive)) {
+        beginMouseGesture(event, configuredButton);
+        return NULL;
+    }
+    if (atomic_load(&g_mouseGestureActive)) {
+        if (type == kCGEventMouseMoved || type == kCGEventOtherMouseDragged) {
+            updateMouseGesture(event);
+        } else if (type == kCGEventOtherMouseUp &&
+                   eventButton == atomic_load(&g_mouseGestureButton)) {
+            atomic_store(&g_mouseGestureActive, false);
+            atomic_store(&g_mouseGestureButton, -1);
+            atomic_store(&g_gestureEnding, true);
+            uint64_t generation = atomic_load(&g_gestureGeneration);
+            NSInteger selection = g_selectedIndex;
+            dispatch_async(dispatch_get_main_queue(), ^{ finishGesture(generation, selection); });
+        }
+        return NULL;
+    }
+
     BOOL isProtectedInput = type == kCGEventScrollWheel ||
                             type == kCGEventMouseMoved ||
                             type == kCGEventLeftMouseDown || type == kCGEventLeftMouseUp ||
@@ -1523,6 +1608,7 @@ static void finishGesture(uint64_t generation, NSInteger selection) {
     atomic_store(&g_gestureEnding, false);
     if (g_panel) [g_panel orderOut:nil];
     atomic_store(&g_ringOverlayVisible, false);
+    showSystemCursorAfterGesture();
     restoreCursorAfterGesture();
     releaseDecodedThumbnails();
     if (selection < 0 || selection >= (NSInteger)g_windowEntries.count) {
@@ -3823,6 +3909,7 @@ static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouche
             double x = sumX / 3.0, y = sumY / 3.0;
             atomic_store(&g_gestureActive, true);
             atomic_store(&g_gestureEnding, false);
+            hideSystemCursorForGesture();
             allFingersUpSince = -1.0;
             liftCompletionScheduled = NO;
             g_previousX = x;
@@ -4002,6 +4089,11 @@ static void loadSettings(void) {
     Boolean blurValid = false;
     CFIndex blurRadius = CFPreferencesGetAppIntegerValue(CFSTR("BlurRadius"), kSettingsID, &blurValid);
     atomic_store(&g_settingBlurRadius, blurValid ? (int)MIN(MAX(blurRadius, 0), 40) : 15);
+    Boolean mouseButtonValid = false;
+    CFIndex mouseButton = CFPreferencesGetAppIntegerValue(CFSTR("MouseActivationButton"), kSettingsID,
+                                                          &mouseButtonValid);
+    atomic_store(&g_settingMouseButton,
+                 mouseButtonValid && mouseButton >= 2 && mouseButton <= 4 ? (int)mouseButton : -1);
     g_selectSound = [[NSSound soundNamed:@"Tink"] copy];
     g_selectSound.volume = 0.3;
     g_activateSound = [[NSSound soundNamed:@"Pop"] copy];
@@ -4165,6 +4257,21 @@ static NSString *lastOutputLine(NSString *output) {
     pointer.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
     pointer.selectedSegment = atomic_load(&g_settingPointerStyle);
 
+    NSTextField *mouseLabel = [self noteWithText:@"Aktivacija mišem"];
+    NSPopUpButton *mouseButton = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    NSArray<NSString *> *mouseButtonTitles = @[@"Isključeno", @"Srednji klik", @"Bočno dugme 4", @"Bočno dugme 5"];
+    NSInteger mouseButtonTags[] = {-1, 2, 3, 4};
+    for (NSUInteger i = 0; i < mouseButtonTitles.count; i++) {
+        [mouseButton addItemWithTitle:mouseButtonTitles[i]];
+        mouseButton.lastItem.tag = mouseButtonTags[i];
+        if (mouseButtonTags[i] == atomic_load(&g_settingMouseButton)) [mouseButton selectItem:mouseButton.lastItem];
+    }
+    mouseButton.controlSize = NSControlSizeSmall;
+    mouseButton.target = self;
+    mouseButton.action = @selector(mouseButtonChanged:);
+    NSTextField *mouseNote = [self noteWithText:
+        @"Drži izabrano dugme, pomeri miš ka kartici i pusti dugme. Za Logitech miš u Logi Options+ mapiraj željeno bočno dugme na Middle button, pa ovde izaberi Srednji klik. Zahteva Accessibility dozvolu i ponovno pokretanje aplikacije posle njenog uključivanja."];
+
     NSTextField *mediaLabel = [self noteWithText:@"Video u Chrome-u"];
     NSMutableArray<NSView *> *mediaRows = [NSMutableArray array];
     for (NSInteger row = 0; row < kMediaOptionRowCount; row++) {
@@ -4216,7 +4323,8 @@ static NSString *lastOutputLine(NSString *output) {
     buttons.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     buttons.spacing = 8;
 
-    NSMutableArray<NSView *> *rows = [@[title, self.gestureWarning, titlesLabel, titles, pointerLabel, pointer, mediaLabel] mutableCopy];
+    NSMutableArray<NSView *> *rows = [@[title, self.gestureWarning, titlesLabel, titles, pointerLabel, pointer,
+                                         mouseLabel, mouseButton, mouseNote, mediaLabel] mutableCopy];
     [rows addObjectsFromArray:mediaRows];
     [rows addObjectsFromArray:@[mediaNote, self.javaScriptHint, finderTabs, sounds, self.blurLabel, blur, separator,
                                 hideIcon, hideNote, buttons, self.updateStatus]];
@@ -4227,6 +4335,8 @@ static NSString *lastOutputLine(NSString *output) {
     stack.edgeInsets = NSEdgeInsetsMake(14, 14, 14, 14);
     [stack setCustomSpacing:4 afterView:titlesLabel];
     [stack setCustomSpacing:4 afterView:pointerLabel];
+    [stack setCustomSpacing:4 afterView:mouseLabel];
+    [stack setCustomSpacing:4 afterView:mouseButton];
     [stack setCustomSpacing:4 afterView:mediaLabel];
     for (NSView *row in mediaRows) [stack setCustomSpacing:4 afterView:row];
     [stack setCustomSpacing:4 afterView:mediaNote];
@@ -4320,6 +4430,14 @@ static NSString *lastOutputLine(NSString *output) {
     [g_ringView resetPointer];   // rebuilt with the new shape on the next open
 }
 
+- (void)mouseButtonChanged:(NSPopUpButton *)button {
+    int mouseButton = (int)button.selectedItem.tag;
+    atomic_store(&g_settingMouseButton, mouseButton);
+    CFNumberRef value = CFNumberCreate(NULL, kCFNumberIntType, &mouseButton);
+    storeSetting(CFSTR("MouseActivationButton"), value);
+    CFRelease(value);
+}
+
 - (void)mediaOptionChanged:(NSButton *)button {
     BOOL on = button.state == NSControlStateValueOn;
     *mediaOptionField(&g_mediaOptions, button.tag) = on;
@@ -4379,6 +4497,7 @@ static SettingsMenu *g_settingsMenu;
 static void handleSignal(int signalNumber) {
     (void)signalNumber;
     printf("\nStopping Touchpad Ring Test...\n");
+    showSystemCursorAfterGesture();
     if (g_scanTimer) {
         dispatch_source_cancel(g_scanTimer);
         g_scanTimer = NULL;

@@ -63,6 +63,16 @@ defaults read com.apple.AppleMultitouchTrackpad TrackpadThreeFingerVertSwipeGest
 
 Panel aplikacije ispisuje isto upozorenje dok je nešto od ovoga uključeno.
 
+Ako se koristi miš, u panelu ikonice šake pod **Aktivacija mišem** može da se
+izabere srednji klik ili bočno dugme 4/5. Dugme se drži dok se miš pomera ka
+kartici, a puštanje je aktivira. Za ovu opciju je potrebna Accessibility dozvola
+i ponovno pokretanje aplikacije posle njenog uključivanja.
+Ako Logi Options+ pretvara bočnu dugmad u Back/Forward, željeno bočno dugme se
+tamo mapira na **Middle button**, a u panelu Touchpad Switcher-a bira se
+**Srednji klik**.
+Sistemski kursor je sakriven dok je kružni meni otvoren i ponovo se prikazuje
+čim se izbor završi ili otkaže.
+
 ## 5. Chrome
 
 Za automatsko zaustavljanje i pokretanje videa u svakom Chrome profilu treba

@@ -33,12 +33,11 @@ list-apps: $(TARGET)
 RING_SOURCES = touchpad_ring_test.m ring_media.m
 
 touchpad_ring_test: $(RING_SOURCES) ring_media.h
+	@mkdir -p "$(RING_APP)/Contents/MacOS"
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(RING_SOURCES) -o $@
-	@if [ -d "$(RING_APP)/Contents/MacOS" ]; then \
-		cp "$@" "$(RING_APP_EXECUTABLE)" && \
-		codesign --force --deep --sign - --identifier "$(RING_APP_IDENTIFIER)" \
-			-r='designated => identifier "$(RING_APP_IDENTIFIER)"' "$(RING_APP)"; \
-	fi
+	@cp "$@" "$(RING_APP_EXECUTABLE)"
+	@codesign --force --deep --sign - --identifier "$(RING_APP_IDENTIFIER)" \
+		-r='designated => identifier "$(RING_APP_IDENTIFIER)"' "$(RING_APP)"
 	@echo "Uspešno kompajliran eksperimentalni test: $@"
 
 ring-test: touchpad_ring_test

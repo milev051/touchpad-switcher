@@ -208,7 +208,19 @@ pokazivač klizi po prstenu. Pokret gore-dole vredi isto koliko i levo-desno,
 jer se uzima prava veličina trackpada.
 
 Krug u sredini je zona za odustajanje: ako se prsti podignu dok je pokazivač u
-njoj, ništa se ne bira.
+njoj, ništa se ne bira. Sistemski kursor je sakriven dok je kružni meni otvoren,
+bez obzira da li je aktiviran sa tri prsta ili mišem, i vraća se čim se meni zatvori.
+
+Isti kružni meni može da se koristi i mišem. U panelu ikonice šake, pod
+**Aktivacija mišem**, izaberi srednji klik ili jedno od dva bočna dugmeta.
+Drži dugme, pomeri miš u smeru kartice i pusti dugme da je aktiviraš. Ova opcija
+zahteva Accessibility dozvolu; posle uključivanja dozvole ponovo pokreni
+Touchpad Switcher. Sistemski kursor ostaje zaključan na mestu pritiska dok
+pomeranje miša upravlja pokazivačem kružnog menija.
+
+Ako softver miša presreće bočnu dugmad (na primer Logi Options+), mapiraj željeno
+bočno dugme na **Middle button**, a u panelu Touchpad Switcher-a izaberi
+**Srednji klik**.
 
 ### Sličice
 
