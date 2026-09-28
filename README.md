@@ -212,22 +212,15 @@ njoj, ništa se ne bira. Sistemski kursor je sakriven dok je kružni meni otvore
 bez obzira da li je aktiviran sa tri prsta ili mišem, i vraća se čim se meni zatvori.
 
 Isti kružni meni može da se koristi i mišem. U panelu ikonice šake, pod
-**Aktivacija mišem**, izaberi srednji klik ili jedno od dva bočna dugmeta.
-Drži dugme, pomeri miš u smeru kartice i pusti dugme da je aktiviraš. Ova opcija
+**Aktivacija mišem**, klikni **Snimi dugme** i pritisni željeno dugme miša
+(Esc otkazuje, **Isključi** gasi aktivaciju). Drži dugme, pomeri miš u smeru kartice i pusti dugme da je aktiviraš. Ova opcija
 zahteva Accessibility dozvolu; posle uključivanja dozvole ponovo pokreni
 Touchpad Switcher. Sistemski kursor ostaje zaključan na mestu pritiska dok
 pomeranje miša upravlja pokazivačem kružnog menija.
 
-Najlakše podešavanje je **Snimi sledeće dugme**: klikni ga, zatim pritisni
-željeno srednje ili bočno dugme, pa aplikacija pamti stvarni broj koji macOS
-šalje. Ručni izbor i **F18 / Logi prečica** ostaju dostupni kao alternativa.
-
-Ako softver miša presreće bočnu dugmad (na primer Logi Options+), mapiraj željeno
-bočno dugme na **Middle button**, a u panelu Touchpad Switcher-a izaberi
-**Srednji klik / Logi bočno**. Stavke **Direktno dugme 4/5** namenjene su
-miševima koji šalju ta dugmad bez dodatnog softverskog mapiranja. Ako se u
-Logi Options+ koristi Keyboard shortcut F18, u panelu izaberi **F18 / Logi
-prečica**.
+Snimanje pamti stvarni signal koji stiže: broj dugmeta miša ili taster. Ako
+softver miša presreće bočnu dugmad (na primer Logi Options+), dodeli željenom
+dugmetu **Middle button** ili Keyboard shortcut poput **F18**, pa ga snimi.
 
 ### Sličice
 

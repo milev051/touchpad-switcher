@@ -63,17 +63,13 @@ defaults read com.apple.AppleMultitouchTrackpad TrackpadThreeFingerVertSwipeGest
 
 Panel aplikacije ispisuje isto upozorenje dok je nešto od ovoga uključeno.
 
-Ako se koristi miš, u panelu ikonice šake pod **Aktivacija mišem** može da se
-izabere srednji klik ili bočno dugme 4/5. Dugme se drži dok se miš pomera ka
-kartici, a puštanje je aktivira. Za ovu opciju je potrebna Accessibility dozvola
-i ponovno pokretanje aplikacije posle njenog uključivanja.
-Najlakše je kliknuti **Snimi sledeće dugme**, pa pritisnuti željeno dugme miša;
-aplikacija tada sama pamti signal koji macOS šalje. Dostupna je i ručna opcija
-**F18 / Logi prečica**.
-Ako Logi Options+ pretvara bočnu dugmad u Back/Forward, željeno bočno dugme se
-tamo mapira na **Middle button**, a u panelu Touchpad Switcher-a bira se
-**Srednji klik / Logi bočno**. Opcije **Direktno dugme 4/5** koriste se samo
-ako miš ta dugmad šalje bez dodatnog mapiranja.
+Ako se koristi miš, u panelu ikonice šake pod **Aktivacija mišem** klikne se
+**Snimi dugme**, pa pritisne željeno dugme miša (Esc otkazuje); aplikacija sama
+pamti signal koji stiže. **Isključi** gasi aktivaciju mišem. Dugme se drži dok
+se miš pomera ka kartici, a puštanje je aktivira. Za ovu opciju je potrebna
+Accessibility dozvola i ponovno pokretanje aplikacije posle njenog uključivanja.
+Ako Logi Options+ pretvara bočnu dugmad u Back/Forward, željenom dugmetu se tamo
+dodeli **Middle button** ili prečica poput **F18**, pa se ono snimi.
 Sistemski kursor je sakriven dok je kružni meni otvoren i ponovo se prikazuje
 čim se izbor završi ili otkaže.
 
