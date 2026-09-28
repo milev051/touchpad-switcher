@@ -151,6 +151,9 @@ static RingMediaOptions g_mediaOptions;   // main thread; the media module keeps
 static _Atomic(bool) g_settingFinderTabsOneCard = true;
 static _Atomic(bool) g_settingHideMenuIcon = false;
 static _Atomic(bool) g_settingSoundEffects = false;
+// Mouse activation by holding the button and releasing it on a card. Off: one
+// click opens the ring and a second click (or a left click) picks the card.
+static _Atomic(bool) g_settingMouseHoldToSelect = true;
 static _Atomic(int) g_settingBlurRadius = 15;   // 0 turns the blur off
 // -1 disables mouse activation. Values 2...31 are Quartz mouse button numbers
 // (middle is 2, the usual side buttons 3 and 4); kMouseActivationKeyBase plus a
@@ -885,10 +888,12 @@ static _Atomic(int) g_mouseGestureButton = -1;
 static _Atomic(bool) g_mouseButtonLearning = false;
 static _Atomic(int) g_learnedButtonAwaitingUp = -1;
 static _Atomic(int) g_learnedKeyAwaitingUp = -1;
-// A Logi Back/Forward swipe has no press duration, so it opens the ring and
-// the ring stays open until the same button or a left click picks the card.
-static _Atomic(bool) g_swipeGestureActive = false;
+// Click mode: the ring stays open after the activation until the same button
+// or a left click picks the card. A Logi Back/Forward swipe has no press
+// duration, so it always works this way.
+static _Atomic(bool) g_clickGestureActive = false;
 static _Atomic(bool) g_swallowLeftMouseUp = false;
+static _Atomic(int) g_swallowOtherMouseUp = -1;
 // The swipe's direction is only known at its end, so its start is held back
 // and posted again when the swipe turns out not to be the activation.
 static CGEventRef g_heldSwipeBegin = NULL;
@@ -1140,7 +1145,7 @@ static void releaseHeldSwipeBegin(CGEventTapProxy proxy, BOOL post) {
 
 static void finishMouseDrivenGesture(NSInteger selection) {
     atomic_store(&g_mouseGestureActive, false);
-    atomic_store(&g_swipeGestureActive, false);
+    atomic_store(&g_clickGestureActive, false);
     atomic_store(&g_mouseGestureButton, -1);
     atomic_store(&g_gestureEnding, true);
     uint64_t generation = atomic_load(&g_gestureGeneration);
@@ -1215,20 +1220,30 @@ static CGEventRef filterScrollDuringRing(CGEventTapProxy proxy, CGEventType type
             return event;
         }
         releaseHeldSwipeBegin(proxy, NO);
-        if (atomic_load(&g_swipeGestureActive)) {
+        if (atomic_load(&g_clickGestureActive)) {
             finishMouseDrivenGesture(g_selectedIndex);
         } else if (!atomic_load(&g_gestureActive)) {
             beginMouseGesture(event, configuredButton);
-            if (atomic_load(&g_mouseGestureActive)) atomic_store(&g_swipeGestureActive, true);
+            if (atomic_load(&g_mouseGestureActive)) atomic_store(&g_clickGestureActive, true);
         }
         return NULL;
     }
     if (type == kCGEventLeftMouseUp && atomic_exchange(&g_swallowLeftMouseUp, false)) {
         return NULL;
     }
-    if (atomic_load(&g_swipeGestureActive)) {
-        if (type == kCGEventMouseMoved || type == kCGEventLeftMouseDragged) {
+    if (type == kCGEventOtherMouseUp && eventButton >= 0 &&
+        atomic_compare_exchange_strong(&g_swallowOtherMouseUp, &(int){eventButton}, -1)) {
+        return NULL;
+    }
+    if (atomic_load(&g_clickGestureActive)) {
+        if (type == kCGEventMouseMoved || type == kCGEventLeftMouseDragged ||
+            type == kCGEventOtherMouseDragged) {
             updateMouseGesture(event);
+            return NULL;
+        }
+        if (type == kCGEventOtherMouseDown && eventButton == atomic_load(&g_mouseGestureButton)) {
+            atomic_store(&g_swallowOtherMouseUp, eventButton);
+            finishMouseDrivenGesture(g_selectedIndex);
             return NULL;
         }
         if (type == kCGEventLeftMouseDown) {
@@ -1301,12 +1316,16 @@ static CGEventRef filterScrollDuringRing(CGEventTapProxy proxy, CGEventType type
         beginMouseGesture(event, configuredButton);
         return NULL;
     }
-    if (atomic_load(&g_mouseGestureActive) && !atomic_load(&g_swipeGestureActive)) {
+    if (atomic_load(&g_mouseGestureActive) && !atomic_load(&g_clickGestureActive)) {
         if (type == kCGEventMouseMoved || type == kCGEventOtherMouseDragged) {
             updateMouseGesture(event);
         } else if (type == kCGEventOtherMouseUp &&
                    eventButton == atomic_load(&g_mouseGestureButton)) {
-            finishMouseDrivenGesture(g_selectedIndex);
+            if (atomic_load(&g_settingMouseHoldToSelect)) {
+                finishMouseDrivenGesture(g_selectedIndex);
+            } else {
+                atomic_store(&g_clickGestureActive, true);   // stays open until the next click
+            }
         }
         return NULL;
     }
@@ -2710,7 +2729,11 @@ static BOOL isTwinSurface(CGRect bounds, NSString *title, RingEntry *listed) {
 static NSArray<RingEntry *> *collectOpenWindows(void) {
     NSMutableDictionary<NSNumber *, NSRunningApplication *> *appsByPID = [NSMutableDictionary dictionary];
     for (NSRunningApplication *app in NSWorkspace.sharedWorkspace.runningApplications) {
-        if (app.activationPolicy == NSApplicationActivationPolicyRegular && !app.isTerminated) {
+        // Our own settings window makes this app regular while it is open; it
+        // is never a card, and raising it from the activation queue crashed
+        // AppKit (window ordering is main-thread only).
+        if (app.activationPolicy == NSApplicationActivationPolicyRegular && !app.isTerminated &&
+            app.processIdentifier != getpid()) {
             appsByPID[@(app.processIdentifier)] = app;
         }
     }
@@ -4275,6 +4298,7 @@ static void loadSettings(void) {
     g_mediaOptions.rewindAfterLongPause = settingBool(CFSTR("MediaRewindAfterLongPause"), YES);
     atomic_store(&g_settingFinderTabsOneCard, settingBool(CFSTR("FinderTabsAsOneCard"), YES));
     atomic_store(&g_settingSoundEffects, settingBool(CFSTR("SoundEffects"), NO));
+    atomic_store(&g_settingMouseHoldToSelect, settingBool(CFSTR("MouseHoldToSelect"), YES));
     Boolean pointerValid = false;
     CFIndex pointerStyle = CFPreferencesGetAppIntegerValue(CFSTR("PointerStyle"), kSettingsID, &pointerValid);
     atomic_store(&g_settingPointerStyle, pointerValid && pointerStyle >= PointerStyleArrow && pointerStyle <= PointerStyleHidden
@@ -4393,10 +4417,33 @@ static NSString *lastOutputLine(NSString *output) {
     return @"nepoznata greška";
 }
 
-// Menu bar icon with a small panel of switches, the same shape as Limiti.
-@interface SettingsMenu : NSObject
+// The settings window behaves like Diktat's: the menu bar icon toggles it, and
+// Esc, Cmd+W or a click into another app closes it. It handles Esc and Cmd+W
+// itself because a menu bar app has no main menu to route them.
+@interface SettingsWindow : NSWindow
+@end
+
+@implementation SettingsWindow
+- (BOOL)canBecomeKeyWindow { return YES; }
+
+- (void)sendEvent:(NSEvent *)event {
+    NSEventModifierFlags flags = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+    if (event.type == NSEventTypeKeyDown && event.keyCode == kEscapeKeyCode && flags == 0) {
+        [self performClose:nil];
+        return;
+    }
+    if (event.type == NSEventTypeKeyDown && flags == NSEventModifierFlagCommand &&
+        [event.charactersIgnoringModifiers.lowercaseString isEqualToString:@"w"]) {
+        [self performClose:nil];
+        return;
+    }
+    [super sendEvent:event];
+}
+@end
+
+@interface SettingsMenu : NSObject <NSWindowDelegate>
 @property(nonatomic, strong) NSStatusItem *statusItem;
-@property(nonatomic, strong) NSPopover *popover;
+@property(nonatomic, strong) SettingsWindow *window;
 @property(nonatomic, strong) NSTextField *javaScriptHint;
 @property(nonatomic, strong) NSTextField *blurLabel;
 @property(nonatomic, strong) NSTextField *gestureWarning;
@@ -4460,7 +4507,7 @@ static NSString *lastOutputLine(NSString *output) {
         self.mouseLearnStatus.textColor = NSColor.systemGreenColor;
     }
     self.mouseLearnStatus.hidden = NO;
-    if (self.popover.isShown) self.popover.contentSize = self.popover.contentViewController.view.fittingSize;
+    [self fitWindow];
 }
 
 - (void)showIcon {
@@ -4530,8 +4577,12 @@ static NSString *lastOutputLine(NSString *output) {
     mouseButtons.spacing = 8;
     self.mouseLearnStatus = [self noteWithText:@""];
     self.mouseLearnStatus.hidden = YES;
+    NSButton *holdToSelect = [NSButton checkboxWithTitle:@"Drži dugme i pusti ga na kartici"
+                                                 target:self action:@selector(mouseHoldChanged:)];
+    holdToSelect.state = atomic_load(&g_settingMouseHoldToSelect) ? NSControlStateValueOn : NSControlStateValueOff;
     NSTextField *mouseNote = [self noteWithText:
-        @"Klikni „Snimi dugme“, pa pritisni željeno dugme miša (Esc otkazuje). Bočna dugmad sa Logi podešavanjem Back/Forward rade direktno: klik otvara meni, pomeri miš ka kartici, pa isto dugme ili levi klik bira. Ostala dugmad se drže dok se miš pomera i puštaju na kartici."];
+        @"Klikni „Snimi dugme“, pa pritisni željeno dugme miša (Esc otkazuje). Bez držanja: klik otvara meni, pomeri miš ka kartici, pa isto dugme ili levi klik bira. "
+         "Logi Back/Forward ne javlja kad je dugme pušteno, pa uvek radi na klik; za držanje mu u Logi Options+ dodeli Middle button."];
 
     NSTextField *mediaLabel = [self noteWithText:@"Video u Chrome-u"];
     NSMutableArray<NSView *> *mediaRows = [NSMutableArray array];
@@ -4585,7 +4636,7 @@ static NSString *lastOutputLine(NSString *output) {
     buttons.spacing = 8;
 
     NSMutableArray<NSView *> *rows = [@[title, self.gestureWarning, titlesLabel, titles, pointerLabel, pointer,
-                                         mouseLabel, self.mouseActivationLabel, mouseButtons,
+                                         mouseLabel, self.mouseActivationLabel, mouseButtons, holdToSelect,
                                          self.mouseLearnStatus, mouseNote, mediaLabel] mutableCopy];
     [rows addObjectsFromArray:mediaRows];
     [rows addObjectsFromArray:@[mediaNote, self.javaScriptHint, finderTabs, sounds, self.blurLabel, blur, separator,
@@ -4600,6 +4651,7 @@ static NSString *lastOutputLine(NSString *output) {
     [stack setCustomSpacing:4 afterView:mouseLabel];
     [stack setCustomSpacing:4 afterView:self.mouseActivationLabel];
     [stack setCustomSpacing:4 afterView:mouseButtons];
+    [stack setCustomSpacing:4 afterView:holdToSelect];
     [stack setCustomSpacing:4 afterView:self.mouseLearnStatus];
     [stack setCustomSpacing:4 afterView:mediaLabel];
     for (NSView *row in mediaRows) [stack setCustomSpacing:4 afterView:row];
@@ -4616,25 +4668,79 @@ static NSString *lastOutputLine(NSString *output) {
     return stack;
 }
 
+- (void)fitWindow {
+    if (!self.window) return;
+    NSSize size = self.window.contentView.fittingSize;
+    NSRect frame = [self.window frameRectForContentRect:NSMakeRect(0, 0, size.width, size.height)];
+    NSRect old = self.window.frame;
+    // Grow or shrink from the top edge so the title bar stays where it was.
+    frame.origin = NSMakePoint(old.origin.x, NSMaxY(old) - frame.size.height);
+    [self.window setFrame:frame display:YES];
+}
+
+- (void)centerWindow {
+    NSScreen *screen = NSScreen.mainScreen ?: self.window.screen;
+    if (!screen) return;
+    NSRect visible = screen.visibleFrame;
+    NSRect frame = self.window.frame;
+    [self.window setFrameOrigin:NSMakePoint(round(NSMidX(visible) - frame.size.width / 2),
+                                            round(NSMidY(visible) - frame.size.height / 2))];
+}
+
 - (void)togglePanel:(id)sender {
-    if (self.popover.isShown) {
-        [self.popover performClose:sender];
+    (void)sender;
+    if (self.window.isVisible) {
+        [self.window performClose:nil];
         return;
     }
-    if (!self.popover) {
-        NSViewController *controller = [NSViewController new];
-        controller.view = [self panelContent];
-        self.popover = [NSPopover new];
-        self.popover.contentViewController = controller;
-        self.popover.contentSize = controller.view.fittingSize;
-        self.popover.behavior = NSPopoverBehaviorTransient;
+    if (!self.window) {
+        self.window = [[SettingsWindow alloc] initWithContentRect:NSMakeRect(0, 0, 340, 600)
+                                                        styleMask:NSWindowStyleMaskTitled |
+                                                                  NSWindowStyleMaskClosable |
+                                                                  NSWindowStyleMaskMiniaturizable
+                                                          backing:NSBackingStoreBuffered
+                                                            defer:NO];
+        self.window.title = @"Touchpad Switcher — Podešavanja";
+        self.window.releasedWhenClosed = NO;
+        // Its own place in Mission Control instead of a helper panel above
+        // another app's window.
+        self.window.collectionBehavior = NSWindowCollectionBehaviorManaged;
+        self.window.contentView = [self panelContent];
+        self.window.delegate = self;
+        [NSNotificationCenter.defaultCenter addObserver:self
+                                               selector:@selector(applicationResignedActive:)
+                                                   name:NSApplicationDidResignActiveNotification
+                                                 object:nil];
     }
     self.gestureWarning.hidden = !threeFingerSystemGesturesOn();
     [self updateJavaScriptHint];
-    self.popover.contentSize = self.popover.contentViewController.view.fittingSize;
-    NSButton *button = self.statusItem.button;
-    [self.popover showRelativeToRect:button.bounds ofView:button preferredEdge:NSRectEdgeMinY];
+    [self fitWindow];
+    [self centerWindow];
+    // A regular app while the window is open: Dock icon, Cmd+Tab and Mission
+    // Control. windowWillClose: returns to a menu bar app.
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    [self.window makeKeyAndOrderFront:nil];
     [NSApp activate];
+    // The policy change settles on the next turn of the run loop; activating
+    // only before it left the window unfocused, so Esc and clicks elsewhere
+    // never reached it.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        if (!self.window.isVisible) return;
+        [NSApp activate];
+        [self.window makeKeyAndOrderFront:nil];
+    });
+}
+
+- (void)windowWillClose:(NSNotification *)notification {
+    (void)notification;
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+}
+
+// A click into another app closes the window, the same as Esc. The app is
+// watched rather than the window, so the menu bar icon still toggles it.
+- (void)applicationResignedActive:(NSNotification *)notification {
+    (void)notification;
+    if (self.window.isVisible) [self.window performClose:nil];
 }
 
 - (void)setUpdateMessage:(NSString *)message done:(BOOL)done {
@@ -4642,7 +4748,7 @@ static NSString *lastOutputLine(NSString *output) {
         self.updateStatus.stringValue = message;
         self.updateStatus.hidden = NO;
         if (done) self.updateButton.enabled = YES;
-        self.popover.contentSize = self.popover.contentViewController.view.fittingSize;
+        [self fitWindow];
     });
 }
 
@@ -4700,7 +4806,7 @@ static NSString *lastOutputLine(NSString *output) {
     persistMouseActivationSetting(-1);
     [self refreshMouseActivationLabel];
     self.mouseLearnStatus.hidden = YES;
-    self.popover.contentSize = self.popover.contentViewController.view.fittingSize;
+    [self fitWindow];
 }
 
 - (void)learnMouseButton:(NSButton *)button {
@@ -4709,7 +4815,7 @@ static NSString *lastOutputLine(NSString *output) {
     self.mouseLearnStatus.stringValue = @"Čekam… pritisni željeno dugme miša (Esc otkazuje).";
     self.mouseLearnStatus.textColor = NSColor.systemOrangeColor;
     self.mouseLearnStatus.hidden = NO;
-    self.popover.contentSize = self.popover.contentViewController.view.fittingSize;
+    [self fitWindow];
 }
 
 - (void)mediaOptionChanged:(NSButton *)button {
@@ -4723,13 +4829,19 @@ static NSString *lastOutputLine(NSString *output) {
 - (void)updateJavaScriptHint {
     self.javaScriptHint.hidden = !(RingMediaJavaScriptBlocked() &&
                                    (g_mediaOptions.pauseWhenLeaving || g_mediaOptions.resumeWhenReturning));
-    self.popover.contentSize = self.popover.contentViewController.view.fittingSize;
+    [self fitWindow];
 }
 
 - (void)finderTabsChanged:(NSButton *)button {
     BOOL on = button.state == NSControlStateValueOn;
     atomic_store(&g_settingFinderTabsOneCard, on);
     storeSetting(CFSTR("FinderTabsAsOneCard"), on ? kCFBooleanTrue : kCFBooleanFalse);
+}
+
+- (void)mouseHoldChanged:(NSButton *)button {
+    BOOL on = button.state == NSControlStateValueOn;
+    atomic_store(&g_settingMouseHoldToSelect, on);
+    storeSetting(CFSTR("MouseHoldToSelect"), on ? kCFBooleanTrue : kCFBooleanFalse);
 }
 
 - (void)soundEffectsChanged:(NSButton *)button {
@@ -4759,8 +4871,7 @@ static NSString *lastOutputLine(NSString *output) {
     if (button.state != NSControlStateValueOn) return;
     atomic_store(&g_settingHideMenuIcon, true);
     storeSetting(CFSTR("HideMenuBarIcon"), kCFBooleanTrue);
-    [self.popover close];
-    self.popover = nil;
+    [self.window performClose:nil];
     if (self.statusItem) [NSStatusBar.systemStatusBar removeStatusItem:self.statusItem];
     self.statusItem = nil;
 }

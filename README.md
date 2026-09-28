@@ -224,6 +224,16 @@ Logi bočno dugme. Uz podrazumevano Logi Options+ podešavanje bočna dugmad su
 pa isto dugme ili levi klik bira (Esc otkazuje). Tada se Back/Forward ne
 izvršava. Za srednji klik ne treba ništa menjati u Logi Options+.
 
+Opcija **Drži dugme i pusti ga na kartici** (podrazumevano uključena) važi za
+prava dugmad miša: dugme se drži dok se miš pomera i pušta na kartici. Kad je
+isključena, klik otvara meni, a drugi klik bira. Logi Back/Forward ne javlja
+kad je dugme pušteno, pa uvek radi na klik; za držanje mu u Logi Options+
+dodeli **Middle button**.
+
+Podešavanja se otvaraju klikom na ikonicu u gornjoj traci, u zasebnom prozoru
+na sredini ekrana. Zatvaraju se na Esc, Cmd+W, klik van prozora ili ponovni
+klik na ikonicu.
+
 ### Sličice
 
 Sličice se snimaju u smanjenoj rezoluciji ako aplikacija ima dozvolu za Screen
