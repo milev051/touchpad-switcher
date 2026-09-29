@@ -8,6 +8,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import "ring_media.h"
 #import "ring_favicons.h"
+#import "ring_update.h"
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #include <math.h>
 #include <float.h>
@@ -4717,6 +4718,8 @@ static NSString *lastOutputLine(NSString *output) {
 @property(nonatomic, strong) NSTextField *mouseLearnStatus;
 @property(nonatomic, strong) NSButton *updateButton;
 @property(nonatomic, strong) NSTextField *updateStatus;
+@property(nonatomic, strong) RingRelease *latestRelease;
+@property(nonatomic) NSTimeInterval lastUpdateCheck;
 @end
 
 @implementation SettingsMenu
@@ -4912,12 +4915,12 @@ static NSString *lastOutputLine(NSString *output) {
 
     NSButton *quit = [NSButton buttonWithTitle:@"Ugasi Touchpad Switcher" target:NSApp action:@selector(terminate:)];
     quit.controlSize = NSControlSizeSmall;
-    self.updateButton = [NSButton buttonWithTitle:@"Ažuriraj sa GitHub-a" target:self action:@selector(updateApp:)];
+    NSString *installedVersion = NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"] ?: @"?";
+    self.updateButton = [NSButton buttonWithTitle:[NSString stringWithFormat:@"Proveri ažuriranje (%@)", installedVersion]
+                                         target:self action:@selector(updateApp:)];
     self.updateButton.controlSize = NSControlSizeSmall;
     self.updateStatus = [self noteWithText:@""];
     self.updateStatus.hidden = YES;
-    // Only a copy built from the repository folder can update itself.
-    self.updateButton.hidden = sourceRepositoryPath() == nil;
     NSStackView *buttons = [NSStackView stackViewWithViews:@[self.updateButton, quit]];
     buttons.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     buttons.spacing = 8;
@@ -5010,6 +5013,7 @@ static NSString *lastOutputLine(NSString *output) {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     [self.window makeKeyAndOrderFront:nil];
     [NSApp activate];
+    if (NSDate.date.timeIntervalSince1970 - self.lastUpdateCheck > 60) [self checkForUpdate];
     // The policy change settles on the next turn of the run loop; activating
     // only before it left the window unfocused, so Esc and clicks elsewhere
     // never reached it.
@@ -5041,34 +5045,52 @@ static NSString *lastOutputLine(NSString *output) {
     });
 }
 
-- (void)updateApp:(NSButton *)button {
-    NSString *repository = sourceRepositoryPath();
-    if (!repository) return;
-    button.enabled = NO;
-    [self setUpdateMessage:@"Proveravam izmene na GitHub-u…" done:NO];
+- (void)checkForUpdate {
+    self.lastUpdateCheck = NSDate.date.timeIntervalSince1970;
+    self.updateButton.enabled = NO;
+    [self setUpdateMessage:@"Proveravam novu verziju na GitHub-u…" done:NO];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSString *output = nil;
-        if (runTool(repository, @[@"git", @"fetch", @"--quiet"], &output) != 0) {
-            [self setUpdateMessage:[@"GitHub nije dostupan: " stringByAppendingString:lastOutputLine(output)] done:YES];
-            return;
-        }
-        runTool(repository, @[@"git", @"rev-list", @"--count", @"HEAD..@{u}"], &output);
-        if (output.integerValue == 0) {
-            [self setUpdateMessage:@"Imaš najnoviju verziju." done:YES];
-            return;
-        }
-        [self setUpdateMessage:@"Preuzimam izmene i pravim novu verziju…" done:NO];
-        if (runTool(repository, @[@"git", @"pull", @"--ff-only"], &output) != 0) {
-            [self setUpdateMessage:[@"Preuzimanje nije uspelo: " stringByAppendingString:lastOutputLine(output)] done:YES];
-            return;
-        }
-        if (runTool(repository, @[@"make", @"install-ring"], &output) != 0) {
-            [self setUpdateMessage:[@"Pravljenje nije uspelo: " stringByAppendingString:lastOutputLine(output)] done:YES];
+        NSError *error = nil;
+        RingRelease *release = RingLatestRelease(&error);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.updateButton.enabled = YES;
+            if (!release) {
+                self.updateStatus.stringValue = [@"Provera nije uspela: " stringByAppendingString:error.localizedDescription ?: @"GitHub nije dostupan."];
+            } else {
+                self.latestRelease = release;
+                NSString *current = NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"] ?: @"";
+                if (RingVersionNewer(current, release.version)) {
+                    self.updateButton.title = [NSString stringWithFormat:@"Ažuriraj %@ → %@", current, release.version];
+                    self.updateStatus.stringValue = [NSString stringWithFormat:@"Dostupna je nova verzija %@.", release.version];
+                } else {
+                    self.updateButton.title = [NSString stringWithFormat:@"Proveri ažuriranje (%@)", current];
+                    self.updateStatus.stringValue = [NSString stringWithFormat:@"Imaš najnoviju verziju (%@).", current];
+                }
+            }
+            self.updateStatus.hidden = NO;
+            [self fitWindow];
+        });
+    });
+}
+
+- (void)updateApp:(NSButton *)button {
+    NSString *current = NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"] ?: @"";
+    RingRelease *release = self.latestRelease;
+    if (!release || !RingVersionNewer(current, release.version)) {
+        [self checkForUpdate];
+        return;
+    }
+    button.enabled = NO;
+    [self setUpdateMessage:[NSString stringWithFormat:@"Preuzimam verziju %@…", release.version] done:NO];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *error = nil;
+        if (!RingInstallRelease(release, &error)) {
+            [self setUpdateMessage:[@"Ažuriranje nije uspelo: " stringByAppendingString:error.localizedDescription ?: @"nepoznata greška"] done:YES];
             return;
         }
         [self setUpdateMessage:@"Gotovo, pokrećem novu verziju…" done:NO];
         // The new instance ends this one as it starts.
-        runTool(repository, @[@"open", @"-n", @"/Applications/Touchpad Switcher.app"], NULL);
+        runTool(NSHomeDirectory(), @[@"open", @"-n", @"/Applications/Touchpad Switcher.app"], NULL);
     });
 }
 

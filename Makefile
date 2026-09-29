@@ -30,9 +30,9 @@ run-python:
 list-apps: $(TARGET)
 	./$(TARGET) --list-apps
 
-RING_SOURCES = touchpad_ring_test.m ring_media.m ring_favicons.m
+RING_SOURCES = touchpad_ring_test.m ring_media.m ring_favicons.m ring_update.m
 
-touchpad_ring_test: $(RING_SOURCES) ring_media.h ring_favicons.h
+touchpad_ring_test: $(RING_SOURCES) ring_media.h ring_favicons.h ring_update.h
 	@mkdir -p "$(RING_APP)/Contents/MacOS"
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(RING_SOURCES) -o $@
 	@cp "$@" "$(RING_APP_EXECUTABLE)"
@@ -61,7 +61,7 @@ update:
 	open -n "/Applications/$(RING_APP)"
 
 # Zip for someone else's Mac: one binary for Apple Silicon and Intel.
-dist: $(RING_SOURCES) ring_media.h ring_favicons.h
+dist: $(RING_SOURCES) ring_media.h ring_favicons.h ring_update.h
 	@mkdir -p "$(RING_APP)/Contents/MacOS" dist
 	$(CC) $(CFLAGS) -arch arm64 -arch x86_64 $(FRAMEWORKS) $(RING_SOURCES) -o "$(RING_APP_EXECUTABLE)"
 	codesign --force --deep --sign - --identifier "$(RING_APP_IDENTIFIER)" \

@@ -169,8 +169,10 @@ make run-python
 ## Instalacija i ažuriranje
 
 Dupli klik na `Instaliraj.command` napravi aplikaciju i stavi je u
-`/Applications`. Ažuriranje: ikonica šake > **Ažuriraj sa GitHub-a**, dupli klik
-na `Ažuriraj.command` ili `make update`. Dozvole, trackpad i Chrome:
+`/Applications`. U podešavanjima aplikacija proverava poslednje GitHub izdanje;
+kad postoji novija verzija, dugme **Ažuriraj** prikazuje broj stare i nove
+verzije i instalira ZIP bez lokalnog Git klona. Iz izvornog foldera može i dupli
+klik na `Ažuriraj.command` ili `make update`. Dozvole, trackpad i Chrome:
 [INSTALACIJA.md](INSTALACIJA.md).
 
 ## Eksperimentalni troprstni kružni meni

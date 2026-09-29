@@ -95,14 +95,15 @@ sleep 5; tail -30 /tmp/ts.log
 
 ## Ažuriranje
 
-Tri jednaka načina:
+Načini ažuriranja:
 
-- u aplikaciji: ikonica šake > **Ažuriraj sa GitHub-a**
+- u aplikaciji: ikonica šake > **Ažuriraj** (proverava poslednje GitHub izdanje
+  i instalira njegov ZIP, čak i bez lokalnog Git klona)
 - dupli klik na `Ažuriraj.command`
 - `make update` u folderu repozitorijuma
 
-Svaki preuzme izmene, napravi aplikaciju ponovo i pokrene novu verziju, koja
-zameni staru.
+Poslednja dva načina preuzimaju izvorni kod i prave aplikaciju ponovo. Sva tri
+pokreću novu verziju, koja zamenjuje staru.
 
 ## Uklanjanje
 
