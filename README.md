@@ -265,6 +265,7 @@ Ikonica šake u gornjoj traci otvara panel sa podešavanjima:
 | Ikonice sajtova na Chrome karticama | ikonica sajta u donjem levom uglu (Chrome ikonica kad sajt nema svoju); preuzima se sa samog sajta, bez drugih servisa (`ring_favicons.m`) | uključeno |
 | Ikonice aplikacija na karticama | ikonica aplikacije u donjem levom uglu ostalih kartica | uključeno |
 | Sakrij ikonicu iz gornje trake | uklanja ikonicu | isključeno |
+| Pokreni pri uključivanju računara | otvara instalirani Touchpad Switcher pri prijavi na Mac; može se isključiti u podešavanjima | uključeno |
 
 ### Video u Chrome-u
 

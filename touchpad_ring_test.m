@@ -4492,6 +4492,49 @@ static BOOL settingBool(CFStringRef key, BOOL fallback) {
     return valid ? value : fallback;
 }
 
+// A per-user LaunchAgent opens the installed app at login. Keep this separate
+// from a manually added Login Item, so the setting can remove exactly its own job.
+static NSString *loginAgentPath(void) {
+    return [NSHomeDirectory() stringByAppendingPathComponent:
+            @"Library/LaunchAgents/com.milev.touchpad-switcher.autostart.plist"];
+}
+
+static BOOL syncLoginAgent(BOOL enabled, NSError **error) {
+    NSString *installed = @"/Applications/Touchpad Switcher.app";
+    // Running the development bundle must not change the installed app's login setting.
+    if (![NSBundle.mainBundle.bundlePath.stringByStandardizingPath isEqualToString:installed]) return YES;
+    NSFileManager *files = NSFileManager.defaultManager;
+    NSString *path = loginAgentPath();
+    if (enabled) {
+        if (![files fileExistsAtPath:installed]) {
+            if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileNoSuchFileError
+                                               userInfo:@{NSFilePathErrorKey: installed}];
+            return NO;
+        }
+        NSDictionary *job = @{
+            @"Label": @"com.milev.touchpad-switcher.autostart",
+            @"ProgramArguments": @[@"/usr/bin/open", @"-a", installed],
+            @"RunAtLoad": @YES,
+        };
+        NSData *data = [NSPropertyListSerialization dataWithPropertyList:job
+                                         format:NSPropertyListXMLFormat_v1_0 options:0 error:error];
+        if (!data) return NO;
+        NSString *folder = path.stringByDeletingLastPathComponent;
+        if (![files createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:error]) return NO;
+        NSData *old = [NSData dataWithContentsOfFile:path];
+        return [old isEqualToData:data] || [data writeToFile:path options:NSDataWritingAtomic error:error];
+    }
+    if (![files fileExistsAtPath:path]) return YES;
+    // An already loaded job is removed as well; a missing job is harmless.
+    NSTask *task = [NSTask new];
+    task.executableURL = [NSURL fileURLWithPath:@"/bin/launchctl"];
+    task.arguments = @[@"bootout", [NSString stringWithFormat:@"gui/%d/com.milev.touchpad-switcher.autostart", getuid()]];
+    task.standardOutput = NSFileHandle.fileHandleWithNullDevice;
+    task.standardError = NSFileHandle.fileHandleWithNullDevice;
+    if ([task launchAndReturnError:nil]) [task waitUntilExit];
+    return [files removeItemAtPath:path error:error];
+}
+
 static void storeSetting(CFStringRef key, CFPropertyListRef value) {
     CFPreferencesSetAppValue(key, value, kSettingsID);
     CFPreferencesAppSynchronize(kSettingsID);
@@ -4546,6 +4589,10 @@ static void loadSettings(void) {
         storeSetting(CFSTR("HideMenuBarIcon"), kCFBooleanFalse);
     }
     atomic_store(&g_settingHideMenuIcon, hideIcon);
+    NSError *loginError = nil;
+    if (!syncLoginAgent(settingBool(CFSTR("StartAtLogin"), YES), &loginError)) {
+        NSLog(@"Automatsko pokretanje nije podešeno: %@", loginError);
+    }
 }
 
 // macOS gestures that also use three fingers: three-finger drag moves the
@@ -4858,6 +4905,11 @@ static NSString *lastOutputLine(NSString *output) {
                                               target:self action:@selector(hideIconChanged:)];
     NSTextField *hideNote = [self noteWithText:@"Ikonica se vraća kad ponovo otvoriš aplikaciju."];
 
+    NSButton *startAtLogin = [NSButton checkboxWithTitle:@"Pokreni pri uključivanju računara"
+                                                  target:self action:@selector(startAtLoginChanged:)];
+    startAtLogin.state = settingBool(CFSTR("StartAtLogin"), YES)
+        ? NSControlStateValueOn : NSControlStateValueOff;
+
     NSButton *quit = [NSButton buttonWithTitle:@"Ugasi Touchpad Switcher" target:NSApp action:@selector(terminate:)];
     quit.controlSize = NSControlSizeSmall;
     self.updateButton = [NSButton buttonWithTitle:@"Ažuriraj sa GitHub-a" target:self action:@selector(updateApp:)];
@@ -4876,7 +4928,7 @@ static NSString *lastOutputLine(NSString *output) {
                                          self.mouseLearnStatus, mouseNote, mediaLabel] mutableCopy];
     [rows addObjectsFromArray:mediaRows];
     [rows addObjectsFromArray:@[mediaNote, self.javaScriptHint, finderTabs, sounds, self.blurLabel, blur, separator,
-                                hideIcon, hideNote, buttons, self.updateStatus]];
+                                hideIcon, hideNote, startAtLogin, buttons, self.updateStatus]];
     NSStackView *stack = [NSStackView stackViewWithViews:rows];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeLeading;
@@ -5133,6 +5185,20 @@ static NSString *lastOutputLine(NSString *output) {
     if (self.statusItem) [NSStatusBar.systemStatusBar removeStatusItem:self.statusItem];
     self.statusItem = nil;
 }
+- (void)startAtLoginChanged:(NSButton *)button {
+    BOOL enabled = button.state == NSControlStateValueOn;
+    NSError *error = nil;
+    if (!syncLoginAgent(enabled, &error)) {
+        button.state = enabled ? NSControlStateValueOff : NSControlStateValueOn;
+        NSAlert *alert = [NSAlert new];
+        alert.messageText = @"Automatsko pokretanje nije podešeno";
+        alert.informativeText = error.localizedDescription ?: @"Proveri dozvole za LaunchAgents folder.";
+        [alert runModal];
+        return;
+    }
+    storeSetting(CFSTR("StartAtLogin"), enabled ? kCFBooleanTrue : kCFBooleanFalse);
+}
+
 @end
 
 static SettingsMenu *g_settingsMenu;
