@@ -112,6 +112,8 @@ static BOOL ensureChromeAutomation(BOOL askUser);
 static void schedulePendingThumbnailCapture(NSArray<RingEntry *> *entries);
 static void scheduleChromeBackgroundPrefetch(NSArray<RingEntry *> *entries);
 static void refreshThumbnailsNow(pid_t onlyPID, NSTimeInterval minAge);
+static void loadHiddenChromeTabs(uint64_t generation);
+static void setRingPick(BOOL made, NSString *chromeWindowID);
 static void scanWindowsNow(void);
 static void noteChromeSelectionChanges(NSArray<RingEntry *> *entries);
 
@@ -125,6 +127,7 @@ static void noteChromeSelectionChanges(NSArray<RingEntry *> *entries);
 @property(nonatomic, weak) NSView *glowView;
 @property(nonatomic) NSPoint lastPointer;
 @property(nonatomic, strong) CALayer *focusLayer;
+@property(nonatomic) NSInteger focusIndex;
 - (void)movePointerTo:(NSPoint)ringPoint;
 - (void)resetPointer;
 - (void)resetSelectionVisuals;
@@ -311,28 +314,47 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
 
 @implementation SectorGlowView {
     CAGradientLayer *_gradient;   // radial: bright at the center, fading outward
-    CAGradientLayer *_beam;       // conic mask: soft-edged beam, turned by rotation
+    CAGradientLayer *_beam;       // conic mask: soft beam, turned by rotation
     CADisplayLink *_displayLink;
-    CGFloat _targetAngle;
-    CGFloat _shownAngle;
-    CGFloat _beamWidth;
+    CGPoint _target;              // unit vector toward the fingers
+    CGPoint _point;               // where the light points now; shorter near the center
+    CGPoint _speed;
+    CGFloat _targetWidth;
+    CGFloat _width;               // eases toward _targetWidth
+    CGFloat _beamWidth;           // what the mask shows, widened near the center
+    CGFloat _level;               // 0 hidden, 1 fully lit
     CFTimeInterval _lastFrame;
     NSPoint _center;
+    CGFloat _glowRadius;
     BOOL _visible;
 }
+
+// The light points at a spot that moves in a straight line toward the new
+// direction on a critically damped spring (no overshoot, about 0.15 s). A
+// step to a neighbor looks like turning; a jump to the other side pulls the
+// light back through the center, where it is short, dim and wide, and out
+// again on the new side.
+static const CGFloat kBeamSpring = 30.0;
+static const CGFloat kBeamMaxWidth = 3.6;   // radians; a soft glow all around the hub
 
 - (instancetype)initWithFrame:(NSRect)frame {
     self = [super initWithFrame:frame];
     self.wantsLayer = YES;
     _gradient = [CAGradientLayer layer];
     _gradient.type = kCAGradientLayerRadial;
-    // Brightest at the center, fading out toward the edge of the screen.
-    _gradient.colors = @[
-        (id)[NSColor colorWithCalibratedRed:0.60 green:0.92 blue:1.0 alpha:0.55].CGColor,
-        (id)[NSColor colorWithCalibratedRed:0.45 green:0.88 blue:1.0 alpha:0.22].CGColor,
-        (id)[NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.0].CGColor
-    ];
-    _gradient.locations = @[@0.0, @0.40, @1.0];
+    // Brightest at the center, fading out toward the edge of the screen along
+    // a smooth curve, so no ring shows where two straight segments would meet.
+    NSMutableArray *colors = [NSMutableArray array], *locations = [NSMutableArray array];
+    const int stops = 12;
+    for (int i = 0; i <= stops; i++) {
+        CGFloat t = (CGFloat)i / stops;
+        CGFloat fade = (1.0 - t) * (1.0 - t);
+        [colors addObject:(id)[NSColor colorWithCalibratedRed:0.24 + 0.36 * fade green:0.82 + 0.10 * fade
+                                                         blue:1.0 alpha:0.55 * fade].CGColor];
+        [locations addObject:@(t)];
+    }
+    _gradient.colors = colors;
+    _gradient.locations = locations;
     _gradient.opacity = 0;
     _beam = [CAGradientLayer layer];
     _beam.type = kCAGradientLayerConic;
@@ -345,63 +367,80 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
 
 - (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
 
-// Beam centered on the conic gradient's half-way point, with edges that fade
-// out instead of ending in a hard line.
+// Beam centered on the conic gradient's half-way point. Its brightness follows
+// a raised cosine from the middle to the edges, with no flat core: a flat core
+// showed as two straight lines where the light was strongest.
 - (void)setBeamWidth:(CGFloat)width {
-    if (fabs(width - _beamWidth) < 0.001) return;
+    if (fabs(width - _beamWidth) < 0.002) return;
     _beamWidth = width;
-    CGFloat core = MIN(0.249, width * 0.38 / (2.0 * M_PI));
     CGFloat edge = MIN(0.499, width * 0.85 / (2.0 * M_PI));
-    id clear = (id)[NSColor colorWithCalibratedWhite:1.0 alpha:0.0].CGColor;
-    id solid = (id)[NSColor colorWithCalibratedWhite:1.0 alpha:1.0].CGColor;
-    _beam.colors = @[clear, clear, solid, solid, clear, clear];
-    _beam.locations = @[@0.0, @(0.5 - edge), @(0.5 - core), @(0.5 + core), @(0.5 + edge), @1.0];
+    const int stops = 16;
+    NSMutableArray *colors = [NSMutableArray array], *locations = [NSMutableArray array];
+    [colors addObject:(id)[NSColor colorWithCalibratedWhite:1.0 alpha:0.0].CGColor];
+    [locations addObject:@0.0];
+    for (int i = 0; i <= stops; i++) {
+        CGFloat u = (CGFloat)i / stops * 2.0 - 1.0;          // -1 .. 1 across the beam
+        CGFloat alpha = 0.5 * (1.0 + cos(M_PI * u));
+        [colors addObject:(id)[NSColor colorWithCalibratedWhite:1.0 alpha:alpha].CGColor];
+        [locations addObject:@(0.5 + u * edge)];
+    }
+    [colors addObject:(id)[NSColor colorWithCalibratedWhite:1.0 alpha:0.0].CGColor];
+    [locations addObject:@1.0];
+    _beam.colors = colors;
+    _beam.locations = locations;
 }
 
-- (void)applyAngle:(CGFloat)angle {
+- (void)applyBeam {
+    CGFloat length = MIN(1.0, hypot(_point.x, _point.y));
+    CGFloat reach = length * length * (3.0 - 2.0 * length);   // smoothstep
+    CGFloat angle = length > 0.001 ? (CGFloat)atan2(_point.y, _point.x) : 0;
+    CGFloat viewWidth = MAX(1.0, NSWidth(self.bounds)), viewHeight = MAX(1.0, NSHeight(self.bounds));
+    CGFloat radius = kHubRadius + (_glowRadius - kHubRadius) * (0.3 + 0.7 * reach);
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     // The beam's middle sits half a turn from the gradient's start direction.
     _beam.affineTransform = CGAffineTransformMakeRotation(angle - (CGFloat)M_PI);
+    [self setBeamWidth:_width + (kBeamMaxWidth - _width) * (1.0 - reach)];
+    _gradient.endPoint = CGPointMake((_center.x + radius) / viewWidth, (_center.y + radius) / viewHeight);
+    _gradient.opacity = (float)(_level * (0.35 + 0.65 * reach));
     [CATransaction commit];
 }
 
 - (void)pointAt:(CGFloat)angle width:(CGFloat)width center:(NSPoint)center {
-    _targetAngle = angle;
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    [self setBeamWidth:width];
-    [CATransaction commit];
+    _target = CGPointMake(cos(angle), sin(angle));
+    _targetWidth = width;   // eases in with the frames below
     if (_visible) return;
-
     _visible = YES;
+
+    // Crossing the center: the light that is still fading carries on toward
+    // the new side instead of starting over.
+    if (_level > 0.05 && NSEqualPoints(center, _center)) {
+        [self startFrames];
+        return;
+    }
+
+    // A new light grows out of the center toward its card.
     _center = center;
-    _shownAngle = angle;
+    _point = CGPointMake(_target.x * 0.15, _target.y * 0.15);
+    _speed = CGPointZero;
+    _width = width;
+    _level = 1.0;
     CGFloat viewWidth = MAX(1.0, NSWidth(self.bounds)), viewHeight = MAX(1.0, NSHeight(self.bounds));
-    CGFloat glowRadius = MAX(viewWidth, viewHeight) * 0.6;
+    _glowRadius = MAX(viewWidth, viewHeight) * 0.6;
     CGFloat side = hypot(viewWidth, viewHeight) * 2.0;   // covers the screen at any rotation
-    CGPoint fullEnd = CGPointMake((center.x + glowRadius) / viewWidth, (center.y + glowRadius) / viewHeight);
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     [_gradient removeAllAnimations];
     _gradient.frame = self.layer.bounds;
     _gradient.startPoint = CGPointMake(center.x / viewWidth, center.y / viewHeight);
-    _gradient.endPoint = fullEnd;
     _beam.bounds = CGRectMake(0, 0, side, side);
     _beam.position = center;
-    _gradient.opacity = 1.0;
     [CATransaction commit];
-    [self applyAngle:angle];
+    [self applyBeam];
+    [self startFrames];
+}
 
-    // A new light shoots out of the center toward its card.
-    CABasicAnimation *grow = [CABasicAnimation animationWithKeyPath:@"endPoint"];
-    grow.fromValue = [NSValue valueWithPoint:NSMakePoint((center.x + kHubRadius) / viewWidth,
-                                                         (center.y + kHubRadius) / viewHeight)];
-    grow.toValue = [NSValue valueWithPoint:NSPointFromCGPoint(fullEnd)];
-    grow.duration = 0.16;
-    grow.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
-    [_gradient addAnimation:grow forKey:@"grow"];
-
+- (void)startFrames {
     if (!_displayLink) {
         _displayLink = [self displayLinkWithTarget:self selector:@selector(stepBeam:)];
         [_displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
@@ -410,34 +449,43 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
     _displayLink.paused = NO;
 }
 
-// Each screen refresh eases the beam toward the finger direction. The finger
-// data is a little noisy; a 35 ms time constant removes the shake while the
-// light still keeps up with a fast flick.
+// Each screen refresh moves the light toward the finger direction. The spring
+// also smooths out the small shake of the finger data.
 - (void)stepBeam:(CADisplayLink *)link {
     CFTimeInterval now = link.timestamp;
-    CFTimeInterval dt = _lastFrame > 0 ? MIN(now - _lastFrame, 0.05) : 1.0 / 120.0;
+    CGFloat dt = (CGFloat)(_lastFrame > 0 ? MIN(now - _lastFrame, 0.05) : 1.0 / 120.0);
     _lastFrame = now;
-    CGFloat delta = (CGFloat)remainder(_targetAngle - _shownAngle, 2.0 * M_PI);
-    _shownAngle += delta * (CGFloat)(1.0 - exp(-dt / 0.035));
-    [self applyAngle:_shownAngle];
+    // Small steps keep the spring stable when a frame comes late.
+    for (CGFloat left = dt; left > 0; left -= 1.0 / 240.0) {
+        CGFloat step = MIN(left, (CGFloat)(1.0 / 240.0));
+        _speed.x += (kBeamSpring * kBeamSpring * (_target.x - _point.x) - 2.0 * kBeamSpring * _speed.x) * step;
+        _speed.y += (kBeamSpring * kBeamSpring * (_target.y - _point.y) - 2.0 * kBeamSpring * _speed.y) * step;
+        _point.x += _speed.x * step;
+        _point.y += _speed.y * step;
+    }
+    // A card with a wider or narrower sector changes the width gradually.
+    _width += (_targetWidth - _width) * (CGFloat)(1.0 - exp(-dt / 0.06));
+    // Lighting up is quick; going out takes about a fifth of a second.
+    CGFloat levelTarget = _visible ? 1.0 : 0.0;
+    _level += (levelTarget - _level) * (CGFloat)(1.0 - exp(-dt / (_visible ? 0.05 : 0.07)));
+    if (!_visible && _level < 0.01) {
+        _level = 0;
+        _displayLink.paused = YES;
+    }
+    [self applyBeam];
 }
 
 - (void)hideAnimated:(BOOL)animated {
-    float fromOpacity = ((CALayer *)_gradient.presentationLayer ?: _gradient).opacity;
     _visible = NO;
+    if (animated && _level > 0) return;   // the frames fade it out
+    _level = 0;
+    _speed = CGPointZero;
     _displayLink.paused = YES;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     [_gradient removeAllAnimations];
     _gradient.opacity = 0;
     [CATransaction commit];
-    if (animated && fromOpacity > 0) {
-        CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
-        fade.fromValue = @(fromOpacity);
-        fade.toValue = @0.0;
-        fade.duration = 0.18;
-        [_gradient addAnimation:fade forKey:@"fade"];
-    }
 }
 @end
 
@@ -473,88 +521,141 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
                        -8.0, -8.0);
 }
 
-// The selection outline is one layer that glides from card to card on a
-// spring, like focus on Apple TV, instead of jumping.
+// The selected card is a copy of it in its own layer, a little larger and
+// outlined. It fades in on the new card while the previous one fades out and
+// shrinks back, instead of an outline gliding from card to card.
+static const CGFloat kSelectedCardScale = 1.08;
+
+// The card exactly as drawRect draws it, as an image for the selection layer.
+- (id)cardImageForIndex:(NSInteger)index rect:(NSRect)rect {
+    CGFloat scale = self.window.backingScaleFactor ?: 2.0;
+    size_t pixelsWide = (size_t)ceil(NSWidth(rect) * scale);
+    size_t pixelsHigh = (size_t)ceil(NSHeight(rect) * scale);
+    if (pixelsWide == 0 || pixelsHigh == 0) return nil;
+    CGColorSpaceRef sRGB = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef bitmap = CGBitmapContextCreate(NULL, pixelsWide, pixelsHigh, 8, 0, sRGB,
+                                                (CGBitmapInfo)kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Host);
+    CGColorSpaceRelease(sRGB);
+    if (!bitmap) return nil;
+    CGContextScaleCTM(bitmap, scale, scale);
+    CGContextTranslateCTM(bitmap, -NSMinX(rect), -NSMinY(rect));
+    NSUInteger count = self.entries.count;
+    CGFloat radiusX = self.ringRadius, radiusY = self.ringRadius;
+    ringEllipseRadii(count, self.ringRadius, &radiusX, &radiusY);
+    CGFloat cardWidth = safeCardWidthForRing(count, radiusX, radiusY, NSWidth(self.bounds));
+    [NSGraphicsContext saveGraphicsState];
+    NSGraphicsContext.currentContext = [NSGraphicsContext graphicsContextWithCGContext:bitmap flipped:NO];
+    [self drawCardForEntry:self.entries[(NSUInteger)index]
+                  atCenter:NSMakePoint(NSMidX(rect), NSMidY(rect))
+                 cardWidth:cardWidth];
+    [NSGraphicsContext restoreGraphicsState];
+    CGImageRef image = CGBitmapContextCreateImage(bitmap);
+    CGContextRelease(bitmap);
+    return CFBridgingRelease(image);
+}
+
+// Places the selection layer on its card and paints the card into it.
+- (void)fillFocusLayer:(CALayer *)focus index:(NSInteger)index {
+    NSRect rect = [self cardRectForIndex:index];
+    focus.bounds = CGRectMake(0, 0, NSWidth(rect), NSHeight(rect));
+    focus.position = CGPointMake(NSMidX(rect), NSMidY(rect));
+    focus.contentsScale = self.window.backingScaleFactor ?: 2.0;
+    focus.contents = [self cardImageForIndex:index rect:rect];
+    CGPathRef outline = CGPathCreateWithRoundedRect(focus.bounds, 8.0, 8.0, NULL);
+    focus.shadowPath = outline;
+    CGPathRelease(outline);
+}
+
 - (void)updateFocusAnimated:(BOOL)animated {
-    if (!self.focusLayer) {
-        CALayer *focus = [CALayer layer];
-        NSColor *accent = [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.95];
-        focus.borderColor = accent.CGColor;
-        focus.borderWidth = 2.5;
-        focus.cornerRadius = 8.0;
-        focus.shadowColor = accent.CGColor;
-        focus.shadowOpacity = 0.9;
-        focus.shadowRadius = 9.0;
-        focus.shadowOffset = CGSizeZero;
-        focus.opacity = 0;
-        [self.layer addSublayer:focus];
-        self.focusLayer = focus;
-    }
-    CALayer *focus = self.focusLayer;
     NSInteger index = self.selectedIndex;
-    if (index < 0 || index >= (NSInteger)self.entries.count) {
-        float fromOpacity = ((CALayer *)focus.presentationLayer ?: focus).opacity;
+    BOOL hasSelection = index >= 0 && index < (NSInteger)self.entries.count;
+    if (hasSelection && self.focusLayer && self.focusIndex == index) return;
+
+    CALayer *previous = self.focusLayer;
+    self.focusLayer = nil;
+    if (previous) {
+        CALayer *shown = (CALayer *)previous.presentationLayer ?: previous;
+        NSNumber *fromOpacity = @(shown.opacity);
+        NSNumber *fromScale = [shown valueForKeyPath:@"transform.scale"] ?: @(kSelectedCardScale);
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
-        focus.opacity = 0;
-        [CATransaction commit];
-        if (animated && fromOpacity > 0) {
+        [CATransaction setCompletionBlock:^{ [previous removeFromSuperlayer]; }];
+        [previous removeAllAnimations];
+        previous.opacity = 0;
+        previous.transform = CATransform3DIdentity;
+        if (animated) {
             CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
-            fade.fromValue = @(fromOpacity);
+            fade.fromValue = fromOpacity;
             fade.toValue = @0.0;
-            fade.duration = 0.12;
-            [focus addAnimation:fade forKey:@"fade"];
+            CABasicAnimation *shrink = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+            shrink.fromValue = fromScale;
+            shrink.toValue = @1.0;
+            CAAnimationGroup *leave = [CAAnimationGroup animation];
+            leave.animations = @[fade, shrink];
+            leave.duration = 0.16;
+            leave.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+            [previous addAnimation:leave forKey:@"leave"];
         }
-        return;
+        [CATransaction commit];
     }
+    if (!hasSelection) return;
 
-    NSRect rect = [self cardRectForIndex:index];
-    CGPoint position = CGPointMake(NSMidX(rect), NSMidY(rect));
-    CGRect bounds = CGRectMake(0, 0, NSWidth(rect), NSHeight(rect));
-    BOOL wasHidden = focus.opacity < 0.5;
-    if (!wasHidden && CGPointEqualToPoint(focus.position, position) && CGRectEqualToRect(focus.bounds, bounds)) return;
-    CALayer *shown = (CALayer *)focus.presentationLayer ?: focus;
-    NSValue *fromPosition = [NSValue valueWithPoint:NSPointFromCGPoint(shown.position)];
-    NSValue *fromBounds = [NSValue valueWithRect:NSRectFromCGRect(shown.bounds)];
-
+    CALayer *focus = [CALayer layer];
+    NSColor *accent = [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.95];
+    focus.contentsGravity = kCAGravityResize;
+    focus.borderColor = accent.CGColor;
+    focus.borderWidth = 2.5;
+    focus.cornerRadius = 8.0;
+    focus.shadowColor = accent.CGColor;
+    focus.shadowOpacity = 0.9;
+    focus.shadowRadius = 9.0;
+    focus.shadowOffset = CGSizeZero;
+    focus.zPosition = 5;   // above the cards, under the pointer
+    [self fillFocusLayer:focus index:index];
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    [focus removeAnimationForKey:@"fade"];
-    focus.position = position;
-    focus.bounds = bounds;
-    focus.opacity = 1;
+    focus.transform = CATransform3DMakeScale(kSelectedCardScale, kSelectedCardScale, 1);
+    [self.layer addSublayer:focus];
+    if (animated) {
+        CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
+        fade.fromValue = @0.0;
+        fade.toValue = @1.0;
+        fade.duration = 0.16;
+        fade.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+        [focus addAnimation:fade forKey:@"fade"];
+        CASpringAnimation *zoom = [CASpringAnimation animationWithKeyPath:@"transform.scale"];
+        zoom.fromValue = @1.0;
+        zoom.toValue = @(kSelectedCardScale);
+        zoom.stiffness = 320;
+        zoom.damping = 24;
+        zoom.duration = zoom.settlingDuration;
+        [focus addAnimation:zoom forKey:@"zoom"];
+    }
     [CATransaction commit];
-    if (!animated) return;
+    self.focusLayer = focus;
+    self.focusIndex = index;
+}
 
-    if (wasHidden) {
-        // First selection: a quick pop into place.
-        CASpringAnimation *pop = [CASpringAnimation animationWithKeyPath:@"transform.scale"];
-        pop.fromValue = @0.92;
-        pop.toValue = @1.0;
-        pop.stiffness = 420;
-        pop.damping = 26;
-        pop.duration = pop.settlingDuration;
-        [focus addAnimation:pop forKey:@"pop"];
+// A picture that arrived while the card is selected, or a card that changed
+// size, is copied into the selection layer without animating it again.
+- (void)refreshFocusContents {
+    CALayer *focus = self.focusLayer;
+    if (!focus) return;
+    if (self.focusIndex != self.selectedIndex || self.focusIndex >= (NSInteger)self.entries.count) {
+        [self updateFocusAnimated:NO];
         return;
     }
-    for (NSString *keyPath in @[@"position", @"bounds"]) {
-        CASpringAnimation *glide = [CASpringAnimation animationWithKeyPath:keyPath];
-        glide.fromValue = [keyPath isEqualToString:@"position"] ? fromPosition : fromBounds;
-        glide.toValue = [keyPath isEqualToString:@"position"]
-            ? [NSValue valueWithPoint:NSPointFromCGPoint(position)]
-            : [NSValue valueWithRect:NSRectFromCGRect(bounds)];
-        glide.stiffness = 380;
-        glide.damping = 32;      // settles in about a quarter second, a hint of overshoot
-        glide.duration = glide.settlingDuration;
-        [focus addAnimation:glide forKey:keyPath];
-    }
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [self fillFocusLayer:focus index:self.focusIndex];
+    [CATransaction commit];
 }
 
 - (void)resetSelectionVisuals {
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    [self.focusLayer removeAllAnimations];
-    self.focusLayer.opacity = 0;
+    [self.focusLayer removeFromSuperlayer];
+    self.focusLayer = nil;
     [CATransaction commit];
     [(SectorGlowView *)self.glowView hideAnimated:NO];
 }
@@ -653,9 +754,10 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
 
 - (void)drawRect:(NSRect)dirtyRect {
     [super drawRect:dirtyRect];
-    if (self.selectedIndex >= 0) {
-        // A picture that just arrived can change the card's size.
-        dispatch_async(dispatch_get_main_queue(), ^{ [self updateFocusAnimated:YES]; });
+    NSRect selectedCard = [self cardRectForIndex:self.focusIndex];
+    if (self.focusLayer && NSIntersectsRect(NSInsetRect(selectedCard, -30.0, -30.0), dirtyRect)) {
+        // A picture that just arrived can change the selected card.
+        dispatch_async(dispatch_get_main_queue(), ^{ [self refreshFocusContents]; });
     }
     NSRect bounds = self.bounds;
     NSPoint center = self.anchorPoint;
@@ -707,182 +809,186 @@ static void cardSector(NSInteger i, NSUInteger count, CGFloat *startAngle, CGFlo
         NSRect cardArea = NSInsetRect(NSMakeRect(itemCenter.x - previewWidth / 2.0, itemCenter.y - cardHeight / 2.0,
                                                  previewWidth, cardHeight), -30.0, -30.0);
         if (!NSIntersectsRect(cardArea, dirtyRect)) continue;
-        // The glide-in outline layer marks the selection; cards draw unselected.
-        BOOL selected = NO;
-        RingEntry *entry = self.entries[i];
-        NSImage *thumbnail = resolvedThumbnail(entry);
-        if (thumbnail) {
-            CGFloat itemPreviewWidth = previewWidth;
-            CGFloat previewHeight = itemPreviewWidth * 0.60;
-            CGFloat previewY = itemCenter.y - previewHeight / 2;
-            NSRect previewRect = NSMakeRect(itemCenter.x - itemPreviewWidth / 2,
-                                            previewY, itemPreviewWidth, previewHeight);
+        [self drawCardForEntry:self.entries[i] atCenter:itemCenter cardWidth:cardWidth];
+    }
+}
 
-            // 1. Drop shadow behind the card
-            [NSGraphicsContext saveGraphicsState];
-            NSShadow *shadow = [NSShadow new];
-            shadow.shadowBlurRadius = selected ? 18.0 : 14.0;
-            shadow.shadowColor = selected ? [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.40]
-                                          : [NSColor colorWithCalibratedWhite:0.0 alpha:0.45];
-            shadow.shadowOffset = NSMakeSize(0, -3);
-            [shadow set];
-            NSBezierPath *backPath = [NSBezierPath bezierPathWithRoundedRect:previewRect xRadius:8.0 yRadius:8.0];
-            [[NSColor colorWithCalibratedWhite:0.12 alpha:1.0] setFill];
-            [backPath fill];
-            [NSGraphicsContext restoreGraphicsState];
+// One card around itemCenter: a preview for windows with a picture and for
+// Chrome tabs, a smaller icon card otherwise.
+- (void)drawCardForEntry:(RingEntry *)entry atCenter:(NSPoint)itemCenter cardWidth:(CGFloat)cardWidth {
+    CGFloat previewWidth = cardWidth * 0.94;
+    // The selection layer marks the selection; cards draw unselected.
+    BOOL selected = NO;
+    NSImage *thumbnail = resolvedThumbnail(entry);
+    if (thumbnail) {
+        CGFloat itemPreviewWidth = previewWidth;
+        CGFloat previewHeight = itemPreviewWidth * 0.60;
+        CGFloat previewY = itemCenter.y - previewHeight / 2;
+        NSRect previewRect = NSMakeRect(itemCenter.x - itemPreviewWidth / 2,
+                                        previewY, itemPreviewWidth, previewHeight);
 
-            // 2. Clip thumbnail with rounded corners: cornerRadius = 8.0
-            [NSGraphicsContext saveGraphicsState];
-            NSBezierPath *clipPath = [NSBezierPath bezierPathWithRoundedRect:previewRect xRadius:8.0 yRadius:8.0];
-            [clipPath addClip];
-            // Fill the card without stretching; trim the sides of wide windows
-            // and the bottom of tall ones, so the title bar stays visible.
-            NSSize imageSize = thumbnail.size;
-            NSRect sourceRect = NSMakeRect(0, 0, imageSize.width, imageSize.height);
-            CGFloat cardAspect = itemPreviewWidth / previewHeight;
-            if (imageSize.width > 0 && imageSize.height > 0) {
-                if (imageSize.width / imageSize.height > cardAspect) {
-                    sourceRect.size.width = imageSize.height * cardAspect;
-                    sourceRect.origin.x = (imageSize.width - sourceRect.size.width) / 2.0;
-                } else {
-                    sourceRect.size.height = imageSize.width / cardAspect;
-                    sourceRect.origin.y = imageSize.height - sourceRect.size.height;
-                }
-            }
-            [thumbnail drawInRect:previewRect
-                         fromRect:sourceRect
-                        operation:NSCompositingOperationSourceOver
-                         fraction:1.0];
-            [NSGraphicsContext restoreGraphicsState];
+        // 1. Drop shadow behind the card
+        [NSGraphicsContext saveGraphicsState];
+        NSShadow *shadow = [NSShadow new];
+        shadow.shadowBlurRadius = selected ? 18.0 : 14.0;
+        shadow.shadowColor = selected ? [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.40]
+                                      : [NSColor colorWithCalibratedWhite:0.0 alpha:0.45];
+        shadow.shadowOffset = NSMakeSize(0, -3);
+        [shadow set];
+        NSBezierPath *backPath = [NSBezierPath bezierPathWithRoundedRect:previewRect xRadius:8.0 yRadius:8.0];
+        [[NSColor colorWithCalibratedWhite:0.12 alpha:1.0] setFill];
+        [backPath fill];
+        [NSGraphicsContext restoreGraphicsState];
 
-            BOOL isFinderEntry = [entry.application.bundleIdentifier isEqualToString:@"com.apple.finder"];
-            CGFloat badgeWidth = drawCardBadgeIcon(entry, previewRect);
-            if (shouldDrawCardLabel(entry)) {
-                drawCardLabel(cardLabelText(entry), previewRect, isFinderEntry && entry.folderPath.length > 0, badgeWidth);
-            }
-
-            // 4. Draw clean border around the card
-            [NSGraphicsContext saveGraphicsState];
-            NSBezierPath *borderPath = [NSBezierPath bezierPathWithRoundedRect:previewRect xRadius:8.0 yRadius:8.0];
-            if (selected) {
-                NSShadow *glow = [NSShadow new];
-                glow.shadowBlurRadius = 8.0;
-                glow.shadowColor = [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.75];
-                glow.shadowOffset = NSMakeSize(0, 0);
-                [glow set];
-                borderPath.lineWidth = 2.5;
-                [[NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.95] setStroke];
-                [borderPath stroke];
+        // 2. Clip thumbnail with rounded corners: cornerRadius = 8.0
+        [NSGraphicsContext saveGraphicsState];
+        NSBezierPath *clipPath = [NSBezierPath bezierPathWithRoundedRect:previewRect xRadius:8.0 yRadius:8.0];
+        [clipPath addClip];
+        // Fill the card without stretching; trim the sides of wide windows
+        // and the bottom of tall ones, so the title bar stays visible.
+        NSSize imageSize = thumbnail.size;
+        NSRect sourceRect = NSMakeRect(0, 0, imageSize.width, imageSize.height);
+        CGFloat cardAspect = itemPreviewWidth / previewHeight;
+        if (imageSize.width > 0 && imageSize.height > 0) {
+            if (imageSize.width / imageSize.height > cardAspect) {
+                sourceRect.size.width = imageSize.height * cardAspect;
+                sourceRect.origin.x = (imageSize.width - sourceRect.size.width) / 2.0;
             } else {
-                borderPath.lineWidth = 1.5;
-                [[NSColor colorWithCalibratedWhite:1.0 alpha:0.22] setStroke];
-                [borderPath stroke];
+                sourceRect.size.height = imageSize.width / cardAspect;
+                sourceRect.origin.y = imageSize.height - sourceRect.size.height;
             }
-            [NSGraphicsContext restoreGraphicsState];
-        } else if ([entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"]) {
-            // Chrome tabs share one CG window, so inactive tabs often have no
-            // screenshot. Keep the same card size and show title + site instead
-            // of a bare Chrome icon.
-            CGFloat cardHeight = previewWidth * 0.60;
-            NSRect cardRect = NSMakeRect(itemCenter.x - previewWidth / 2,
-                                         itemCenter.y - cardHeight / 2,
-                                         previewWidth, cardHeight);
-            NSString *host = chromeHostFromEntry(entry);
-            CGFloat hue = (CGFloat)(host.hash % 360) / 360.0;
-            NSColor *topColor = [NSColor colorWithCalibratedHue:hue saturation:0.48 brightness:0.27 alpha:1.0];
-            NSColor *bottomColor = [NSColor colorWithCalibratedHue:hue saturation:0.37 brightness:0.13 alpha:1.0];
-            NSBezierPath *cardPath = [NSBezierPath bezierPathWithRoundedRect:cardRect xRadius:8 yRadius:8];
-            [NSGraphicsContext saveGraphicsState];
-            NSShadow *shadow = [NSShadow new];
-            shadow.shadowBlurRadius = selected ? 18.0 : 14.0;
-            shadow.shadowColor = [NSColor colorWithCalibratedWhite:0 alpha:0.45];
-            shadow.shadowOffset = NSMakeSize(0, -3);
-            [shadow set];
-            [[NSColor colorWithCalibratedWhite:0.12 alpha:1.0] setFill];
-            [cardPath fill];
-            [NSGraphicsContext restoreGraphicsState];
-            NSGradient *gradient = [[NSGradient alloc] initWithStartingColor:topColor endingColor:bottomColor];
-            [gradient drawInBezierPath:cardPath angle:90];
+        }
+        [thumbnail drawInRect:previewRect
+                     fromRect:sourceRect
+                    operation:NSCompositingOperationSourceOver
+                     fraction:1.0];
+        [NSGraphicsContext restoreGraphicsState];
 
-            CGFloat inset = MIN(20.0, previewWidth * 0.07);
-            CGFloat iconSize = MIN(38.0, cardHeight * 0.25);
-            NSImage *siteIcon = atomic_load(&g_settingShowSiteIcons) ? RingFaviconForURL(entry.tabURL) : nil;
-            [(siteIcon ?: entry.icon) drawInRect:NSMakeRect(NSMinX(cardRect) + inset,
-                                                            NSMaxY(cardRect) - inset - iconSize,
-                                                            iconSize, iconSize)];
-            NSMutableParagraphStyle *titleStyle = [NSMutableParagraphStyle new];
-            titleStyle.lineBreakMode = NSLineBreakByTruncatingTail;
-            NSDictionary *titleAttributes = @{
-                NSFontAttributeName: [NSFont systemFontOfSize:MIN(18.0, previewWidth * 0.063) weight:NSFontWeightSemibold],
-                NSForegroundColorAttributeName: NSColor.whiteColor,
-                NSParagraphStyleAttributeName: titleStyle
-            };
-            NSString *title = chromeDisplayTitle(entry);
-            [title drawInRect:NSMakeRect(NSMinX(cardRect) + inset,
-                                         NSMinY(cardRect) + cardHeight * 0.28,
-                                         previewWidth - inset * 2,
-                                         cardHeight * 0.35)
-                   withAttributes:titleAttributes];
-            NSDictionary *hostAttributes = @{
-                NSFontAttributeName: [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium],
-                NSForegroundColorAttributeName: [NSColor colorWithCalibratedWhite:0.87 alpha:1.0],
-                NSParagraphStyleAttributeName: titleStyle
-            };
-            [host drawInRect:NSMakeRect(NSMinX(cardRect) + inset,
-                                        NSMinY(cardRect) + inset - 1,
-                                        previewWidth - inset * 2,
-                                        18)
-                  withAttributes:hostAttributes];
-            cardPath.lineWidth = selected ? 2.5 : 1.5;
-            NSColor *borderColor = selected
-                ? [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.95]
-                : [NSColor colorWithCalibratedWhite:1.0 alpha:0.22];
-            [borderColor setStroke];
-            [cardPath stroke];
-        } else {
-            CGFloat iconSize = MIN(140, MAX(54, cardWidth * 0.42));
-            NSRect iconRect = NSMakeRect(itemCenter.x - iconSize / 2,
-                                         itemCenter.y - iconSize / 2, iconSize, iconSize);
-            NSRect iconCardRect = NSInsetRect(iconRect, -8.0, -8.0);
-
-            [NSGraphicsContext saveGraphicsState];
-            NSShadow *iconShadow = [NSShadow new];
-            iconShadow.shadowBlurRadius = selected ? 18.0 : 14.0;
-            iconShadow.shadowColor = selected ? [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.40]
-                                              : [NSColor colorWithCalibratedWhite:0.0 alpha:0.45];
-            iconShadow.shadowOffset = NSMakeSize(0, -3);
-            [iconShadow set];
-            NSBezierPath *iconBackPath = [NSBezierPath bezierPathWithRoundedRect:iconCardRect xRadius:8.0 yRadius:8.0];
-            [[NSColor colorWithCalibratedWhite:0.12 alpha:1.0] setFill];
-            [iconBackPath fill];
-            [NSGraphicsContext restoreGraphicsState];
-
-            [entry.icon drawInRect:iconRect];
-            BOOL isFinderIcon = [entry.application.bundleIdentifier isEqualToString:@"com.apple.finder"];
-            if (shouldDrawCardLabel(entry)) {
-                drawCardLabel(cardLabelText(entry), iconCardRect, isFinderIcon && entry.folderPath.length > 0, 0);
-            }
-
-            [NSGraphicsContext saveGraphicsState];
-            NSBezierPath *iconBorderPath = [NSBezierPath bezierPathWithRoundedRect:iconCardRect xRadius:8.0 yRadius:8.0];
-            if (selected) {
-                NSShadow *iconGlow = [NSShadow new];
-                iconGlow.shadowBlurRadius = 8.0;
-                iconGlow.shadowColor = [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.75];
-                iconGlow.shadowOffset = NSMakeSize(0, 0);
-                [iconGlow set];
-                iconBorderPath.lineWidth = 2.5;
-                [[NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.95] setStroke];
-            } else {
-                iconBorderPath.lineWidth = 1.5;
-                [[NSColor colorWithCalibratedWhite:1.0 alpha:0.22] setStroke];
-            }
-            [iconBorderPath stroke];
-            [NSGraphicsContext restoreGraphicsState];
+        BOOL isFinderEntry = [entry.application.bundleIdentifier isEqualToString:@"com.apple.finder"];
+        CGFloat badgeWidth = drawCardBadgeIcon(entry, previewRect);
+        if (shouldDrawCardLabel(entry)) {
+            drawCardLabel(cardLabelText(entry), previewRect, isFinderEntry && entry.folderPath.length > 0, badgeWidth);
         }
 
-    }
+        // 4. Draw clean border around the card
+        [NSGraphicsContext saveGraphicsState];
+        NSBezierPath *borderPath = [NSBezierPath bezierPathWithRoundedRect:previewRect xRadius:8.0 yRadius:8.0];
+        if (selected) {
+            NSShadow *glow = [NSShadow new];
+            glow.shadowBlurRadius = 8.0;
+            glow.shadowColor = [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.75];
+            glow.shadowOffset = NSMakeSize(0, 0);
+            [glow set];
+            borderPath.lineWidth = 2.5;
+            [[NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.95] setStroke];
+            [borderPath stroke];
+        } else {
+            borderPath.lineWidth = 1.5;
+            [[NSColor colorWithCalibratedWhite:1.0 alpha:0.22] setStroke];
+            [borderPath stroke];
+        }
+        [NSGraphicsContext restoreGraphicsState];
+    } else if ([entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"]) {
+        // Chrome tabs share one CG window, so inactive tabs often have no
+        // screenshot. Keep the same card size and show title + site instead
+        // of a bare Chrome icon.
+        CGFloat cardHeight = previewWidth * 0.60;
+        NSRect cardRect = NSMakeRect(itemCenter.x - previewWidth / 2,
+                                     itemCenter.y - cardHeight / 2,
+                                     previewWidth, cardHeight);
+        NSString *host = chromeHostFromEntry(entry);
+        CGFloat hue = (CGFloat)(host.hash % 360) / 360.0;
+        NSColor *topColor = [NSColor colorWithCalibratedHue:hue saturation:0.48 brightness:0.27 alpha:1.0];
+        NSColor *bottomColor = [NSColor colorWithCalibratedHue:hue saturation:0.37 brightness:0.13 alpha:1.0];
+        NSBezierPath *cardPath = [NSBezierPath bezierPathWithRoundedRect:cardRect xRadius:8 yRadius:8];
+        [NSGraphicsContext saveGraphicsState];
+        NSShadow *shadow = [NSShadow new];
+        shadow.shadowBlurRadius = selected ? 18.0 : 14.0;
+        shadow.shadowColor = [NSColor colorWithCalibratedWhite:0 alpha:0.45];
+        shadow.shadowOffset = NSMakeSize(0, -3);
+        [shadow set];
+        [[NSColor colorWithCalibratedWhite:0.12 alpha:1.0] setFill];
+        [cardPath fill];
+        [NSGraphicsContext restoreGraphicsState];
+        NSGradient *gradient = [[NSGradient alloc] initWithStartingColor:topColor endingColor:bottomColor];
+        [gradient drawInBezierPath:cardPath angle:90];
 
+        CGFloat inset = MIN(20.0, previewWidth * 0.07);
+        CGFloat iconSize = MIN(38.0, cardHeight * 0.25);
+        NSImage *siteIcon = atomic_load(&g_settingShowSiteIcons) ? RingFaviconForURL(entry.tabURL) : nil;
+        [(siteIcon ?: entry.icon) drawInRect:NSMakeRect(NSMinX(cardRect) + inset,
+                                                        NSMaxY(cardRect) - inset - iconSize,
+                                                        iconSize, iconSize)];
+        NSMutableParagraphStyle *titleStyle = [NSMutableParagraphStyle new];
+        titleStyle.lineBreakMode = NSLineBreakByTruncatingTail;
+        NSDictionary *titleAttributes = @{
+            NSFontAttributeName: [NSFont systemFontOfSize:MIN(18.0, previewWidth * 0.063) weight:NSFontWeightSemibold],
+            NSForegroundColorAttributeName: NSColor.whiteColor,
+            NSParagraphStyleAttributeName: titleStyle
+        };
+        NSString *title = chromeDisplayTitle(entry);
+        [title drawInRect:NSMakeRect(NSMinX(cardRect) + inset,
+                                     NSMinY(cardRect) + cardHeight * 0.28,
+                                     previewWidth - inset * 2,
+                                     cardHeight * 0.35)
+               withAttributes:titleAttributes];
+        NSDictionary *hostAttributes = @{
+            NSFontAttributeName: [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium],
+            NSForegroundColorAttributeName: [NSColor colorWithCalibratedWhite:0.87 alpha:1.0],
+            NSParagraphStyleAttributeName: titleStyle
+        };
+        [host drawInRect:NSMakeRect(NSMinX(cardRect) + inset,
+                                    NSMinY(cardRect) + inset - 1,
+                                    previewWidth - inset * 2,
+                                    18)
+              withAttributes:hostAttributes];
+        cardPath.lineWidth = selected ? 2.5 : 1.5;
+        NSColor *borderColor = selected
+            ? [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.95]
+            : [NSColor colorWithCalibratedWhite:1.0 alpha:0.22];
+        [borderColor setStroke];
+        [cardPath stroke];
+    } else {
+        CGFloat iconSize = MIN(140, MAX(54, cardWidth * 0.42));
+        NSRect iconRect = NSMakeRect(itemCenter.x - iconSize / 2,
+                                     itemCenter.y - iconSize / 2, iconSize, iconSize);
+        NSRect iconCardRect = NSInsetRect(iconRect, -8.0, -8.0);
+
+        [NSGraphicsContext saveGraphicsState];
+        NSShadow *iconShadow = [NSShadow new];
+        iconShadow.shadowBlurRadius = selected ? 18.0 : 14.0;
+        iconShadow.shadowColor = selected ? [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.40]
+                                          : [NSColor colorWithCalibratedWhite:0.0 alpha:0.45];
+        iconShadow.shadowOffset = NSMakeSize(0, -3);
+        [iconShadow set];
+        NSBezierPath *iconBackPath = [NSBezierPath bezierPathWithRoundedRect:iconCardRect xRadius:8.0 yRadius:8.0];
+        [[NSColor colorWithCalibratedWhite:0.12 alpha:1.0] setFill];
+        [iconBackPath fill];
+        [NSGraphicsContext restoreGraphicsState];
+
+        [entry.icon drawInRect:iconRect];
+        BOOL isFinderIcon = [entry.application.bundleIdentifier isEqualToString:@"com.apple.finder"];
+        if (shouldDrawCardLabel(entry)) {
+            drawCardLabel(cardLabelText(entry), iconCardRect, isFinderIcon && entry.folderPath.length > 0, 0);
+        }
+
+        [NSGraphicsContext saveGraphicsState];
+        NSBezierPath *iconBorderPath = [NSBezierPath bezierPathWithRoundedRect:iconCardRect xRadius:8.0 yRadius:8.0];
+        if (selected) {
+            NSShadow *iconGlow = [NSShadow new];
+            iconGlow.shadowBlurRadius = 8.0;
+            iconGlow.shadowColor = [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.75];
+            iconGlow.shadowOffset = NSMakeSize(0, 0);
+            [iconGlow set];
+            iconBorderPath.lineWidth = 2.5;
+            [[NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.95] setStroke];
+        } else {
+            iconBorderPath.lineWidth = 1.5;
+            [[NSColor colorWithCalibratedWhite:1.0 alpha:0.22] setStroke];
+        }
+        [iconBorderPath stroke];
+        [NSGraphicsContext restoreGraphicsState];
+    }
 }
 @end
 
@@ -1587,6 +1693,7 @@ static void showRing(uint64_t generation) {
     // The cached ring is already on screen. Fresh pictures of the visible
     // windows, above all the one being left, replace it as they arrive.
     refreshThumbnailsNow(0, 1.0);
+    loadHiddenChromeTabs(generation);
 
     // Pruning may issue CG/AX queries. Run it after the cached ring is already
     // visible, away from the main queue and gesture-start path.
@@ -1605,6 +1712,16 @@ static void activateApplication(NSRunningApplication *application) {
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     // Only the application, not every one of its windows.
     [application activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+#pragma clang diagnostic pop
+}
+
+// Our own settings window in front of every other app, as Diktat does it.
+// The newer [NSApp activate] only asks, and macOS kept the window behind the
+// app that was active when the menu bar icon was clicked.
+static void activateSelf(void) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    [NSApp activateIgnoringOtherApps:YES];
 #pragma clang diagnostic pop
 }
 
@@ -1834,6 +1951,11 @@ static void finishGesture(uint64_t generation, NSInteger selection) {
         }
     }
     if (generation != atomic_load(&g_gestureGeneration)) return;
+    // Hidden Chrome tabs shown for their pictures are put back, except in the
+    // window of the card being picked.
+    RingEntry *picked = selection >= 0 && selection < (NSInteger)g_windowEntries.count
+        ? g_windowEntries[(NSUInteger)selection] : nil;
+    setRingPick(picked != nil, picked.isTab ? picked.chromeWindowID : nil);
     atomic_store(&g_gestureActive, false);
     atomic_store(&g_gestureEnding, false);
     if (g_panel) [g_panel orderOut:nil];
@@ -2353,6 +2475,31 @@ static void populateThumbnailsFromCache(NSArray<RingEntry *> *entries) {
         }
     }
     }
+}
+
+// A window off this desktop that was never captured could only show its app
+// icon, and such cards (a Terminal helper, a window left in another Space)
+// usually did not open anything. They stay out of the ring until the window is
+// on screen and gets its picture. Chrome tabs keep their title card.
+static NSArray<RingEntry *> *entriesWorthShowing(NSArray<RingEntry *> *entries) {
+    // Without Screen Recording no card has a picture; keep them all.
+    if (!g_thumbnailPreviewsEnabled || !CGPreflightScreenCaptureAccess()) return entries;
+    NSMutableSet<NSNumber *> *onScreenIDs = [NSMutableSet set];
+    CFArrayRef onScreen = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+                                                     kCGNullWindowID);
+    if (onScreen) {
+        for (NSDictionary *info in (__bridge NSArray *)onScreen) {
+            if (info[(id)kCGWindowNumber]) [onScreenIDs addObject:info[(id)kCGWindowNumber]];
+        }
+        CFRelease(onScreen);
+    }
+    NSIndexSet *shown = [entries indexesOfObjectsPassingTest:^BOOL(RingEntry *entry, NSUInteger index, BOOL *stop) {
+        (void)index; (void)stop;
+        return entry.thumbnailData.length > 0 ||
+            [entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"] ||
+            [onScreenIDs containsObject:@(entry.windowID)];
+    }];
+    return shown.count == entries.count ? entries : [entries objectsAtIndexes:shown];
 }
 
 // "windowID:tabID" of every open Chrome tab, or nil when that cannot be known
@@ -3682,6 +3829,306 @@ static void scheduleChromeBackgroundPrefetch(NSArray<RingEntry *> *entries) {
 }
 
 
+// Chrome tabs that were never on screen have no picture, because Chrome paints
+// only the tab in front. While the ring is open, its blur hides the windows
+// behind it, so those tabs are loaded and captured there:
+//   1. every such tab is put in front for an instant, which makes Chrome start
+//      loading all of them at once, in the background;
+//   2. one by one, each is put in front again, captured once its page has
+//      loaded, and the tab each window showed before is put back.
+// A Chrome window hidden behind other windows is not painted by Chrome, so it
+// is raised for this (without activating Chrome) and the window that was in
+// front is raised again afterwards. The tab under the fingers goes first.
+static _Atomic(bool) g_hiddenTabLoaderRunning = false;
+static os_unfair_lock g_ringPickLock = OS_UNFAIR_LOCK_INIT;
+static BOOL g_ringPickMade;
+static NSString *g_ringPickedChromeWindow;   // Chrome window of the card just picked
+
+static void setRingPick(BOOL made, NSString *chromeWindowID) {
+    os_unfair_lock_lock(&g_ringPickLock);
+    g_ringPickMade = made;
+    g_ringPickedChromeWindow = [chromeWindowID copy];
+    os_unfair_lock_unlock(&g_ringPickLock);
+}
+
+static BOOL ringPickMade(NSString **chromeWindowOut) {
+    os_unfair_lock_lock(&g_ringPickLock);
+    BOOL made = g_ringPickMade;
+    if (chromeWindowOut) *chromeWindowOut = g_ringPickedChromeWindow;
+    os_unfair_lock_unlock(&g_ringPickLock);
+    return made;
+}
+
+// Puts one tab in front inside its window, without raising the window or Chrome.
+static BOOL showChromeTabQuietly(NSString *windowID, NSString *tabID) {
+    if (!validChromeID(windowID) || !validChromeID(tabID)) return NO;
+    return runChromeScript([NSString stringWithFormat:
+        @"tell application \"Google Chrome\"\n"
+         "try\n"
+         "set targetWindow to first window whose id is \"%@\"\n"
+         "repeat with tabIndex from 1 to count of tabs of targetWindow\n"
+         "if (id of tab tabIndex of targetWindow) as text is \"%@\" then\n"
+         "set active tab index of targetWindow to tabIndex\n"
+         "return \"ok\"\n"
+         "end if\n"
+         "end repeat\n"
+         "end try\n"
+         "end tell\n"
+         "return \"failed\"", windowID, tabID]);
+}
+
+// Moves a Chrome window above the other apps' windows. Chrome stays in the
+// background; only the order of the windows changes.
+static BOOL raiseChromeWindowQuietly(NSString *windowID) {
+    if (!validChromeID(windowID)) return NO;
+    return runChromeScript([NSString stringWithFormat:
+        @"tell application \"Google Chrome\"\n"
+         "try\n"
+         "set index of (first window whose id is \"%@\") to 1\n"
+         "return \"ok\"\n"
+         "end try\n"
+         "end tell\n"
+         "return \"failed\"", windowID]);
+}
+
+static BOOL chromeTabIsLoading(NSString *windowID, NSString *tabID) {
+    if (!validChromeID(windowID) || !validChromeID(tabID)) return NO;
+    NSAppleScript *script = [[NSAppleScript alloc] initWithSource:[NSString stringWithFormat:
+        @"tell application \"Google Chrome\"\n"
+         "return (loading of (first tab of (first window whose id is \"%@\") whose id is \"%@\")) as text\n"
+         "end tell", windowID, tabID]];
+    NSDictionary *error = nil;
+    NSAppleEventDescriptor *result = nil;
+    @synchronized ([NSAppleScript class]) {
+        result = [script executeAndReturnError:&error];
+    }
+    return !error && [result.stringValue isEqualToString:@"true"];
+}
+
+static BOOL ringStillOpen(uint64_t generation) {
+    return generation == atomic_load(&g_gestureGeneration) && atomic_load(&g_gestureActive);
+}
+
+// Chrome stops painting a window that other windows cover completely, and a
+// capture would show the tab that was there before.
+static BOOL windowFullyCovered(CGWindowID windowID) {
+    CFArrayRef windows = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenAboveWindow | kCGWindowListExcludeDesktopElements,
+                                                    windowID);
+    if (!windows) return NO;
+    CGRect bounds = currentWindowBounds(windowID);
+    BOOL covered = NO;
+    for (NSDictionary *info in (__bridge NSArray *)windows) {
+        if ([info[(id)kCGWindowLayer] intValue] != 0 || [info[(id)kCGWindowOwnerPID] intValue] == getpid()) continue;
+        if ([info[(id)kCGWindowAlpha] doubleValue] < 1.0) continue;
+        CGRect above = CGRectNull;
+        if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)info[(id)kCGWindowBounds], &above)) continue;
+        if (!CGRectIsNull(bounds) && CGRectContainsRect(above, bounds)) { covered = YES; break; }
+    }
+    CFRelease(windows);
+    return covered;
+}
+
+// Chrome tabs without a picture in windows on this desktop, on the main
+// queue. The tab under the fingers comes first.
+static NSArray<RingEntry *> *hiddenTabsToLoad(NSSet<NSString *> *tried) {
+    NSArray<RingEntry *> *entries = g_ringView.entries;
+    NSMutableSet<NSNumber *> *onScreenIDs = capturableOnScreenWindowIDs();
+    NSInteger selected = g_ringView.selectedIndex;
+    NSMutableArray<RingEntry *> *tabs = [NSMutableArray array];
+    for (NSInteger i = 0; i < (NSInteger)entries.count; i++) {
+        RingEntry *entry = entries[(NSUInteger)i];
+        if (!entry.isTab || entry.isSelectedTab || entry.thumbnailData.length ||
+            !validChromeID(entry.chromeWindowID) || !validChromeID(entry.chromeTabID) ||
+            ![onScreenIDs containsObject:@(entry.windowID)]) continue;
+        NSString *key = tabThumbnailKey(entry);
+        if ([tried containsObject:key]) continue;
+        @synchronized ([NSMutableDictionary class]) {
+            if (g_tabThumbnailCache[key]) continue;
+        }
+        if (i == selected) [tabs insertObject:entry atIndex:0];
+        else [tabs addObject:entry];
+    }
+    return tabs;
+}
+
+static void storeLoadedTabPicture(NSString *tabKey, CGWindowID windowID, NSString *pageURL, NSData *data) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @synchronized ([NSMutableDictionary class]) {
+            g_tabThumbnailCache[tabKey] = data;
+            g_tabLastCaptured[tabKey] = @(NSProcessInfo.processInfo.systemUptime);
+            if (pageURL) g_tabCachedURL[tabKey] = chromePageIdentity(pageURL) ?: @"";
+            for (RingEntry *entry in g_windowEntries) {
+                if (entry.windowID == windowID && entry.isTab && [tabThumbnailKey(entry) isEqualToString:tabKey]) {
+                    applyThumbnailDataToEntry(entry, data);
+                }
+            }
+        }
+        if (g_ringView && atomic_load(&g_ringOverlayVisible)) [g_ringView setNeedsDisplay:YES];
+    });
+}
+
+static SCWindow *shareableWindow(CGWindowID windowID) {
+    dispatch_semaphore_t listed = dispatch_semaphore_create(0);
+    __block SCWindow *window = nil;
+    [SCShareableContent getShareableContentExcludingDesktopWindows:YES onScreenWindowsOnly:YES
+                                                completionHandler:^(SCShareableContent *content, NSError *error) {
+        (void)error;
+        for (SCWindow *candidate in content.windows) {
+            if (candidate.windowID == windowID) { window = candidate; break; }
+        }
+        dispatch_semaphore_signal(listed);
+    }];
+    if (dispatch_semaphore_wait(listed, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1000 * NSEC_PER_MSEC))) != 0) return nil;
+    return window;
+}
+
+static void loadHiddenChromeTabs(uint64_t generation) {
+    if (!g_thumbnailPreviewsEnabled || !g_liveCaptureQueue || !CGPreflightScreenCaptureAccess() ||
+        !ensureChromeAutomation(NO)) return;
+    NSArray<RingEntry *> *firstTargets = hiddenTabsToLoad([NSSet set]);
+    if (!firstTargets.count) return;
+    if (atomic_exchange(&g_hiddenTabLoaderRunning, true)) return;
+    setRingPick(NO, nil);
+    if (!g_chromePrefetchQueue) {
+        g_chromePrefetchQueue = dispatch_queue_create("touchpad.ring.chrome-prefetch", DISPATCH_QUEUE_SERIAL);
+    }
+    // The window in front now, raised again if a Chrome window had to come up.
+    pid_t frontPID = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;
+    CGWindowID frontWindow = kCGNullWindowID;
+    CFArrayRef onScreen = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+                                                     kCGNullWindowID);
+    if (onScreen) {
+        for (NSDictionary *info in (__bridge NSArray *)onScreen) {
+            if ([info[(id)kCGWindowLayer] intValue] == 0 && [info[(id)kCGWindowOwnerPID] intValue] == frontPID) {
+                frontWindow = [info[(id)kCGWindowNumber] unsignedIntValue];
+                break;
+            }
+        }
+        CFRelease(onScreen);
+    }
+
+    dispatch_async(g_chromePrefetchQueue, ^{
+        NSMutableDictionary<NSString *, NSString *> *originalTabs = [NSMutableDictionary dictionary];
+        NSMutableDictionary<NSString *, NSData *> *lastPicture = [NSMutableDictionary dictionary];
+        NSMutableSet<NSString *> *raisedWindows = [NSMutableSet set];
+        NSMutableSet<NSString *> *tried = [NSMutableSet set];
+        RingMediaIgnoreTabChanges(30.0);
+
+        // 1. Start loading every tab at once. Steps run on the live capture
+        //    queue, so a capture from the ring's opening never sees a tab half
+        //    painted.
+        dispatch_sync(g_liveCaptureQueue, ^{
+            for (RingEntry *entry in firstTargets) {
+                if (!originalTabs[entry.chromeWindowID]) {
+                    NSString *originalTab = chromeActiveTab(entry.chromeWindowID, NULL);
+                    if (!originalTab) continue;
+                    originalTabs[entry.chromeWindowID] = originalTab;
+                }
+                @synchronized ([NSAppleScript class]) {
+                    if (!ringStillOpen(generation)) return;
+                    showChromeTabQuietly(entry.chromeWindowID, entry.chromeTabID);
+                }
+            }
+            for (NSString *chromeWindowID in originalTabs) {
+                @synchronized ([NSAppleScript class]) {
+                    if (!ringStillOpen(generation)) return;
+                    showChromeTabQuietly(chromeWindowID, originalTabs[chromeWindowID]);
+                }
+            }
+        });
+
+        // 2. Capture them one by one.
+        while (ringStillOpen(generation)) {
+            @autoreleasepool {
+                __block RingEntry *target = nil;
+                dispatch_sync(dispatch_get_main_queue(), ^{ target = hiddenTabsToLoad(tried).firstObject; });
+                if (!target) break;
+                NSString *chromeWindowID = target.chromeWindowID, *tabID = target.chromeTabID;
+                NSString *tabKey = tabThumbnailKey(target);
+                CGWindowID windowID = target.windowID;
+                [tried addObject:tabKey];
+
+                dispatch_sync(g_liveCaptureQueue, ^{
+                    if (!ringStillOpen(generation)) return;
+                    if (windowFullyCovered(windowID) && ![raisedWindows containsObject:chromeWindowID]) {
+                        if (!raiseChromeWindowQuietly(chromeWindowID)) return;
+                        [raisedWindows addObject:chromeWindowID];
+                        usleep(150000);   // Chrome paints the window again
+                    }
+                    if (windowFullyCovered(windowID)) return;
+                    SCWindow *window = shareableWindow(windowID);
+                    if (!window) return;
+                    if (!originalTabs[chromeWindowID]) {
+                        NSString *originalTab = chromeActiveTab(chromeWindowID, NULL);
+                        if (!originalTab) return;
+                        originalTabs[chromeWindowID] = originalTab;
+                    }
+                    if (!lastPicture[chromeWindowID]) {
+                        // The window as it is now, to tell a repainted tab from an unchanged window.
+                        CGImageRef before = captureWindowImage(window);
+                        NSData *beforeData = encodedThumbnailFromCGImage(before);
+                        if (before) CGImageRelease(before);
+                        if (beforeData) lastPicture[chromeWindowID] = beforeData;
+                    }
+                    // Under the Apple Event lock: once the ring has closed, the
+                    // pick may already have switched this window, and wins.
+                    BOOL switched = NO;
+                    @synchronized ([NSAppleScript class]) {
+                        switched = ringStillOpen(generation) && showChromeTabQuietly(chromeWindowID, tabID);
+                    }
+                    if (!switched) return;
+
+                    // Pages started loading in step 1; most are ready by now.
+                    NSTimeInterval started = NSProcessInfo.processInfo.systemUptime;
+                    BOOL loading = YES;
+                    while (ringStillOpen(generation) && NSProcessInfo.processInfo.systemUptime - started < 2.0) {
+                        usleep(60000);
+                        loading = chromeTabIsLoading(chromeWindowID, tabID);
+                        if (!loading) break;
+                    }
+                    // A page still loading would be stored blank; it is tried
+                    // again the next time the ring opens.
+                    if (loading || !ringStillOpen(generation)) return;
+                    usleep(100000);   // a few frames for the page to paint
+                    NSString *pageURL = nil;
+                    if (![chromeActiveTab(chromeWindowID, &pageURL) isEqualToString:tabID]) return;
+                    CGImageRef image = captureWindowImage(window);
+                    NSData *data = encodedThumbnailFromCGImage(image);
+                    if (image) CGImageRelease(image);
+                    // Media that started only because the tab was opened here stops again.
+                    RingMediaQuietLoadedTab(chromeWindowID, tabID);
+                    if (!data || [data isEqualToData:lastPicture[chromeWindowID]]) return;
+                    lastPicture[chromeWindowID] = data;
+                    storeLoadedTabPicture(tabKey, windowID, pageURL, data);
+                    NSLog(@"[Chrome thumbnails] loaded hidden tab %@", tabKey);
+                });
+            }
+        }
+
+        // Put back the tab each window showed, unless the user just picked a
+        // card in that window: the ring switches to it, and the pick wins.
+        // The Apple Event lock orders this against the pick's own switch.
+        for (NSString *chromeWindowID in originalTabs) {
+            @synchronized ([NSAppleScript class]) {
+                NSString *pickedWindow = nil;
+                ringPickMade(&pickedWindow);
+                if ([pickedWindow isEqualToString:chromeWindowID]) continue;
+                NSString *originalTab = originalTabs[chromeWindowID];
+                if (![chromeActiveTab(chromeWindowID, NULL) isEqualToString:originalTab]) {
+                    showChromeTabQuietly(chromeWindowID, originalTab);
+                }
+            }
+        }
+        // A raised Chrome window goes back behind the window that was in
+        // front, unless a card was picked: then that card's window comes up.
+        if (raisedWindows.count && frontWindow != kCGNullWindowID && !ringPickMade(NULL)) {
+            focusWindowExactly(frontPID, frontWindow);
+        }
+        RingMediaIgnoreTabChanges(0.4);
+        atomic_store(&g_hiddenTabLoaderRunning, false);
+    });
+}
+
 static void releaseTabThumbnailRequest(RingEntry *entry) {
     NSString *key = tabThumbnailKey(entry);
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -4439,6 +4886,7 @@ static void scanWindowsNow(void) {
             NSArray<RingEntry *> *entries = collectOpenWindows();
             pruneThumbnailCaches(entries);
             populateThumbnailsFromCache(entries);
+            entries = entriesWorthShowing(entries);
             noteChromeSelectionChanges(entries);
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (!atomic_load(&g_gestureActive)) {
@@ -4793,25 +5241,52 @@ static NSString *lastOutputLine(NSString *output) {
     self.statusItem.button.action = @selector(togglePanel:);
 }
 
+// The window is laid out like Diktat's settings: buttons centered on top and
+// three columns side by side instead of one tall column.
+static const CGFloat kSettingsColumnWidth = 330;
+static const CGFloat kSettingsColumnGap = 22;   // on each side of the divider line
+static const CGFloat kSettingsSectionGap = 26;  // before a section title
+static const CGFloat kSettingsTitleGap = 12;    // after a section title
+
 - (NSTextField *)noteWithText:(NSString *)text {
     NSTextField *note = [NSTextField wrappingLabelWithString:text];
     note.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
     note.textColor = NSColor.secondaryLabelColor;
-    note.preferredMaxLayoutWidth = 312;
+    note.preferredMaxLayoutWidth = kSettingsColumnWidth;
     return note;
 }
 
-- (NSView *)panelContent {
-    NSTextField *title = [NSTextField labelWithString:@"Touchpad Switcher"];
-    title.font = [NSFont boldSystemFontOfSize:13];
+- (NSTextField *)sectionTitle:(NSString *)text {
+    NSTextField *title = [NSTextField labelWithString:text];
+    title.font = [NSFont boldSystemFontOfSize:15];
+    return title;
+}
 
+- (NSStackView *)settingsColumn:(NSArray<NSView *> *)rows {
+    NSStackView *column = [NSStackView stackViewWithViews:rows];
+    column.orientation = NSUserInterfaceLayoutOrientationVertical;
+    column.alignment = NSLayoutAttributeLeading;
+    column.spacing = 8;
+    [column.widthAnchor constraintEqualToConstant:kSettingsColumnWidth].active = YES;
+    // A row wider than the column was centered and lost its left margin.
+    // Rows may not be squeezed: labels gave way first and vanished, instead
+    // of the window growing to fit them.
+    for (NSView *row in rows) {
+        [row.widthAnchor constraintLessThanOrEqualToConstant:kSettingsColumnWidth].active = YES;
+        [row setContentCompressionResistancePriority:NSLayoutPriorityRequired
+                                      forOrientation:NSLayoutConstraintOrientationVertical];
+    }
+    return column;
+}
+
+- (NSView *)panelContent {
     self.gestureWarning = [self noteWithText:
         @"macOS takođe koristi tri prsta (prevlačenje ili prelazak između ekrana), pa se kursor ili ekran pomera dok biraš. "
          "Isključi prevlačenje sa tri prsta u System Settings > Accessibility > Pointer Control > Trackpad Options, "
          "a pokrete za Mission Control i ekrane prebaci na četiri prsta u System Settings > Trackpad > More Gestures."];
     self.gestureWarning.textColor = NSColor.systemOrangeColor;
 
-    NSTextField *groupingLabel = [self noteWithText:@"Kartice"];
+    NSTextField *cardsTitle = [self sectionTitle:@"Kartice"];
     NSSegmentedControl *grouping = [NSSegmentedControl segmentedControlWithLabels:@[@"Prozori i tabovi", @"Samo aplikacije"]
                                                                      trackingMode:NSSegmentSwitchTrackingSelectOne
                                                                            target:self
@@ -4845,7 +5320,7 @@ static NSString *lastOutputLine(NSString *output) {
     pointer.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
     pointer.selectedSegment = atomic_load(&g_settingPointerStyle);
 
-    NSTextField *mouseLabel = [self noteWithText:@"Aktivacija mišem"];
+    NSTextField *mouseTitle = [self sectionTitle:@"Aktivacija mišem"];
     self.mouseActivationLabel = [NSTextField labelWithString:@""];
     self.mouseActivationLabel.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
     [self refreshMouseActivationLabel];
@@ -4869,7 +5344,7 @@ static NSString *lastOutputLine(NSString *output) {
         @"Klikni „Snimi dugme“, pa pritisni željeno dugme miša (Esc otkazuje). Bez držanja: klik otvara meni, pomeri miš ka kartici, pa isto dugme ili levi klik bira. "
          "Logi Back/Forward ne javlja kad je dugme pušteno, pa uvek radi na klik; za držanje mu u Logi Options+ dodeli Middle button."];
 
-    NSTextField *mediaLabel = [self noteWithText:@"Video u Chrome-u"];
+    NSTextField *mediaTitle = [self sectionTitle:@"Video u Chrome-u"];
     NSMutableArray<NSView *> *mediaRows = [NSMutableArray array];
     for (NSInteger row = 0; row < kMediaOptionRowCount; row++) {
         NSButton *box = [NSButton checkboxWithTitle:mediaOptionRow(row).title
@@ -4899,65 +5374,99 @@ static NSString *lastOutputLine(NSString *output) {
     NSSlider *blur = [NSSlider sliderWithValue:atomic_load(&g_settingBlurRadius) minValue:0 maxValue:40
                                         target:self action:@selector(blurRadiusChanged:)];
     blur.controlSize = NSControlSizeSmall;
-    [blur.widthAnchor constraintEqualToConstant:312].active = YES;
-
-    NSBox *separator = [NSBox new];
-    separator.boxType = NSBoxSeparator;
+    [blur.widthAnchor constraintEqualToConstant:kSettingsColumnWidth].active = YES;
 
     NSButton *hideIcon = [NSButton checkboxWithTitle:@"Sakrij ikonicu iz gornje trake"
                                               target:self action:@selector(hideIconChanged:)];
     NSTextField *hideNote = [self noteWithText:@"Ikonica se vraća kad ponovo otvoriš aplikaciju."];
-
     NSButton *startAtLogin = [NSButton checkboxWithTitle:@"Pokreni pri uključivanju računara"
                                                   target:self action:@selector(startAtLoginChanged:)];
     startAtLogin.state = settingBool(CFSTR("StartAtLogin"), YES)
         ? NSControlStateValueOn : NSControlStateValueOff;
 
     NSButton *quit = [NSButton buttonWithTitle:@"Ugasi Touchpad Switcher" target:NSApp action:@selector(terminate:)];
-    quit.controlSize = NSControlSizeSmall;
     NSString *installedVersion = NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"] ?: @"?";
     self.updateButton = [NSButton buttonWithTitle:[NSString stringWithFormat:@"Proveri ažuriranje (%@)", installedVersion]
                                          target:self action:@selector(updateApp:)];
-    self.updateButton.controlSize = NSControlSizeSmall;
     self.updateStatus = [self noteWithText:@""];
     self.updateStatus.hidden = YES;
     NSStackView *buttons = [NSStackView stackViewWithViews:@[self.updateButton, quit]];
     buttons.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     buttons.spacing = 8;
 
-    NSMutableArray<NSView *> *rows = [@[title, self.gestureWarning, groupingLabel, grouping, titlesLabel, titles,
-                                         siteIcons, appIcons, pointerLabel, pointer,
-                                         mouseLabel, self.mouseActivationLabel, mouseButtons, holdToSelect,
-                                         self.mouseLearnStatus, mouseNote, mediaLabel] mutableCopy];
-    [rows addObjectsFromArray:mediaRows];
-    [rows addObjectsFromArray:@[mediaNote, self.javaScriptHint, finderTabs, sounds, self.blurLabel, blur, separator,
-                                hideIcon, hideNote, startAtLogin, buttons, self.updateStatus]];
-    NSStackView *stack = [NSStackView stackViewWithViews:rows];
-    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
-    stack.alignment = NSLayoutAttributeLeading;
-    stack.spacing = 10;
-    stack.edgeInsets = NSEdgeInsetsMake(14, 14, 14, 14);
-    [stack setCustomSpacing:4 afterView:titlesLabel];
-    [stack setCustomSpacing:4 afterView:groupingLabel];
-    [stack setCustomSpacing:4 afterView:pointerLabel];
-    [stack setCustomSpacing:4 afterView:mouseLabel];
-    [stack setCustomSpacing:4 afterView:self.mouseActivationLabel];
-    [stack setCustomSpacing:4 afterView:mouseButtons];
-    [stack setCustomSpacing:4 afterView:holdToSelect];
-    [stack setCustomSpacing:4 afterView:self.mouseLearnStatus];
-    [stack setCustomSpacing:4 afterView:mediaLabel];
-    for (NSView *row in mediaRows) [stack setCustomSpacing:4 afterView:row];
-    [stack setCustomSpacing:4 afterView:mediaNote];
-    [stack setCustomSpacing:4 afterView:hideIcon];
-    [stack setCustomSpacing:4 afterView:self.blurLabel];
-    [stack setCustomSpacing:14 afterView:hideNote];
-    [stack.widthAnchor constraintEqualToConstant:340].active = YES;
-    // A row wider than the panel was centered and lost its left margin.
-    for (NSView *row in stack.arrangedSubviews) {
-        [row.widthAnchor constraintLessThanOrEqualToConstant:312].active = YES;
+    NSTextField *lookTitle = [self sectionTitle:@"Izgled menija"];
+    NSTextField *menuBarTitle = [self sectionTitle:@"Gornja traka"];
+
+    NSStackView *cardsColumn = [self settingsColumn:@[cardsTitle, grouping, titlesLabel, titles, siteIcons, appIcons,
+                                                      finderTabs, lookTitle, pointerLabel, pointer,
+                                                      self.blurLabel, blur, sounds]];
+    [cardsColumn setCustomSpacing:kSettingsTitleGap afterView:cardsTitle];
+    [cardsColumn setCustomSpacing:14 afterView:grouping];
+    [cardsColumn setCustomSpacing:4 afterView:titlesLabel];
+    [cardsColumn setCustomSpacing:14 afterView:titles];
+    [cardsColumn setCustomSpacing:kSettingsSectionGap afterView:finderTabs];
+    [cardsColumn setCustomSpacing:kSettingsTitleGap afterView:lookTitle];
+    [cardsColumn setCustomSpacing:4 afterView:pointerLabel];
+    [cardsColumn setCustomSpacing:14 afterView:pointer];
+    [cardsColumn setCustomSpacing:4 afterView:self.blurLabel];
+    [cardsColumn setCustomSpacing:14 afterView:blur];
+
+    NSStackView *mouseColumn = [self settingsColumn:@[mouseTitle, self.mouseActivationLabel, mouseButtons, holdToSelect,
+                                                      self.mouseLearnStatus, mouseNote, menuBarTitle, hideIcon, hideNote,
+                                                      startAtLogin]];
+    [mouseColumn setCustomSpacing:kSettingsTitleGap afterView:mouseTitle];
+    [mouseColumn setCustomSpacing:kSettingsSectionGap afterView:mouseNote];
+    [mouseColumn setCustomSpacing:kSettingsTitleGap afterView:menuBarTitle];
+    [mouseColumn setCustomSpacing:4 afterView:hideIcon];
+
+    NSMutableArray<NSView *> *mediaColumnRows = [NSMutableArray arrayWithObject:mediaTitle];
+    [mediaColumnRows addObjectsFromArray:mediaRows];
+    [mediaColumnRows addObjectsFromArray:@[mediaNote, self.javaScriptHint]];
+    NSStackView *mediaColumn = [self settingsColumn:mediaColumnRows];
+    [mediaColumn setCustomSpacing:kSettingsTitleGap afterView:mediaTitle];
+    [mediaColumn setCustomSpacing:14 afterView:mediaRows.lastObject];
+
+    // Thin vertical lines between the columns, as tall as the tallest column.
+    NSStackView *columns = [NSStackView stackViewWithViews:@[cardsColumn]];
+    columns.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    columns.alignment = NSLayoutAttributeTop;
+    columns.spacing = kSettingsColumnGap;
+    for (NSStackView *column in @[mouseColumn, mediaColumn]) {
+        NSBox *divider = [NSBox new];
+        divider.boxType = NSBoxSeparator;
+        [columns addArrangedSubview:divider];
+        [divider.widthAnchor constraintEqualToConstant:1].active = YES;
+        [divider.heightAnchor constraintEqualToAnchor:columns.heightAnchor].active = YES;
+        [columns addArrangedSubview:column];
     }
-    [separator.widthAnchor constraintEqualToConstant:312].active = YES;
-    return stack;
+    CGFloat columnsWidth = 3 * kSettingsColumnWidth + 4 * kSettingsColumnGap + 2;
+
+    self.gestureWarning.preferredMaxLayoutWidth = columnsWidth;
+    self.gestureWarning.alignment = NSTextAlignmentCenter;
+    self.updateStatus.alignment = NSTextAlignmentCenter;
+    self.updateStatus.preferredMaxLayoutWidth = columnsWidth;
+
+    NSStackView *stack = [NSStackView stackViewWithViews:@[buttons, self.updateStatus, self.gestureWarning, columns]];
+    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    stack.alignment = NSLayoutAttributeCenterX;
+    stack.spacing = 12;
+    [stack setCustomSpacing:28 afterView:self.gestureWarning];
+    [stack setCustomSpacing:28 afterView:self.updateStatus];
+    [stack setCustomSpacing:28 afterView:buttons];
+    [self.gestureWarning.widthAnchor constraintLessThanOrEqualToConstant:columnsWidth].active = YES;
+    // Margins as constraints on a container: the stack's own edgeInsets were
+    // left out of fittingSize, so the window came out too small and clipped.
+    NSView *content = [NSView new];
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    [content addSubview:stack];
+    [NSLayoutConstraint activateConstraints:@[
+        [stack.topAnchor constraintEqualToAnchor:content.topAnchor constant:24],
+        [stack.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-32],
+        [stack.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:32],
+        [stack.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-32],
+        [stack.widthAnchor constraintEqualToConstant:columnsWidth],
+    ]];
+    return content;
 }
 
 - (void)fitWindow {
@@ -5012,14 +5521,14 @@ static NSString *lastOutputLine(NSString *output) {
     // Control. windowWillClose: returns to a menu bar app.
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     [self.window makeKeyAndOrderFront:nil];
-    [NSApp activate];
+    activateSelf();
     if (NSDate.date.timeIntervalSince1970 - self.lastUpdateCheck > 60) [self checkForUpdate];
     // The policy change settles on the next turn of the run loop; activating
     // only before it left the window unfocused, so Esc and clicks elsewhere
     // never reached it.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
         if (!self.window.isVisible) return;
-        [NSApp activate];
+        activateSelf();
         [self.window makeKeyAndOrderFront:nil];
     });
 }
@@ -5207,6 +5716,7 @@ static NSString *lastOutputLine(NSString *output) {
     if (self.statusItem) [NSStatusBar.systemStatusBar removeStatusItem:self.statusItem];
     self.statusItem = nil;
 }
+
 - (void)startAtLoginChanged:(NSButton *)button {
     BOOL enabled = button.state == NSControlStateValueOn;
     NSError *error = nil;
@@ -5220,7 +5730,6 @@ static NSString *lastOutputLine(NSString *output) {
     }
     storeSetting(CFSTR("StartAtLogin"), enabled ? kCFBooleanTrue : kCFBooleanFalse);
 }
-
 @end
 
 static SettingsMenu *g_settingsMenu;
@@ -5294,6 +5803,7 @@ int main(int argc, const char *argv[]) {
         g_liveCaptureQueue = dispatch_queue_create("touchpad.ring.live-capture", DISPATCH_QUEUE_SERIAL);
         g_windowEntries = collectOpenWindows();
         populateThumbnailsFromCache(g_windowEntries);
+        g_windowEntries = entriesWorthShowing(g_windowEntries);
         atomic_store(&g_windowEntryCount, (int)g_windowEntries.count);
         if (g_thumbnailPreviewsEnabled) schedulePendingThumbnailCapture(g_windowEntries);
         if (g_thumbnailPreviewsEnabled) scheduleChromeBackgroundPrefetch(g_windowEntries);
@@ -5301,6 +5811,7 @@ int main(int argc, const char *argv[]) {
             if (ensureChromeAutomation(YES)) {
                 NSArray<RingEntry *> *entries = collectOpenWindows();
                 populateThumbnailsFromCache(entries);
+                entries = entriesWorthShowing(entries);
                 g_windowEntries = entries;
                 atomic_store(&g_windowEntryCount, (int)entries.count);
                 if (g_ringView) g_ringView.entries = entries;

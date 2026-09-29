@@ -209,6 +209,18 @@ pokret prebacuje na drugu stranu prstena. Kad se gura dalje od kartica,
 pokazivač klizi po prstenu. Pokret gore-dole vredi isto koliko i levo-desno,
 jer se uzima prava veličina trackpada.
 
+Izabrana kartica se blago uveća i dobije plavi okvir. Okvir ne klizi od
+kartice do kartice: na novoj kartici se pojavi postepeno, a prethodna se vrati
+na svoju veličinu i okvir joj nestane.
+
+Svetlo iza kartica pokazuje smer prstiju. Njegov vrh se kreće pravo ka novom
+smeru, ubrza pa uspori bez preletanja. Za susednu karticu to izgleda kao
+okretanje. Kad se smer naglo promeni na drugu stranu, svetlo se povuče kroz
+centar, gde je kratko, slabije i široko, pa se izduži na novoj strani. Kad
+prsti prođu kroz centar, svetlo se ne gasi pa pali iznova, nego nastavi ka
+novoj strani. Jačina svetla opada glatko od sredine ka ivicama, bez oštrih
+prelaza, a širina prati širinu kartice postepeno.
+
 Krug u sredini je zona za odustajanje: ako se prsti podignu dok je pokazivač u
 njoj, ništa se ne bira. Sistemski kursor je sakriven dok je kružni meni otvoren,
 bez obzira da li je aktiviran sa tri prsta ili mišem, i vraća se čim se meni zatvori.
@@ -247,12 +259,31 @@ Recording. Čuvaju se u memoriji dok su prozori otvoreni. Novi snimak nastaje:
 3. na svake 3 s za aktivnu aplikaciju i na 12 s za ostale vidljive prozore.
 
 Snimaju se samo prozori sa trenutnog desktopa. Prozor sa drugog desktopa ili
-minimizovan zadržava poslednji snimak.
+minimizovan zadržava poslednji snimak. Ako snimka nema, kartica se ne prikazuje,
+jer bi imala samo ikonicu aplikacije i obično ništa ne bi otvorila (npr.
+Terminalov pomoćni prozor). Vraća se čim prozor dođe na ekran i dobije sliku.
+Chrome tabovi ostaju uvek.
 
 Za Chrome se slika čuva zasebno za svaki tab. U trenutku snimanja Touchpad
 Switcher pita Chrome koji je tab aktivan, da snimak ne završi na pogrešnom
-tabu. Tab koji nikad nije bio vidljiv ima karticu sa naslovom i domenom, a ne
-sliku sa sajta (YouTube poster se više ne koristi). YouTube snimak ostaje dok je
+tabu. Chrome crta samo tab koji je napred, pa tab koji nikad nije bio vidljiv
+nema sliku. Dok je meni otvoren, zamućenje sakriva prozore iza njega, pa se
+takvi tabovi učitaju i snime tu:
+
+1. svaki tab bez slike se na trenutak prebaci napred, pa Chrome počne da
+   učitava sve odjednom, u pozadini;
+2. zatim se jedan po jedan ponovo prebaci napred, snimi kad se stranica
+   učita, i vrati se tab koji je bio pre.
+
+Prvo ide tab na kome su prsti. Ako se izabere kartica iz istog prozora,
+ostaje izabrani tab. Chrome ne crta prozor koji je ceo pokriven drugim
+prozorom, pa se takav prozor za snimak podigne iza zamućenja (Chrome ostaje u
+pozadini), a posle se vrati prozor koji je bio napred, osim ako je izabrana
+kartica. Stranica koja se nije učitala za 2 s dobije sliku pri sledećem
+otvaranju menija. Video koji je krenuo samo zato što je tab otvoren se
+zaustavi, i narednih 15 s dok je tab u pozadini; muzika koja je već svirala
+se ne dira (za to treba **Allow JavaScript from Apple Events**). Dok tab ne
+dobije sliku, kartica ima naslov i domen (YouTube poster se više ne koristi). YouTube snimak ostaje dok je
 isti video, i kad se promeni vreme ili pozicija u listi.
 
 ### Meni u gornjoj traci

@@ -31,6 +31,7 @@ static NSString *g_lastTab;                 // "windowID:tabID" of Chrome's fron
 static NSString *g_playingTab;              // last tab seen playing while on screen
 static BOOL g_chromeInFront;
 static NSTimeInterval g_ringSwitchUntil;
+static _Atomic(double) g_ignoreTabChangesUntil;   // set from the switcher's queues
 static _Atomic(bool) g_javaScriptBlocked = false;
 static id g_activationObserver;
 
@@ -56,6 +57,20 @@ static NSString *resumeJavaScript(BOOL rewind, BOOL playStarted) {
          "if(!resumed&&playStarted){var v=Array.prototype.find.call(document.querySelectorAll('video'),"
          "function(v){return v.paused&&!v.ended&&v.currentTime>0;});if(v)v.play();}"
          "})(%@,%@)", rewind ? @"true" : @"false", playStarted ? @"true" : @"false"];
+}
+
+// For a tab opened only for its picture. Media that has played for less than
+// five seconds started because the tab was opened, and is paused (marked like
+// any pause here). For the next 15 s, media that starts while the tab is in
+// the background is paused too; once the user comes to the tab, it plays.
+static NSString *quietLoadedTabJavaScript(void) {
+    return @"(function(){function mark(m){m.pause();m.dataset.touchpadSwitcherPausedAt=String(Date.now());}"
+            "function played(m){var t=0;for(var i=0;i<m.played.length;i++)t+=m.played.end(i)-m.played.start(i);return t;}"
+            "document.querySelectorAll('video,audio').forEach(function(m){if(!m.paused&&!m.ended&&played(m)<5)mark(m);});"
+            "var until=Date.now()+15000;"
+            "function stop(e){if(document.visibilityState!=='visible'&&Date.now()<until&&e.target.pause)mark(e.target);}"
+            "document.addEventListener('play',stop,true);"
+            "setTimeout(function(){document.removeEventListener('play',stop,true);},15000);})()";
 }
 
 // A tab "has a video" when a video there has already been started.
@@ -146,7 +161,9 @@ static NSString *runInTab(NSString *tab, NSString *javaScript) {
         @"tell application \"Google Chrome\"\n"
          "try\n"
          "set targetTab to (first tab of (first window whose id is \"%@\") whose id is \"%@\")\n"
+         "with timeout of 2 seconds\n"
          "return \"ok:\" & ((execute targetTab javascript \"%@\") as text)\n"
+         "end timeout\n"
          "on error errorMessage\n"
          "if errorMessage contains \"JavaScript\" then return \"blocked\"\n"
          "return \"failed\"\n"
@@ -219,6 +236,8 @@ static void chromeEntered(void) {
 
 static void pollFrontTab(void) {
     if (!g_chromeInFront || !anyMediaRuleOn()) return;
+    // g_lastTab stays the tab from before, which the switcher puts back.
+    if (NSProcessInfo.processInfo.systemUptime < atomic_load(&g_ignoreTabChangesUntil)) return;
     static int s_pollCount;
     BOOL checkPlaying = ++s_pollCount % kPlayingCheckEvery == 0;
     BOOL playing = NO;
@@ -288,6 +307,15 @@ void RingMediaTabSwitchedByRing(NSString *windowID, NSString *tabID) {
         }
         g_lastTab = tab;
     });
+}
+
+void RingMediaIgnoreTabChanges(NSTimeInterval seconds) {
+    atomic_store(&g_ignoreTabChangesUntil, seconds > 0 ? NSProcessInfo.processInfo.systemUptime + seconds : 0);
+}
+
+void RingMediaQuietLoadedTab(NSString *windowID, NSString *tabID) {
+    if (!windowID.length || !tabID.length) return;
+    runInTab([NSString stringWithFormat:@"%@:%@", windowID, tabID], quietLoadedTabJavaScript());
 }
 
 BOOL RingMediaJavaScriptBlocked(void) {

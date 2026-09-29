@@ -19,5 +19,14 @@ void RingMediaStart(RingMediaOptions options);
 void RingMediaSetOptions(RingMediaOptions options);
 // The ring just put this Chrome tab on screen (ids as Chrome reports them).
 void RingMediaTabSwitchedByRing(NSString *windowID, NSString *tabID);
+// The switcher briefly shows hidden tabs behind the open ring to take their
+// pictures. Tab changes seen before `seconds` from now are not the user's and
+// are ignored; 0 ends the pause.
+void RingMediaIgnoreTabChanges(NSTimeInterval seconds);
+// A tab the switcher just opened behind the ring to take its picture: media
+// that started only now (autoplay) is paused, also if it starts in the next
+// seconds while the tab is in the background. Media that was already playing
+// is left alone. Needs JavaScript from Apple Events.
+void RingMediaQuietLoadedTab(NSString *windowID, NSString *tabID);
 // Chrome refused JavaScript from Apple Events (menu shows how to allow it).
 BOOL RingMediaJavaScriptBlocked(void);
