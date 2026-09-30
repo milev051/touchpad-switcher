@@ -126,6 +126,7 @@ static void noteChromeSelectionChanges(NSArray<RingEntry *> *entries);
 @property(nonatomic, strong) NSArray<NSValue *> *layoutRects;
 @property(nonatomic, strong) NSArray<RingEntry *> *layoutEntries;
 @property(nonatomic) NSSize layoutSize;
+@property(nonatomic, strong) NSArray<NSNumber *> *layoutThumbnailShapes;
 @property(nonatomic, strong) NSView *pointerView;
 @property(nonatomic, strong) CAShapeLayer *pointerArrow;
 @property(nonatomic, weak) NSView *glowView;
@@ -410,6 +411,39 @@ static NSArray<NSValue *> *adaptiveCardLayout(NSArray<RingEntry *> *entries, NSS
     return rects;
 }
 
+// Najveći slobodan krug za centralnu ikonicu u srednjem delu rasporeda.
+// Računaju se ivice sa rezervom za zoom, a ne prosek centara slika.
+static CGFloat hubClearance(NSArray<NSValue *> *rects, NSPoint point) {
+    CGFloat clearance = CGFLOAT_MAX;
+    for (NSValue *value in rects) {
+        NSRect rect = value.rectValue;
+        NSSize size = NSMakeSize(NSWidth(rect)*kSelectedCardScale, NSHeight(rect)*kSelectedCardScale);
+        clearance = MIN(clearance, rectangleGap(point, NSMakeSize(kHubRadius*2,kHubRadius*2),
+            NSMakePoint(NSMidX(rect),NSMidY(rect)), size));
+    }
+    return clearance;
+}
+
+static NSPoint balancedHubPoint(NSArray<NSValue *> *rects, NSSize screen) {
+    NSPoint origin = NSMakePoint(screen.width/2,screen.height/2);
+    if (rects.count < 3) return origin;
+    NSPoint best = origin;
+    CGFloat range = MIN(100.0, MIN(screen.width,screen.height)*0.16);
+    CGFloat step = range/3;
+    CGFloat score = hubClearance(rects,best);
+    for (int pass=0; pass<8; pass++) {
+        NSPoint center = best;
+        for (int x=-3;x<=3;x++) for (int y=-3;y<=3;y++) {
+            NSPoint candidate = NSMakePoint(center.x+x*step,center.y+y*step);
+            if (fabs(candidate.x-origin.x)>range || fabs(candidate.y-origin.y)>range) continue;
+            CGFloat candidateScore = hubClearance(rects,candidate)-hypot(candidate.x-origin.x,candidate.y-origin.y)*0.002;
+            if (candidateScore>score) { score=candidateScore; best=candidate; }
+        }
+        step/=3;
+    }
+    return best;
+}
+
 // Direction of a card as seen on screen (the ring is an ellipse, so this is not
 // the raw layout angle).
 static CGFloat cardScreenAngle(NSInteger i, NSUInteger count) {
@@ -640,14 +674,21 @@ static const CGFloat kBeamMaxWidth = 3.6;   // radians; a soft glow all around t
 }
 
 - (void)prepareCardLayout {
-    if (self.layoutEntries == self.entries && NSEqualSizes(self.layoutSize, self.bounds.size)) return;
+    NSMutableArray<NSNumber *> *shapes = [NSMutableArray arrayWithCapacity:self.entries.count];
+    for (RingEntry *entry in self.entries) {
+        NSSize size = resolvedThumbnail(entry).size;
+        [shapes addObject:@(size.width > 0 && size.height > 0 ? size.height/size.width : 0)];
+    }
+    if (self.layoutEntries == self.entries && NSEqualSizes(self.layoutSize, self.bounds.size) &&
+        [self.layoutThumbnailShapes isEqualToArray:shapes]) return;
+    self.layoutThumbnailShapes = shapes;
     CGFloat radiusX, radiusY;
     self.layoutRects = adaptiveCardLayout(self.entries, self.bounds.size, &radiusX, &radiusY);
     self.layoutEntries = self.entries;
     self.layoutSize = self.bounds.size;
     self.ringRadius = radiusX;
     self.ringRadiusY = radiusY;
-    self.anchorPoint = NSMakePoint(NSMidX(self.bounds), NSMidY(self.bounds));
+    self.anchorPoint = balancedHubPoint(self.layoutRects,self.bounds.size);
     atomic_store(&g_layoutAxisRatio, radiusX > 0 ? radiusY / radiusX : 1);
     NSUInteger count = self.layoutRects.count;
     if (count <= 512) for (NSUInteger i = 0; i < count; i++) {
@@ -3595,6 +3636,38 @@ static NSString *chromeActiveTab(NSString *windowID, NSString **urlOut) {
     return parts[0];
 }
 
+// Identitet mora ostati isti tokom čekanja na iscrtavanje i samog snimanja.
+static BOOL sameChromeCapturePage(NSString *beforeID, NSString *beforeURL,
+                                  NSString *afterID, NSString *afterURL) {
+    return beforeID.length && beforeURL.length && [beforeID isEqualToString:afterID] &&
+        [chromePageIdentity(beforeURL) isEqualToString:chromePageIdentity(afterURL)];
+}
+
+static CGImageRef captureVerifiedChromeWindow(SCWindow *window, NSString *chromeWindowID,
+                                              NSString **tabOut, NSString **urlOut) {
+    NSString *beforeURL = nil;
+    NSString *beforeID = chromeActiveTab(chromeWindowID, &beforeURL);
+    if (!beforeID.length || !beforeURL.length) return NULL;
+    // Chrome može promeniti aktivni ID pre nego što prikaže novu stranicu.
+    usleep(180000);
+    NSString *settledURL = nil;
+    NSString *settledID = chromeActiveTab(chromeWindowID, &settledURL);
+    if (!sameChromeCapturePage(beforeID,beforeURL,settledID,settledURL)) return NULL;
+    CGImageRef image = captureWindowImage(window);
+    if (!image) return NULL;
+    NSString *afterURL = nil;
+    NSString *afterID = chromeActiveTab(chromeWindowID, &afterURL);
+    if (!sameChromeCapturePage(beforeID,beforeURL,afterID,afterURL)) {
+        CGImageRelease(image);
+        return NULL;
+    }
+    if (tabOut) *tabOut = afterID;
+    if (urlOut) *urlOut = afterURL;
+    return image;
+}
+
+static _Atomic(bool) g_liveCaptureBusy = false;
+
 static NSMutableDictionary<NSNumber *, NSValue *> *g_windowFullSize;
 
 static BOOL stageManagerEnabled(void) {
@@ -3656,6 +3729,8 @@ static void refreshThumbnailsNow(pid_t onlyPID, NSTimeInterval minAge) {
         NSNumber *windowKey = @(entry.windowID);
         if (entry.windowID == kCGNullWindowID || ![onScreenIDs containsObject:windowKey]) continue;
         if (onlyPID > 0 && entry.application.processIdentifier != onlyPID) continue;
+        if (entry.isTab && [entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"] &&
+            (!entry.chromeWindowID.length || !entry.chromeTabID.length)) continue;
         RingEntry *current = entryByWindow[windowKey];
         if (!current) [windowOrder addObject:windowKey];
         // Tabs share one window and only the selected tab is on screen.
@@ -3681,9 +3756,10 @@ static void refreshThumbnailsNow(pid_t onlyPID, NSTimeInterval minAge) {
             else [targets addObject:target];
         }
     }
-    if (!targets.count) return;
+    if (!targets.count || atomic_exchange(&g_liveCaptureBusy, true)) return;
 
     dispatch_async(g_liveCaptureQueue, ^{
+        @try {
         dispatch_semaphore_t listed = dispatch_semaphore_create(0);
         __block NSArray<SCWindow *> *shareableWindows = nil;
         [SCShareableContent getShareableContentExcludingDesktopWindows:YES onScreenWindowsOnly:YES
@@ -3705,14 +3781,16 @@ static void refreshThumbnailsNow(pid_t onlyPID, NSTimeInterval minAge) {
             NSString *tabKey = target[@"tabKey"];
             NSString *pageURL = nil;
             NSString *chromeWindowID = target[@"chromeWindowID"];
+            CGImageRef image = NULL;
             if (chromeWindowID.length) {
-                NSString *activeTabID = chromeActiveTab(chromeWindowID, &pageURL);
-                // Unknown tab: no picture is better than a picture on the wrong tab.
-                if (!activeTabID) continue;
+                NSString *activeTabID = nil;
+                image = captureVerifiedChromeWindow(window, chromeWindowID, &activeTabID, &pageURL);
+                if (!image || !activeTabID.length) continue;
                 tabKey = [NSString stringWithFormat:@"%d:chrome:%@:%@", [target[@"pid"] intValue],
                           chromeWindowID, activeTabID];
+            } else {
+                image = captureWindowImage(window);
             }
-            CGImageRef image = captureWindowImage(window);
             if (!image) continue;
             NSData *data = encodedThumbnailFromCGImage(image);
             CGImageRelease(image);
@@ -3747,12 +3825,15 @@ static void refreshThumbnailsNow(pid_t onlyPID, NSTimeInterval minAge) {
                         if (entry.windowID != windowKey.unsignedIntValue) continue;
                         BOOL matches = tabKey ? (entry.isTab && [tabThumbnailKey(entry) isEqualToString:tabKey])
                                               : !entry.isTab;
+                        if (matches && result[@"pageURL"])
+                            matches = [chromePageIdentity(entry.tabURL) isEqualToString:chromePageIdentity(result[@"pageURL"])];
                         if (matches) applyThumbnailDataToEntry(entry, data);
                     }
                 }
             }
             if (g_ringView && atomic_load(&g_ringOverlayVisible)) [g_ringView setNeedsDisplay:YES];
         });
+        } @finally { atomic_store(&g_liveCaptureBusy, false); }
     });
 }
 
@@ -3897,7 +3978,8 @@ static void storeLoadedTabPicture(NSString *tabKey, CGWindowID windowID, NSStrin
             g_tabLastCaptured[tabKey] = @(NSProcessInfo.processInfo.systemUptime);
             if (pageURL) g_tabCachedURL[tabKey] = chromePageIdentity(pageURL) ?: @"";
             for (RingEntry *entry in g_windowEntries) {
-                if (entry.windowID == windowID && entry.isTab && [tabThumbnailKey(entry) isEqualToString:tabKey]) {
+                if (entry.windowID == windowID && entry.isTab && [tabThumbnailKey(entry) isEqualToString:tabKey] &&
+                    [chromePageIdentity(entry.tabURL) isEqualToString:chromePageIdentity(pageURL)]) {
                     applyThumbnailDataToEntry(entry, data);
                 }
             }
@@ -4031,9 +4113,12 @@ static void loadHiddenChromeTabs(uint64_t generation) {
                     usleep(100000);   // a few frames for the page to paint
                     NSString *pageURL = nil;
                     if (![chromeActiveTab(chromeWindowID, &pageURL) isEqualToString:tabID]) return;
-                    CGImageRef image = captureWindowImage(window);
+                    NSString *capturedID = nil;
+                    CGImageRef image = captureVerifiedChromeWindow(window, chromeWindowID, &capturedID, &pageURL);
+                    if (![capturedID isEqualToString:tabID]) { if (image) CGImageRelease(image); return; }
                     NSData *data = encodedThumbnailFromCGImage(image);
                     if (image) CGImageRelease(image);
+                    if (!ringStillOpen(generation)) return;
                     // Media that started only because the tab was opened here stops again.
                     RingMediaQuietLoadedTab(chromeWindowID, tabID);
                     if (!data || [data isEqualToData:lastPicture[chromeWindowID]]) return;
@@ -4178,23 +4263,8 @@ static void capturePendingThumbnails(NSArray<RingEntry *> *entries,
         if (entry.isTab) {
             BOOL isChromeTab = [entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"];
             if (isChromeTab) {
-                if (!entry.isSelectedTab) continue;
-                NSString *tabKey = tabThumbnailKey(entry);
-                NSTimeInterval lastAttempt = g_chromeWindowLastCapture[key].doubleValue;
-                NSTimeInterval lastCaptured = tabLastCapturedSnapshot[tabKey].doubleValue;
-                BOOL justBecameSelected = [g_chromeForceCaptureKeys containsObject:tabKey];
-                if (justBecameSelected) [g_chromeForceCaptureKeys removeObject:tabKey];
-                BOOL hasRealShot = tabThumbnailSnapshot[tabKey] != nil;
-                NSTimeInterval refresh = entry.application.isActive ? 3.0 : 8.0;
-                BOOL captureDue = justBecameSelected || !hasRealShot ||
-                    (now - lastCaptured >= refresh);
-                if (entry.windowID != kCGNullWindowID && captureDue &&
-                    now - lastAttempt >= 0.5 &&
-                    !thumbnailCaptureIsCoolingDown(key) &&
-                    ![g_thumbnailRequests containsObject:key]) {
-                    [wantedIDs addObject:key];
-                    [wantedChromeIDs addObject:key];
-                }
+                // Chrome koristi isključivo snimanje sa stvarnim ID-em pre i
+                // posle slike; periodični spisak tabova može biti zastareo.
                 continue;
             }
 
@@ -4399,6 +4469,7 @@ static void schedulePendingThumbnailCapture(NSArray<RingEntry *> *entries) {
     if (!g_thumbnailPlanningQueue) {
         g_thumbnailPlanningQueue = dispatch_queue_create("touchpad.ring.thumbnail-planning", DISPATCH_QUEUE_SERIAL);
     }
+    refreshThumbnailsNow(0, 3.0);
     NSArray<RingEntry *> *entrySnapshot = [entries copy];
     dispatch_async(g_thumbnailPlanningQueue, ^{
         if (atomic_load(&g_gestureActive)) return;
@@ -4734,6 +4805,15 @@ static void startMultitouchDevices(void) {
     NSLog(@"[touch] listening on %ld trackpad device(s)", (long)CFArrayGetCount(g_devices));
 }
 
+// Tema menja rok osvežavanja, a postojeće slike ostaju dok nove ne stignu.
+static void invalidateThumbnailCaptureTimes(void) {
+    @synchronized ([NSMutableDictionary class]) {
+        [g_windowLastCaptured removeAllObjects];
+        [g_tabLastCaptured removeAllObjects];
+        [g_chromeWindowLastCapture removeAllObjects];
+    }
+}
+
 @interface TouchpadWakeObserver : NSObject
 @end
 @implementation TouchpadWakeObserver
@@ -4776,24 +4856,13 @@ static void startMultitouchDevices(void) {
     (void)notification;
     dispatch_async(dispatch_get_main_queue(), ^{
         NSLog(@"[thumbnails] light/dark change; recapturing visible windows");
-        @synchronized ([NSMutableDictionary class]) {
-            [g_thumbnailCache removeAllObjects];
-            [g_windowLastCaptured removeAllObjects];
-            [g_tabThumbnailCache removeAllObjects];
-            [g_tabLastCaptured removeAllObjects];
-            [g_chromeWindowLastCapture removeAllObjects];
-            if (!g_chromeForceCaptureKeys) g_chromeForceCaptureKeys = [NSMutableSet set];
-            [g_chromeForceCaptureKeys removeAllObjects];
-            for (RingEntry *entry in g_windowEntries) {
-                entry.thumbnailData = nil;
-                entry.thumbnail = nil;
-                if (entry.isTab && entry.isSelectedTab &&
-                    [entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"]) {
-                    [g_chromeForceCaptureKeys addObject:tabThumbnailKey(entry)];
-                }
-            }
+        invalidateThumbnailCaptureTimes();
+        if (g_thumbnailPreviewsEnabled) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+                refreshThumbnailsNow(0, 0);
+                schedulePendingThumbnailCapture(g_windowEntries);
+            });
         }
-        if (g_thumbnailPreviewsEnabled) schedulePendingThumbnailCapture(g_windowEntries);
     });
 }
 @end
@@ -5094,8 +5163,9 @@ static NSString *lastOutputLine(NSString *output) {
 }
 @end
 
-@interface SettingsMenu : NSObject <NSWindowDelegate>
+@interface SettingsMenu : NSObject <NSWindowDelegate, NSApplicationDelegate>
 @property(nonatomic, strong) NSStatusItem *statusItem;
+@property(nonatomic, strong) NSButton *hideIconCheckbox;
 @property(nonatomic, strong) SettingsWindow *window;
 @property(nonatomic, strong) NSTextField *javaScriptHint;
 @property(nonatomic, strong) NSTextField *blurLabel;
@@ -5110,6 +5180,20 @@ static NSString *lastOutputLine(NSString *output) {
 @end
 
 @implementation SettingsMenu
+- (void)handleReopenEvent:(NSAppleEventDescriptor *)event withReplyEvent:(NSAppleEventDescriptor *)reply {
+    (void)event; (void)reply;
+    [self applicationShouldHandleReopen:NSApp hasVisibleWindows:self.window.isVisible];
+}
+- (BOOL)applicationShouldHandleReopen:(NSApplication *)application hasVisibleWindows:(BOOL)visible {
+    (void)application; (void)visible;
+    atomic_store(&g_settingHideMenuIcon, false);
+    storeSetting(CFSTR("HideMenuBarIcon"), kCFBooleanFalse);
+    [self showIcon];
+    self.hideIconCheckbox.state = NSControlStateValueOff;
+    if (!self.window.isVisible) [self togglePanel:nil];
+    else { [self.window makeKeyAndOrderFront:nil]; activateSelf(); }
+    return NO;
+}
 - (instancetype)init {
     self = [super init];
     if (self) {
@@ -5345,6 +5429,8 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
 
     NSButton *hideIcon = [NSButton checkboxWithTitle:@"Sakrij ikonicu iz gornje trake"
                                               target:self action:@selector(hideIconChanged:)];
+    self.hideIconCheckbox = hideIcon;
+    hideIcon.state = atomic_load(&g_settingHideMenuIcon) ? NSControlStateValueOn : NSControlStateValueOff;
     NSTextField *hideNote = [self noteWithText:@"Ikonica se vraća kad ponovo otvoriš aplikaciju."];
     NSButton *startAtLogin = [NSButton checkboxWithTitle:@"Pokreni pri uključivanju računara"
                                                   target:self action:@selector(startAtLoginChanged:)];
@@ -5719,7 +5805,12 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
 }
 
 - (void)hideIconChanged:(NSButton *)button {
-    if (button.state != NSControlStateValueOn) return;
+    if (button.state != NSControlStateValueOn) {
+        atomic_store(&g_settingHideMenuIcon, false);
+        storeSetting(CFSTR("HideMenuBarIcon"), kCFBooleanFalse);
+        [self showIcon];
+        return;
+    }
     atomic_store(&g_settingHideMenuIcon, true);
     storeSetting(CFSTR("HideMenuBarIcon"), kCFBooleanTrue);
     [self.window performClose:nil];
@@ -5772,6 +5863,13 @@ int main(int argc, const char *argv[]) {
         [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
         loadSettings();
         g_settingsMenu = [SettingsMenu new];
+        NSApp.delegate = g_settingsMenu;
+        [NSAppleEventManager.sharedAppleEventManager setEventHandler:g_settingsMenu
+            andSelector:@selector(handleReopenEvent:withReplyEvent:)
+            forEventClass:kCoreEventClass andEventID:kAEReopenApplication];
+        [NSAppleEventManager.sharedAppleEventManager setEventHandler:g_settingsMenu
+            andSelector:@selector(handleReopenEvent:withReplyEvent:)
+            forEventClass:kCoreEventClass andEventID:kAEOpenApplication];
         if (!atomic_load(&g_settingHideMenuIcon)) [g_settingsMenu showIcon];
         RingMediaStart(g_mediaOptions);
         RingFaviconsSetLoadedHandler(^{

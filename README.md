@@ -218,7 +218,8 @@ Prozor bez snimka prikazuje samo veću ikonicu i naziv. Razmaci se računaju izm
 dijagonalni razmak. Dodatni korak približava susede prema razmaku njihovih
 ivica, uz proveru redosleda i sudara. Horizontalni snimci sabijaju prsten po visini;
 uspravni i mešoviti snimci imaju sopstvene dimenzije. Raspored ostaje
-stabilan tokom jedne geste, uz rezervu za zoom, susede i centralnu ikonicu.
+stabilan tokom izbora, uz rezervu za zoom, susede i centralnu ikonicu.
+Dolazak novog thumbnaila ili promena proporcija osvežava raspored.
 Veličina kartica automatski se prilagođava ekranu i njihovom broju.
 Centralna ikonica se kratko smanji, uveća i vrati na svoju veličinu pri
 svakom izboru kartice. Iza izabranog thumbnaila pojavi se mekan svetleći
@@ -369,3 +370,13 @@ folderu `layout-previews/`.
 Posle dodira sa četiri ili više prstiju, prvi signal potpunog podizanja
 prstiju odmah oslobađa sledeću gestu. Provera `--verify` pokriva i ovaj
 oporavak bez dodatnih praznih frejmova sa trackpada.
+
+Ponovno otvaranje aplikacije vraća sakrivenu ikonicu i otvara podešavanja.
+Pokretanje nove instance i dalje zamenjuje prethodnu. Chrome snimci se
+proveravaju prema stvarnom ID-u taba i stranici pre i posle snimanja,
+uz kratko čekanje na iscrtavanje. Promena svetle/tamne teme čuva postojeće
+slike dok se nove učitavaju; vidljivi prozori se osvežavaju u pozadini.
+
+Centralna ikonica se pozicionira u slobodnom prostoru između ivica kartica,
+sa rezervom za zoom. Kada ikonica prozora dobije thumbnail tokom otvorenog
+menija, raspored se osvežava i snimak odmah dobija normalnu veličinu.

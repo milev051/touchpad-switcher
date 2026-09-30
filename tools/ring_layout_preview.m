@@ -163,6 +163,22 @@ static void renderPreview(PreviewRingView *view, NSString *path) {
 
 // Provera stvarnih slojeva, razmaka i izbora na više formata ekrana.
 static void verifyPreview(LayoutPreview *preview) {
+    assert(sameChromeCapturePage(@"101",@"https://youtube.com/watch?v=abcdefghijk",@"101",@"https://youtube.com/watch?v=abcdefghijk&t=20"));
+    assert(!sameChromeCapturePage(@"101",@"https://google.com",@"102",@"https://youtube.com/watch?v=abcdefghijk"));
+    assert(!sameChromeCapturePage(@"101",@"https://google.com",@"101",@"https://youtube.com/watch?v=abcdefghijk"));
+    assert(!sameChromeCapturePage(@"101",@"https://youtube.com/watch?v=abcdefghijk",@"101",@"https://youtube.com/watch?v=lmnopqrstuv"));
+    assert(!sameChromeCapturePage(nil,nil,@"101",@"https://google.com"));
+    NSData *savedPicture=[@"sačuvan snimak" dataUsingEncoding:NSUTF8StringEncoding];
+    g_thumbnailCache=[NSMutableDictionary dictionaryWithObject:savedPicture forKey:@1];
+    g_tabThumbnailCache=[NSMutableDictionary dictionaryWithObject:savedPicture forKey:@"tab"];
+    g_windowLastCaptured=[NSMutableDictionary dictionaryWithObject:@1 forKey:@1];
+    g_tabLastCaptured=[NSMutableDictionary dictionaryWithObject:@1 forKey:@"tab"];
+    g_chromeWindowLastCapture=[NSMutableDictionary dictionaryWithObject:@1 forKey:@1];
+    invalidateThumbnailCaptureTimes();
+    assert([g_thumbnailCache[@1] isEqualToData:savedPicture]);
+    assert([g_tabThumbnailCache[@"tab"] isEqualToData:savedPicture]);
+    assert(!g_windowLastCaptured.count && !g_tabLastCaptured.count && !g_chromeWindowLastCapture.count);
+    printf("Chrome: promene taba i stranice odbacuju snimak; promena teme čuva postojeće slike.\n");
     // Jedan prazan frejm mora osloboditi novu gestu, bez daljih callbackova.
     BOOL waiting = NO;
     assert(suppressTouchFrameAfterFourFingers(4, &waiting) && waiting);
@@ -176,6 +192,17 @@ static void verifyPreview(LayoutPreview *preview) {
         assert(!suppressTouchFrameAfterFourFingers(3, &waiting));
     }
     printf("Četiri prsta: oporavak nakon jednog praznog frejma i 20 ponavljanja prolaze.\n");
+    preview.shapeControl.selectedSegment=0;
+    [preview rebuild:5];
+    RingEntry *arriving=preview.ring.entries.lastObject;
+    NSImage *arrivingPicture=arriving.thumbnail;
+    arriving.thumbnail=nil;
+    [preview.ring updateCardLayersAnimated:NO refreshContents:YES];
+    CGFloat iconWidth=NSWidth([preview.ring cardRectForIndex:4]);
+    arriving.thumbnail=arrivingPicture;
+    [preview.ring updateCardLayersAnimated:NO refreshContents:YES];
+    assert(NSWidth([preview.ring cardRectForIndex:4])>iconWidth*1.5);
+    printf("Novi thumbnail odmah dobija punu veličinu bez ponovnog otvaranja menija.\n");
     const NSSize sizes[] = {{800,600},{1100,688},{1440,900},{1600,900},{1996,1248}};
     const NSUInteger counts[] = {1,2,3,4,5,6,7,8,12,16};
     for (NSUInteger sizeIndex=0;sizeIndex<5;sizeIndex++) {
@@ -190,6 +217,9 @@ static void verifyPreview(LayoutPreview *preview) {
             preview.ring.entries.lastObject.thumbnail=nil;
             preview.ring.layoutEntries=nil;
             [preview.ring updateCardLayersAnimated:NO refreshContents:YES];
+            NSPoint originalHub=NSMakePoint(size.width/2,size.height/2);
+            assert(hubClearance(preview.ring.layoutRects,preview.ring.anchorPoint)+0.001 >=
+                   hubClearance(preview.ring.layoutRects,originalHub));
             for (NSUInteger i=0;i<count;i++) {
                 NSRect rect=[preview.ring cardRectForIndex:i];
                 assert(NSWidth(rect)>0 && NSHeight(rect)>0);
