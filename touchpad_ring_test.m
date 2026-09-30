@@ -176,6 +176,19 @@ static _Atomic(int) g_settingBlurRadius = 15;   // 0 turns the blur off
 static _Atomic(int) g_settingMouseButton = -1;
 typedef enum { PointerStyleArrow = 0, PointerStyleDot = 1, PointerStyleHidden = 2 } PointerStyle;
 static _Atomic(int) g_settingPointerStyle = PointerStyleHidden;
+// The selected card's outline and the light behind the cards: the accent
+// color from System Settings > Appearance, like the rest of macOS, or white.
+typedef enum { HighlightSystem = 0, HighlightWhite = 1 } HighlightColor;
+static _Atomic(int) g_settingHighlightColor = HighlightWhite;
+static _Atomic(bool) g_settingShowLight = false;   // light in the direction of the fingers
+// The backdrop behind the cards: a color laid over the (blurred) screen.
+static _Atomic(int) g_settingBackdropDimming = 38;   // percent
+static NSColor *g_backdropColor;                     // main thread; nil is near black
+
+static NSColor *ringHighlightColor(void) {
+    if (atomic_load(&g_settingHighlightColor) == HighlightWhite) return [NSColor colorWithSRGBRed:1 green:1 blue:1 alpha:1];
+    return [NSColor.controlAccentColor colorUsingColorSpace:NSColorSpace.sRGBColorSpace] ?: NSColor.systemBlueColor;
+}
 static NSSound *g_selectSound;
 static NSSound *g_activateSound;
 
@@ -342,19 +355,7 @@ static const CGFloat kBeamMaxWidth = 3.6;   // radians; a soft glow all around t
     self.wantsLayer = YES;
     _gradient = [CAGradientLayer layer];
     _gradient.type = kCAGradientLayerRadial;
-    // Brightest at the center, fading out toward the edge of the screen along
-    // a smooth curve, so no ring shows where two straight segments would meet.
-    NSMutableArray *colors = [NSMutableArray array], *locations = [NSMutableArray array];
-    const int stops = 12;
-    for (int i = 0; i <= stops; i++) {
-        CGFloat t = (CGFloat)i / stops;
-        CGFloat fade = (1.0 - t) * (1.0 - t);
-        [colors addObject:(id)[NSColor colorWithCalibratedRed:0.24 + 0.36 * fade green:0.82 + 0.10 * fade
-                                                         blue:1.0 alpha:0.55 * fade].CGColor];
-        [locations addObject:@(t)];
-    }
-    _gradient.colors = colors;
-    _gradient.locations = locations;
+    [self refreshColors];
     _gradient.opacity = 0;
     _beam = [CAGradientLayer layer];
     _beam.type = kCAGradientLayerConic;
@@ -366,6 +367,33 @@ static const CGFloat kBeamMaxWidth = 3.6;   // radians; a soft glow all around t
 }
 
 - (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
+
+// Brightest at the center, fading out toward the edge of the screen along a
+// smooth curve, so no ring shows where two straight segments would meet. The
+// accent color is kept soft, a little whiter at the center, as macOS draws
+// its own highlights; white is fainter still.
+- (void)refreshColors {
+    NSColor *color = ringHighlightColor();
+    BOOL white = atomic_load(&g_settingHighlightColor) == HighlightWhite;
+    CGFloat peak = white ? 0.26 : 0.34;
+    NSMutableArray *colors = [NSMutableArray array], *locations = [NSMutableArray array];
+    const int stops = 12;
+    for (int i = 0; i <= stops; i++) {
+        CGFloat t = (CGFloat)i / stops;
+        CGFloat fade = (1.0 - t) * (1.0 - t);
+        CGFloat whiten = 0.35 * fade;
+        [colors addObject:(id)[NSColor colorWithSRGBRed:color.redComponent + (1.0 - color.redComponent) * whiten
+                                                  green:color.greenComponent + (1.0 - color.greenComponent) * whiten
+                                                   blue:color.blueComponent + (1.0 - color.blueComponent) * whiten
+                                                  alpha:peak * fade].CGColor];
+        [locations addObject:@(t)];
+    }
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    _gradient.colors = colors;
+    _gradient.locations = locations;
+    [CATransaction commit];
+}
 
 // Beam centered on the conic gradient's half-way point. Its brightness follows
 // a raised cosine from the middle to the edges, with no flat core: a flat core
@@ -407,6 +435,7 @@ static const CGFloat kBeamMaxWidth = 3.6;   // radians; a soft glow all around t
 }
 
 - (void)pointAt:(CGFloat)angle width:(CGFloat)width center:(NSPoint)center {
+    if (!atomic_load(&g_settingShowLight)) return;
     _target = CGPointMake(cos(angle), sin(angle));
     _targetWidth = width;   // eases in with the frames below
     if (_visible) return;
@@ -420,6 +449,7 @@ static const CGFloat kBeamMaxWidth = 3.6;   // radians; a soft glow all around t
     }
 
     // A new light grows out of the center toward its card.
+    [self refreshColors];   // the accent color or the style may have changed
     _center = center;
     _point = CGPointMake(_target.x * 0.15, _target.y * 0.15);
     _speed = CGPointZero;
@@ -600,16 +630,17 @@ static const CGFloat kSelectedCardScale = 1.08;
     }
     if (!hasSelection) return;
 
+    // Outlined in the highlight color and lifted on a soft dark shadow, like a
+    // selected window in Mission Control.
     CALayer *focus = [CALayer layer];
-    NSColor *accent = [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.95];
     focus.contentsGravity = kCAGravityResize;
-    focus.borderColor = accent.CGColor;
-    focus.borderWidth = 2.5;
+    focus.borderColor = [ringHighlightColor() colorWithAlphaComponent:0.95].CGColor;
+    focus.borderWidth = 2.0;
     focus.cornerRadius = 8.0;
-    focus.shadowColor = accent.CGColor;
-    focus.shadowOpacity = 0.9;
-    focus.shadowRadius = 9.0;
-    focus.shadowOffset = CGSizeZero;
+    focus.shadowColor = NSColor.blackColor.CGColor;
+    focus.shadowOpacity = 0.5;
+    focus.shadowRadius = 16.0;
+    focus.shadowOffset = CGSizeMake(0, -6);
     focus.zPosition = 5;   // above the cards, under the pointer
     [self fillFocusLayer:focus index:index];
     [CATransaction begin];
@@ -721,10 +752,10 @@ static const CGFloat kSelectedCardScale = 1.08;
         arrow.path = path;
         CGPathRelease(path);
         arrow.fillColor = [NSColor colorWithCalibratedWhite:1.0 alpha:0.95].CGColor;
-        arrow.strokeColor = [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:1.0].CGColor;
+        arrow.strokeColor = ringHighlightColor().CGColor;
         arrow.lineWidth = 1.5;
         arrow.lineJoin = kCALineJoinRound;
-        arrow.shadowColor = [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:1.0].CGColor;
+        arrow.shadowColor = ringHighlightColor().CGColor;
         arrow.shadowOpacity = 0.8;
         arrow.shadowRadius = 6.0;
         arrow.shadowOffset = CGSizeZero;
@@ -1578,6 +1609,8 @@ static void ensurePanel(NSScreen *screen) {
     // Keep the radial selector visible above full-screen browser/app windows.
     g_panel.level = NSPopUpMenuWindowLevel + 1;
     g_panel.hidesOnDeactivate = NO;
+    // No window animation: macOS zoomed the blurred backdrop in; it appears at once.
+    g_panel.animationBehavior = NSWindowAnimationBehaviorNone;
     // The full-screen panel also catches scrolling if the Quartz event tap
     // misses a trackpad event or is temporarily disabled by the system.
     g_panel.ignoresMouseEvents = NO;
@@ -1680,7 +1713,12 @@ static void showRing(uint64_t generation) {
     // Blur and dimming appear at once with the cards, no fade.
     int blurRadius = atomic_load(&g_settingBlurRadius);
     setPanelBlur(blurRadius);
-    g_dimView.layer.backgroundColor = [NSColor colorWithCalibratedWhite:0.02 alpha:blurRadius > 0 ? 0.12 : 0.27].CGColor;
+    NSColor *backdrop = g_backdropColor ?: [NSColor colorWithSRGBRed:0.02 green:0.02 blue:0.02 alpha:1];
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    g_dimView.layer.backgroundColor =
+        [backdrop colorWithAlphaComponent:atomic_load(&g_settingBackdropDimming) / 100.0].CGColor;
+    [CATransaction commit];
     for (RingEntry *entry in g_windowEntries) (void)resolvedThumbnail(entry);
     [g_ringView setNeedsDisplay:YES];
     // Avoid forcing a synchronous draw before the panel is ordered onscreen.
@@ -5014,6 +5052,19 @@ static void loadSettings(void) {
     CFIndex pointerStyle = CFPreferencesGetAppIntegerValue(CFSTR("PointerStyle"), kSettingsID, &pointerValid);
     atomic_store(&g_settingPointerStyle, pointerValid && pointerStyle >= PointerStyleArrow && pointerStyle <= PointerStyleHidden
                                              ? (int)pointerStyle : PointerStyleHidden);
+    Boolean highlightValid = false;
+    CFIndex highlight = CFPreferencesGetAppIntegerValue(CFSTR("HighlightColor"), kSettingsID, &highlightValid);
+    atomic_store(&g_settingHighlightColor, highlightValid && highlight >= HighlightSystem && highlight <= HighlightWhite
+                                               ? (int)highlight : HighlightWhite);
+    atomic_store(&g_settingShowLight, settingBool(CFSTR("ShowLight"), NO));
+    Boolean dimmingValid = false;
+    CFIndex dimming = CFPreferencesGetAppIntegerValue(CFSTR("BackdropDimming"), kSettingsID, &dimmingValid);
+    atomic_store(&g_settingBackdropDimming, dimmingValid ? (int)MIN(MAX(dimming, 0), 90) : 38);
+    NSArray *backdrop = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("BackdropColor"), kSettingsID));
+    if ([backdrop isKindOfClass:[NSArray class]] && backdrop.count == 3) {
+        g_backdropColor = [NSColor colorWithSRGBRed:[backdrop[0] doubleValue] green:[backdrop[1] doubleValue]
+                                               blue:[backdrop[2] doubleValue] alpha:1];
+    }
     Boolean blurValid = false;
     CFIndex blurRadius = CFPreferencesGetAppIntegerValue(CFSTR("BlurRadius"), kSettingsID, &blurValid);
     atomic_store(&g_settingBlurRadius, blurValid ? (int)MIN(MAX(blurRadius, 0), 40) : 15);
@@ -5161,6 +5212,7 @@ static NSString *lastOutputLine(NSString *output) {
 @property(nonatomic, strong) SettingsWindow *window;
 @property(nonatomic, strong) NSTextField *javaScriptHint;
 @property(nonatomic, strong) NSTextField *blurLabel;
+@property(nonatomic, strong) NSTextField *dimmingLabel;
 @property(nonatomic, strong) NSTextField *gestureWarning;
 @property(nonatomic, strong) NSTextField *mouseActivationLabel;
 @property(nonatomic, strong) NSTextField *mouseLearnStatus;
@@ -5320,6 +5372,34 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
     pointer.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
     pointer.selectedSegment = atomic_load(&g_settingPointerStyle);
 
+    NSTextField *highlightLabel = [self noteWithText:@"Okvir izabrane kartice i svetlo"];
+    NSSegmentedControl *highlight = [NSSegmentedControl segmentedControlWithLabels:@[@"Boja sistema", @"Belo"]
+                                                                      trackingMode:NSSegmentSwitchTrackingSelectOne
+                                                                            target:self
+                                                                            action:@selector(highlightColorChanged:)];
+    highlight.controlSize = NSControlSizeSmall;
+    highlight.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+    highlight.selectedSegment = atomic_load(&g_settingHighlightColor);
+    NSButton *light = [NSButton checkboxWithTitle:@"Svetlo u smeru prstiju"
+                                           target:self action:@selector(showLightChanged:)];
+    light.state = atomic_load(&g_settingShowLight) ? NSControlStateValueOn : NSControlStateValueOff;
+
+    self.dimmingLabel = [self noteWithText:@""];
+    [self updateDimmingLabel];
+    NSSlider *dimmingSlider = [NSSlider sliderWithValue:atomic_load(&g_settingBackdropDimming) minValue:0 maxValue:90
+                                                 target:self action:@selector(backdropDimmingChanged:)];
+    dimmingSlider.controlSize = NSControlSizeSmall;
+    NSColorWell *backdropWell = [NSColorWell colorWellWithStyle:NSColorWellStyleMinimal];
+    backdropWell.color = g_backdropColor ?: [NSColor colorWithSRGBRed:0.02 green:0.02 blue:0.02 alpha:1];
+    backdropWell.supportsAlpha = NO;
+    backdropWell.target = self;
+    backdropWell.action = @selector(backdropColorChanged:);
+    [backdropWell.widthAnchor constraintEqualToConstant:44].active = YES;
+    NSStackView *backdropRow = [NSStackView stackViewWithViews:@[backdropWell, dimmingSlider]];
+    backdropRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    backdropRow.spacing = 10;
+    [backdropRow.widthAnchor constraintEqualToConstant:kSettingsColumnWidth].active = YES;
+
     NSTextField *mouseTitle = [self sectionTitle:@"Aktivacija mišem"];
     self.mouseActivationLabel = [NSTextField labelWithString:@""];
     self.mouseActivationLabel.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
@@ -5398,7 +5478,8 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
     NSTextField *menuBarTitle = [self sectionTitle:@"Gornja traka"];
 
     NSStackView *cardsColumn = [self settingsColumn:@[cardsTitle, grouping, titlesLabel, titles, siteIcons, appIcons,
-                                                      finderTabs, lookTitle, pointerLabel, pointer,
+                                                      finderTabs, lookTitle, pointerLabel, pointer, highlightLabel, highlight,
+                                                      light, self.dimmingLabel, backdropRow,
                                                       self.blurLabel, blur, sounds]];
     [cardsColumn setCustomSpacing:kSettingsTitleGap afterView:cardsTitle];
     [cardsColumn setCustomSpacing:14 afterView:grouping];
@@ -5408,6 +5489,11 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
     [cardsColumn setCustomSpacing:kSettingsTitleGap afterView:lookTitle];
     [cardsColumn setCustomSpacing:4 afterView:pointerLabel];
     [cardsColumn setCustomSpacing:14 afterView:pointer];
+    [cardsColumn setCustomSpacing:4 afterView:highlightLabel];
+    [cardsColumn setCustomSpacing:8 afterView:highlight];
+    [cardsColumn setCustomSpacing:14 afterView:light];
+    [cardsColumn setCustomSpacing:4 afterView:self.dimmingLabel];
+    [cardsColumn setCustomSpacing:14 afterView:backdropRow];
     [cardsColumn setCustomSpacing:4 afterView:self.blurLabel];
     [cardsColumn setCustomSpacing:14 afterView:blur];
 
@@ -5639,6 +5725,43 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
     storeSetting(CFSTR("PointerStyle"), value);
     CFRelease(value);
     [g_ringView resetPointer];   // rebuilt with the new shape on the next open
+}
+
+- (void)highlightColorChanged:(NSSegmentedControl *)control {
+    int color = (int)MIN(MAX(control.selectedSegment, HighlightSystem), HighlightWhite);
+    atomic_store(&g_settingHighlightColor, color);
+    CFNumberRef value = CFNumberCreate(NULL, kCFNumberIntType, &color);
+    storeSetting(CFSTR("HighlightColor"), value);
+    CFRelease(value);
+    [g_ringView resetPointer];   // the arrow takes the new color on the next open
+}
+
+- (void)showLightChanged:(NSButton *)button {
+    BOOL on = button.state == NSControlStateValueOn;
+    atomic_store(&g_settingShowLight, on);
+    storeSetting(CFSTR("ShowLight"), on ? kCFBooleanTrue : kCFBooleanFalse);
+}
+
+- (void)updateDimmingLabel {
+    self.dimmingLabel.stringValue = [NSString stringWithFormat:@"Pozadina iza kartica: boja i jačina %d%%",
+                                     atomic_load(&g_settingBackdropDimming)];
+}
+
+- (void)backdropDimmingChanged:(NSSlider *)slider {
+    int dimming = (int)lround(slider.doubleValue);
+    atomic_store(&g_settingBackdropDimming, dimming);
+    CFNumberRef value = CFNumberCreate(NULL, kCFNumberIntType, &dimming);
+    storeSetting(CFSTR("BackdropDimming"), value);
+    CFRelease(value);
+    [self updateDimmingLabel];
+}
+
+- (void)backdropColorChanged:(NSColorWell *)well {
+    NSColor *color = [well.color colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
+    if (!color) return;
+    g_backdropColor = color;
+    NSArray *components = @[@(color.redComponent), @(color.greenComponent), @(color.blueComponent)];
+    storeSetting(CFSTR("BackdropColor"), (__bridge CFPropertyListRef)components);
 }
 
 - (void)disableMouseActivation:(NSButton *)button {
