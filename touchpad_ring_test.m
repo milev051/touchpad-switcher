@@ -122,12 +122,16 @@ static void noteChromeSelectionChanges(NSArray<RingEntry *> *entries);
 @property(nonatomic) NSInteger selectedIndex;
 @property(nonatomic) NSPoint anchorPoint;
 @property(nonatomic) CGFloat ringRadius;
+@property(nonatomic) CGFloat ringRadiusY;
+@property(nonatomic, strong) NSArray<NSValue *> *layoutRects;
+@property(nonatomic, strong) NSArray<RingEntry *> *layoutEntries;
+@property(nonatomic) NSSize layoutSize;
 @property(nonatomic, strong) NSView *pointerView;
 @property(nonatomic, strong) CAShapeLayer *pointerArrow;
 @property(nonatomic, weak) NSView *glowView;
 @property(nonatomic) NSPoint lastPointer;
-@property(nonatomic, strong) CALayer *focusLayer;
-@property(nonatomic) NSInteger focusIndex;
+@property(nonatomic, strong) NSMutableArray<CALayer *> *cardLayers;
+@property(nonatomic, strong) CALayer *hubLayer;
 - (void)movePointerTo:(NSPoint)ringPoint;
 - (void)resetPointer;
 - (void)resetSelectionVisuals;
@@ -176,7 +180,7 @@ static _Atomic(int) g_settingBlurRadius = 15;   // 0 turns the blur off
 static _Atomic(int) g_settingMouseButton = -1;
 typedef enum { PointerStyleArrow = 0, PointerStyleDot = 1, PointerStyleHidden = 2 } PointerStyle;
 static _Atomic(int) g_settingPointerStyle = PointerStyleHidden;
-// The selected card's outline and the light behind the cards: the accent
+// Boja pokazivača i svetla iza kartica: akcentna boja
 // color from System Settings > Appearance, like the rest of macOS, or white.
 typedef enum { HighlightSystem = 0, HighlightWhite = 1 } HighlightColor;
 static _Atomic(int) g_settingHighlightColor = HighlightWhite;
@@ -222,87 +226,195 @@ static BOOL shouldDrawCardLabel(RingEntry *entry) {
 - (void)otherMouseDragged:(NSEvent *)event { (void)event; }
 @end
 
+static const CGFloat kSelectedCardScale = 1.20;
+// I izbor po smeru prati elipsu koja je izračunata za trenutne prozore.
+static _Atomic(double) g_layoutAxisRatio = 1.0;
+static _Atomic(double) g_layoutCardAngles[512];
+static _Atomic(NSUInteger) g_layoutAngleCount = 0;
+static CGFloat cardFooterHeight(CGFloat width) { return MAX(26.0, width * 0.14); }
+
+// Elipsa sabija prazninu po visini kada su snimci pretežno horizontalni.
 static void ringEllipseRadii(NSUInteger count, CGFloat baseRadius, CGFloat *outRadiusX, CGFloat *outRadiusY) {
-    CGFloat scaleX = 1.0;
-    CGFloat scaleY = 1.0;
-    if (count == 6) {
-        scaleX = 1.15;
-        scaleY = 0.72;
-    } else if (count == 5) {
-        scaleX = 1.12;
-        scaleY = 0.72;
-    } else if (count >= 9) {
-        scaleX = 1.35;
-        scaleY = 0.90;
-    } else if (count >= 7) {
-        scaleX = 1.06;
-        scaleY = 0.82;
-    } else if (count >= 4) {
-        scaleX = 1.08;
-        scaleY = 0.78;
-    }
-    if (outRadiusX) *outRadiusX = baseRadius * scaleX;
-    if (outRadiusY) *outRadiusY = baseRadius * scaleY;
+    if (outRadiusX) *outRadiusX = baseRadius;
+    if (outRadiusY) *outRadiusY = baseRadius * atomic_load(&g_layoutAxisRatio);
 }
 
 static CGFloat rawItemAngle(NSInteger i, NSUInteger count) {
-    if (count == 5) {
-        static const CGFloat angles5[5] = {
-            (CGFloat)(M_PI_2),                   // 0: Top center
-            (CGFloat)(24.0 * M_PI / 180.0),       // 1: Upper-right
-            (CGFloat)(-57.0 * M_PI / 180.0),      // 2: Lower-right (harmoniously spaced, no overlap)
-            (CGFloat)(-123.0 * M_PI / 180.0),     // 3: Lower-left (harmoniously spaced, no overlap)
-            (CGFloat)(156.0 * M_PI / 180.0)       // 4: Upper-left
-        };
-        NSInteger idx = ((i % 5) + 5) % 5;
-        return angles5[idx];
-    }
-    return (CGFloat)M_PI_2 - (CGFloat)(2.0 * M_PI * i / count);
+    return count ? (CGFloat)M_PI_2 - (CGFloat)(2.0 * M_PI * i / count) : 0;
 }
 
-static CGFloat safeCardWidthForRing(NSUInteger count, CGFloat radiusX, CGFloat radiusY, CGFloat maxAvailableWidth) {
-    if (count <= 1) return MIN(600, maxAvailableWidth * 0.60);
-    if (count == 2) return MIN(540, maxAvailableWidth * 0.42);
+// Najkraći razmak između ivica dva pravougaonika, uključujući dijagonalu.
+static CGFloat rectangleGap(NSPoint a, NSSize sa, NSPoint b, NSSize sb) {
+    return hypot(MAX(0, fabs(a.x - b.x) - (sa.width + sb.width) / 2),
+                 MAX(0, fabs(a.y - b.y) - (sa.height + sb.height) / 2));
+}
 
-    const CGFloat minGap = 20.0;
-    const CGFloat selectedScale = 1.025;
-    CGFloat upperBound = (count >= 6 && count <= 10) ? 380.0 : 540.0;
+static NSSize layoutCardSize(NSSize unit, CGFloat longSide) {
+    CGFloat width = unit.width * longSide;
+    return NSMakeSize(width, unit.height * longSide + cardFooterHeight(width));
+}
 
-    // Find the widest card that fits every pair around the ellipse while keeping
-    // at least 20 px between preview bounds. Checking all pairs also protects
-    // against non-adjacent cards meeting on compact rings.
-    CGFloat low = 20.0;
-    CGFloat high = MIN(upperBound, maxAvailableWidth);
-    for (int pass = 0; pass < 24; pass++) {
-        CGFloat candidate = (low + high) * 0.5;
-        CGFloat previewWidth = candidate * 0.94 * selectedScale;
-        CGFloat previewHeight = previewWidth * 0.60;
-        BOOL fits = YES;
-
-        for (NSUInteger i = 0; i < count && fits; i++) {
-            CGFloat a1 = rawItemAngle(i, count);
-            CGFloat x1 = cos(a1) * radiusX, y1 = sin(a1) * radiusY;
-            for (NSUInteger j = i + 1; j < count; j++) {
-                CGFloat a2 = rawItemAngle(j, count);
-                CGFloat dx = fabs(cos(a2) * radiusX - x1);
-                CGFloat dy = fabs(sin(a2) * radiusY - y1);
-                if (dx < previewWidth + minGap && dy < previewHeight + minGap) {
-                    fits = NO;
-                    break;
+// Traži najkrupnije snimke i najkompaktniju elipsu bez sudara, sa prostorom
+// za selekciju, susede i centralnu ikonicu. Računa se jednom po otvaranju.
+static NSArray<NSValue *> *adaptiveCardLayout(NSArray<RingEntry *> *entries, NSSize screen,
+                                             CGFloat *outX, CGFloat *outY) {
+    NSUInteger count = entries.count;
+    if (!count) { *outX = *outY = 0; return @[]; }
+    NSSize *units = calloc(count, sizeof(NSSize));
+    NSSize *sizes = calloc(count, sizeof(NSSize));
+    NSPoint *directions = calloc(count, sizeof(NSPoint));
+    for (NSUInteger i = 0; i < count; i++) {
+        NSImage *image = resolvedThumbnail(entries[i]);
+        NSSize size = image.size;
+        CGFloat longest = MAX(size.width, size.height);
+        units[i] = longest > 0 ? NSMakeSize(size.width / longest, size.height / longest) : NSMakeSize(0.28, 0.28);
+        CGFloat angle = rawItemAngle(i, count);
+        directions[i] = NSMakePoint(cos(angle), sin(angle));
+    }
+    CGFloat bestSize = 0, bestRadius = 0, bestRatio = 1, bestArea = CGFLOAT_MAX;
+    for (int shape = 0; shape <= 36; shape++) {
+        CGFloat ratio = 0.35 + shape * 0.05;
+        CGFloat low = 0, high = 480;
+        CGFloat acceptedRadius = 0;
+        for (int pass = 0; pass < 19; pass++) {
+            CGFloat candidate = (low + high) / 2;
+            CGFloat maximumRadius = CGFLOAT_MAX;
+            for (NSUInteger i = 0; i < count; i++) {
+                sizes[i] = layoutCardSize(units[i], candidate);
+                sizes[i].width *= kSelectedCardScale;
+                sizes[i].height *= kSelectedCardScale;
+                CGFloat x = fabs(directions[i].x), y = fabs(directions[i].y) * ratio;
+                if (x > 0.001) maximumRadius = MIN(maximumRadius, (screen.width / 2 - 44 - sizes[i].width / 2) / x);
+                if (y > 0.001) maximumRadius = MIN(maximumRadius, (screen.height / 2 - 44 - sizes[i].height / 2) / y);
+            }
+            CGFloat minimumRadius = 0, upperRadius = MAX(0, maximumRadius);
+            BOOL fits = maximumRadius > 0;
+            // Binarna pretraga najmanjeg poluprečnika pri zadatoj veličini.
+            for (int radiusPass = 0; radiusPass < 17; radiusPass++) {
+                CGFloat radius = (minimumRadius + upperRadius) / 2;
+                BOOL clear = YES;
+                for (NSUInteger i = 0; i < count && clear; i++) {
+                    NSPoint a = NSMakePoint(directions[i].x * radius, directions[i].y * radius * ratio);
+                    clear = rectangleGap(a, sizes[i], NSZeroPoint, NSMakeSize(kHubRadius * 2, kHubRadius * 2)) >= 30;
+                    for (NSUInteger j = i + 1; j < count && clear; j++) {
+                        NSPoint b = NSMakePoint(directions[j].x * radius, directions[j].y * radius * ratio);
+                        clear = rectangleGap(a, sizes[i], b, sizes[j]) >= 24;
+                    }
+                }
+                if (clear) upperRadius = radius;
+                else minimumRadius = radius;
+            }
+            // Provera i na gornjoj granici sprečava prihvatanje nemogućeg rasporeda.
+            for (NSUInteger i = 0; i < count && fits; i++) {
+                NSPoint a = NSMakePoint(directions[i].x * upperRadius, directions[i].y * upperRadius * ratio);
+                fits = rectangleGap(a, sizes[i], NSZeroPoint, NSMakeSize(kHubRadius * 2, kHubRadius * 2)) >= 29.99;
+                for (NSUInteger j = i + 1; j < count && fits; j++) {
+                    NSPoint b = NSMakePoint(directions[j].x * upperRadius, directions[j].y * upperRadius * ratio);
+                    fits = rectangleGap(a, sizes[i], b, sizes[j]) >= 23.99;
                 }
             }
+            if (fits) { low = candidate; acceptedRadius = upperRadius; }
+            else high = candidate;
         }
-
-        if (fits) low = candidate;
-        else high = candidate;
+        CGFloat area = acceptedRadius * acceptedRadius * ratio;
+        if (low > bestSize + 0.1 || (fabs(low - bestSize) <= 0.1 && area < bestArea)) {
+            bestSize = low; bestRadius = acceptedRadius; bestRatio = ratio; bestArea = area;
+        }
     }
-
-    return low;
+    NSPoint *positions = calloc(count, sizeof(NSPoint));
+    NSPoint *adjustments = calloc(count, sizeof(NSPoint));
+    for (NSUInteger i = 0; i < count; i++) {
+        sizes[i] = layoutCardSize(units[i], bestSize);
+        positions[i] = NSMakePoint(directions[i].x * bestRadius, directions[i].y * bestRadius * bestRatio);
+    }
+    // Zatvara preostale praznine između suseda. Sile deluju po najkraćoj
+    // liniji između ivica, umesto po rastojanju centara pravougaonika.
+    for (int pass = 0; pass < 180; pass++) {
+        memset(adjustments, 0, count * sizeof(NSPoint));
+        for (NSUInteger i = 0; i < count; i++) {
+            for (NSUInteger j = i + 1; j < count; j++) {
+                CGFloat dx = positions[j].x - positions[i].x;
+                CGFloat dy = positions[j].y - positions[i].y;
+                CGFloat halfX = (sizes[i].width + sizes[j].width) * kSelectedCardScale / 2;
+                CGFloat halfY = (sizes[i].height + sizes[j].height) * kSelectedCardScale / 2;
+                CGFloat gapX = MAX(0, fabs(dx) - halfX), gapY = MAX(0, fabs(dy) - halfY);
+                CGFloat distance = hypot(gapX, gapY);
+                BOOL neighbors = j == i + 1 || (i == 0 && j == count - 1);
+                CGFloat force = neighbors ? (distance - 24) * 0.10 : MIN(0, distance - 24) * 0.20;
+                CGFloat nx, ny;
+                if (distance > 0.001) {
+                    nx = copysign(gapX / distance, dx); ny = copysign(gapY / distance, dy);
+                } else {
+                    BOOL horizontal = halfX - fabs(dx) < halfY - fabs(dy);
+                    nx = horizontal ? (dx >= 0 ? 1 : -1) : 0;
+                    ny = horizontal ? 0 : (dy >= 0 ? 1 : -1);
+                    force = -(24 + MIN(halfX - fabs(dx), halfY - fabs(dy))) * 0.20;
+                }
+                adjustments[i].x += nx * force; adjustments[i].y += ny * force;
+                adjustments[j].x -= nx * force; adjustments[j].y -= ny * force;
+            }
+        }
+        for (NSUInteger i = 0; i < count; i++) {
+            positions[i].x += adjustments[i].x;
+            positions[i].y += adjustments[i].y;
+            CGFloat halfX = sizes[i].width * kSelectedCardScale / 2 + kHubRadius;
+            CGFloat halfY = sizes[i].height * kSelectedCardScale / 2 + kHubRadius;
+            CGFloat gapX = MAX(0, fabs(positions[i].x) - halfX);
+            CGFloat gapY = MAX(0, fabs(positions[i].y) - halfY);
+            CGFloat distance = hypot(gapX, gapY);
+            if (distance < 30) {
+                if (distance > 0.001) {
+                    positions[i].x += copysign(gapX / distance * (30-distance), positions[i].x);
+                    positions[i].y += copysign(gapY / distance * (30-distance), positions[i].y);
+                } else if (halfX - fabs(positions[i].x) < halfY - fabs(positions[i].y)) {
+                    positions[i].x = copysign(halfX + 30, positions[i].x);
+                } else {
+                    positions[i].y = copysign(halfY + 30, positions[i].y);
+                }
+            }
+            CGFloat limitX = MAX(0, screen.width/2 - 44 - sizes[i].width*kSelectedCardScale/2);
+            CGFloat limitY = MAX(0, screen.height/2 - 44 - sizes[i].height*kSelectedCardScale/2);
+            positions[i].x = MAX(-limitX, MIN(limitX, positions[i].x));
+            positions[i].y = MAX(-limitY, MIN(limitY, positions[i].y));
+        }
+    }
+    // Kompaktiranje se prihvata samo kada ostanu redosled, razmaci i rezerva
+    // za susede. Složena kombinacija zadržava prethodno proverenu elipsu.
+    BOOL compactFits = YES;
+    for (NSUInteger i = 0; i < count && compactFits; i++) {
+        NSSize scaled = NSMakeSize(sizes[i].width*kSelectedCardScale, sizes[i].height*kSelectedCardScale);
+        compactFits = rectangleGap(positions[i], scaled, NSZeroPoint, NSMakeSize(kHubRadius*2,kHubRadius*2)) >= 28;
+        if (count > 2) {
+            NSPoint next = positions[(i+1)%count];
+            CGFloat step = fmod(atan2(positions[i].y,positions[i].x)-atan2(next.y,next.x)+2*M_PI,2*M_PI);
+            compactFits = compactFits && step > 0.02 && step < M_PI-0.02;
+        }
+        for (NSUInteger j = i+1; j < count && compactFits; j++) {
+            NSSize other = NSMakeSize(sizes[j].width*kSelectedCardScale, sizes[j].height*kSelectedCardScale);
+            compactFits = rectangleGap(positions[i],scaled,positions[j],other) >= 20;
+        }
+    }
+    if (!compactFits) for (NSUInteger i = 0; i < count; i++) {
+        positions[i] = NSMakePoint(directions[i].x * bestRadius, directions[i].y * bestRadius * bestRatio);
+    }
+    NSMutableArray *rects = [NSMutableArray arrayWithCapacity:count];
+    for (NSUInteger i = 0; i < count; i++) {
+        NSSize size = sizes[i];
+        NSPoint center = NSMakePoint(screen.width / 2 + positions[i].x, screen.height / 2 + positions[i].y);
+        [rects addObject:[NSValue valueWithRect:NSMakeRect(center.x - size.width / 2,
+                                                         center.y - size.height / 2, size.width, size.height)]];
+    }
+    free(positions); free(adjustments);
+    free(units); free(sizes); free(directions);
+    *outX = bestRadius; *outY = bestRadius * bestRatio;
+    return rects;
 }
 
 // Direction of a card as seen on screen (the ring is an ellipse, so this is not
 // the raw layout angle).
 static CGFloat cardScreenAngle(NSInteger i, NSUInteger count) {
+    if (i >= 0 && (NSUInteger)i < count && count == atomic_load(&g_layoutAngleCount))
+        return atomic_load(&g_layoutCardAngles[i]);
     CGFloat radiusX = 1.0, radiusY = 1.0;
     ringEllipseRadii(count, 1.0, &radiusX, &radiusY);
     CGFloat rawAngle = rawItemAngle(i, count);
@@ -527,40 +639,37 @@ static const CGFloat kBeamMaxWidth = 3.6;   // radians; a soft glow all around t
     return self;
 }
 
-// The drawn card, the same rectangle drawRect uses: a preview for windows with
-// a picture and for Chrome tabs, a smaller icon card otherwise.
-- (NSRect)cardRectForIndex:(NSInteger)index {
-    NSUInteger count = self.entries.count;
-    if (index < 0 || index >= (NSInteger)count) return NSZeroRect;
-    CGFloat radiusX = self.ringRadius, radiusY = self.ringRadius;
-    ringEllipseRadii(count, self.ringRadius, &radiusX, &radiusY);
-    CGFloat cardWidth = safeCardWidthForRing(count, radiusX, radiusY, NSWidth(self.bounds));
-    CGFloat previewWidth = cardWidth * 0.94;
-    CGFloat rawAngle = rawItemAngle(index, count);
-    NSPoint itemCenter = NSMakePoint(self.anchorPoint.x + cos(rawAngle) * radiusX,
-                                     self.anchorPoint.y + sin(rawAngle) * radiusY);
-    RingEntry *entry = self.entries[(NSUInteger)index];
-    BOOL preview = entry.thumbnail || entry.thumbnailData.length ||
-        [entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"];
-    if (preview) {
-        CGFloat height = previewWidth * 0.60;
-        return NSMakeRect(itemCenter.x - previewWidth / 2.0, itemCenter.y - height / 2.0, previewWidth, height);
+- (void)prepareCardLayout {
+    if (self.layoutEntries == self.entries && NSEqualSizes(self.layoutSize, self.bounds.size)) return;
+    CGFloat radiusX, radiusY;
+    self.layoutRects = adaptiveCardLayout(self.entries, self.bounds.size, &radiusX, &radiusY);
+    self.layoutEntries = self.entries;
+    self.layoutSize = self.bounds.size;
+    self.ringRadius = radiusX;
+    self.ringRadiusY = radiusY;
+    self.anchorPoint = NSMakePoint(NSMidX(self.bounds), NSMidY(self.bounds));
+    atomic_store(&g_layoutAxisRatio, radiusX > 0 ? radiusY / radiusX : 1);
+    NSUInteger count = self.layoutRects.count;
+    if (count <= 512) for (NSUInteger i = 0; i < count; i++) {
+        NSRect rect = self.layoutRects[i].rectValue;
+        atomic_store(&g_layoutCardAngles[i], atan2(NSMidY(rect)-self.anchorPoint.y, NSMidX(rect)-self.anchorPoint.x));
     }
-    CGFloat iconSize = MIN(140, MAX(54, cardWidth * 0.42));
-    return NSInsetRect(NSMakeRect(itemCenter.x - iconSize / 2.0, itemCenter.y - iconSize / 2.0, iconSize, iconSize),
-                       -8.0, -8.0);
+    atomic_store(&g_layoutAngleCount, count <= 512 ? count : 0);
 }
 
-// The selected card is a copy of it in its own layer, a little larger and
-// outlined. It fades in on the new card while the previous one fades out and
-// shrinks back, instead of an outline gliding from card to card.
-static const CGFloat kSelectedCardScale = 1.08;
+- (NSRect)cardRectForIndex:(NSInteger)index {
+    [self prepareCardLayout];
+    return index >= 0 && index < (NSInteger)self.layoutRects.count ? self.layoutRects[index].rectValue : NSZeroRect;
+}
 
-// The card exactly as drawRect draws it, as an image for the selection layer.
+static const CGFloat kCardImagePadding = 24.0;
+
+// Slika kartice sa prostorom za senku oko thumbnaila.
 - (id)cardImageForIndex:(NSInteger)index rect:(NSRect)rect {
     CGFloat scale = self.window.backingScaleFactor ?: 2.0;
-    size_t pixelsWide = (size_t)ceil(NSWidth(rect) * scale);
-    size_t pixelsHigh = (size_t)ceil(NSHeight(rect) * scale);
+    NSRect imageRect = NSInsetRect(rect, -kCardImagePadding, -kCardImagePadding);
+    size_t pixelsWide = (size_t)ceil(NSWidth(imageRect) * scale);
+    size_t pixelsHigh = (size_t)ceil(NSHeight(imageRect) * scale);
     if (pixelsWide == 0 || pixelsHigh == 0) return nil;
     CGColorSpaceRef sRGB = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     CGContextRef bitmap = CGBitmapContextCreate(NULL, pixelsWide, pixelsHigh, 8, 0, sRGB,
@@ -568,139 +677,175 @@ static const CGFloat kSelectedCardScale = 1.08;
     CGColorSpaceRelease(sRGB);
     if (!bitmap) return nil;
     CGContextScaleCTM(bitmap, scale, scale);
-    CGContextTranslateCTM(bitmap, -NSMinX(rect), -NSMinY(rect));
-    NSUInteger count = self.entries.count;
-    CGFloat radiusX = self.ringRadius, radiusY = self.ringRadius;
-    ringEllipseRadii(count, self.ringRadius, &radiusX, &radiusY);
-    CGFloat cardWidth = safeCardWidthForRing(count, radiusX, radiusY, NSWidth(self.bounds));
+    CGContextTranslateCTM(bitmap, -NSMinX(imageRect), -NSMinY(imageRect));
     [NSGraphicsContext saveGraphicsState];
     NSGraphicsContext.currentContext = [NSGraphicsContext graphicsContextWithCGContext:bitmap flipped:NO];
-    [self drawCardForEntry:self.entries[(NSUInteger)index]
-                  atCenter:NSMakePoint(NSMidX(rect), NSMidY(rect))
-                 cardWidth:cardWidth];
+    [self drawCardForEntry:self.entries[(NSUInteger)index] inRect:rect];
     [NSGraphicsContext restoreGraphicsState];
     CGImageRef image = CGBitmapContextCreateImage(bitmap);
     CGContextRelease(bitmap);
     return CFBridgingRelease(image);
 }
 
-// Places the selection layer on its card and paints the card into it.
-- (void)fillFocusLayer:(CALayer *)focus index:(NSInteger)index {
-    NSRect rect = [self cardRectForIndex:index];
-    focus.bounds = CGRectMake(0, 0, NSWidth(rect), NSHeight(rect));
-    focus.position = CGPointMake(NSMidX(rect), NSMidY(rect));
-    focus.contentsScale = self.window.backingScaleFactor ?: 2.0;
-    focus.contents = [self cardImageForIndex:index rect:rect];
-    CGPathRef outline = CGPathCreateWithRoundedRect(focus.bounds, 8.0, 8.0, NULL);
-    focus.shadowPath = outline;
-    CGPathRelease(outline);
-}
-
-- (void)updateFocusAnimated:(BOOL)animated {
-    NSInteger index = self.selectedIndex;
-    BOOL hasSelection = index >= 0 && index < (NSInteger)self.entries.count;
-    if (hasSelection && self.focusLayer && self.focusIndex == index) return;
-
-    CALayer *previous = self.focusLayer;
-    self.focusLayer = nil;
-    if (previous) {
-        CALayer *shown = (CALayer *)previous.presentationLayer ?: previous;
-        NSNumber *fromOpacity = @(shown.opacity);
-        NSNumber *fromScale = [shown valueForKeyPath:@"transform.scale"] ?: @(kSelectedCardScale);
+// Svaka kartica ima svoj sloj, bez duplikata iza uvećanog thumbnaila.
+- (void)updateCardLayersAnimated:(BOOL)animated refreshContents:(BOOL)refresh {
+    [self prepareCardLayout];
+    if (!self.cardLayers) self.cardLayers = [NSMutableArray array];
+    BOOL rebuilt = self.cardLayers.count != self.entries.count;
+    if (rebuilt) {
+        for (CALayer *layer in self.cardLayers) [layer removeFromSuperlayer];
+        [self.cardLayers removeAllObjects];
+        for (NSUInteger i = 0; i < self.entries.count; i++) {
+            CALayer *layer = [CALayer layer];
+            [self.layer addSublayer:layer];
+            [self.cardLayers addObject:layer];
+        }
+    }
+    NSInteger selected = self.selectedIndex;
+    BOOL hasSelection = selected >= 0 && selected < (NSInteger)self.entries.count;
+    NSRect selectedRect = hasSelection ? [self cardRectForIndex:selected] : NSZeroRect;
+    for (NSUInteger i = 0; i < self.cardLayers.count; i++) {
+        CALayer *layer = self.cardLayers[i];
+        CALayer *shown = (CALayer *)layer.presentationLayer ?: layer;
+        CGPoint fromPosition = shown.position;
+        NSNumber *fromScale = [shown valueForKeyPath:@"transform.scale"] ?: @1.0;
+        CGFloat fromGlow = shown.shadowOpacity;
+        NSRect rect = [self cardRectForIndex:i];
+        CGPoint position = CGPointMake(NSMidX(rect), NSMidY(rect));
+        BOOL isSelected = hasSelection && (NSInteger)i == selected;
+        if (hasSelection && !isSelected) {
+            // Oba suseda se odmaknu od izabrane kartice, do 18 tačaka.
+            NSUInteger distance = MIN((i + self.entries.count - selected) % self.entries.count,
+                                      (selected + self.entries.count - i) % self.entries.count);
+            if (distance == 1) {
+                CGFloat dx = position.x - NSMidX(selectedRect);
+                CGFloat dy = position.y - NSMidY(selectedRect);
+                CGFloat length = hypot(dx, dy);
+                CGFloat push = MIN(18.0, NSWidth(selectedRect) * 0.055);
+                if (length > 0) {
+                    position.x += dx / length * push;
+                    position.y += dy / length * push;
+                }
+            }
+        }
+        CGFloat scale = isSelected ? kSelectedCardScale : 1.0;
+        // Uvećanje i pomeranje ostaju unutar ivica ekrana.
+        CGFloat halfWidth = NSWidth(rect) * scale / 2.0 + 8.0;
+        CGFloat halfHeight = NSHeight(rect) * scale / 2.0 + 8.0;
+        position.x = MAX(halfWidth, MIN(NSWidth(self.bounds) - halfWidth, position.x));
+        position.y = MAX(halfHeight, MIN(NSHeight(self.bounds) - halfHeight, position.y));
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
-        [CATransaction setCompletionBlock:^{ [previous removeFromSuperlayer]; }];
-        [previous removeAllAnimations];
-        previous.opacity = 0;
-        previous.transform = CATransform3DIdentity;
-        if (animated) {
-            CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
-            fade.fromValue = fromOpacity;
-            fade.toValue = @0.0;
-            CABasicAnimation *shrink = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
-            shrink.fromValue = fromScale;
-            shrink.toValue = @1.0;
-            CAAnimationGroup *leave = [CAAnimationGroup animation];
-            leave.animations = @[fade, shrink];
-            leave.duration = 0.16;
-            leave.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
-            [previous addAnimation:leave forKey:@"leave"];
+        layer.bounds = CGRectMake(0, 0, NSWidth(rect) + kCardImagePadding * 2,
+                                        NSHeight(rect) + kCardImagePadding * 2);
+        layer.position = position;
+        layer.contentsScale = self.window.backingScaleFactor ?: 2.0;
+        if (refresh || rebuilt) layer.contents = [self cardImageForIndex:i rect:rect];
+        layer.zPosition = isSelected ? 5 : 1;
+        // Mekan sjaj prati oblik kartice, bez okvira i pomerene senke.
+        layer.shadowColor = ringHighlightColor().CGColor;
+        layer.shadowRadius = 22.0;
+        layer.shadowOffset = CGSizeZero;
+        layer.shadowOpacity = isSelected ? 0.42 : 0.0;
+        CGRect glowRect = CGRectInset(layer.bounds, kCardImagePadding, kCardImagePadding);
+        CGFloat footer = cardFooterHeight(NSWidth(rect));
+        glowRect.origin.y += footer;
+        glowRect.size.height -= footer;
+        NSImage *thumbnail = resolvedThumbnail(self.entries[i]);
+        if (thumbnail.size.width > 0 && thumbnail.size.height > 0) {
+            CGFloat fit = MIN(glowRect.size.width / thumbnail.size.width,
+                              glowRect.size.height / thumbnail.size.height);
+            CGSize imageSize = CGSizeMake(thumbnail.size.width * fit, thumbnail.size.height * fit);
+            glowRect = CGRectMake(CGRectGetMidX(glowRect) - imageSize.width / 2,
+                                  CGRectGetMidY(glowRect) - imageSize.height / 2,
+                                  imageSize.width, imageSize.height);
+        }
+        CGPathRef glowPath = thumbnail
+            ? CGPathCreateWithRoundedRect(glowRect, 8.0, 8.0, NULL) : NULL;
+        layer.shadowPath = glowPath;
+        if (glowPath) CGPathRelease(glowPath);
+        layer.transform = CATransform3DMakeScale(scale, scale, 1);
+        if (animated && !rebuilt) {
+            CABasicAnimation *glow = [CABasicAnimation animationWithKeyPath:@"shadowOpacity"];
+            glow.fromValue = @(fromGlow);
+            glow.toValue = @(layer.shadowOpacity);
+            glow.duration = 0.18;
+            glow.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+            [layer addAnimation:glow forKey:@"glow"];
+            CASpringAnimation *move = [CASpringAnimation animationWithKeyPath:@"position"];
+            move.fromValue = [NSValue valueWithPoint:NSPointFromCGPoint(fromPosition)];
+            move.toValue = [NSValue valueWithPoint:NSPointFromCGPoint(position)];
+            move.stiffness = 320;
+            move.damping = 25;
+            move.duration = move.settlingDuration;
+            [layer addAnimation:move forKey:@"move"];
+            CASpringAnimation *zoom = [CASpringAnimation animationWithKeyPath:@"transform.scale"];
+            zoom.fromValue = fromScale;
+            zoom.toValue = @(scale);
+            zoom.stiffness = 320;
+            zoom.damping = 24;
+            zoom.duration = zoom.settlingDuration;
+            [layer addAnimation:zoom forKey:@"zoom"];
         }
         [CATransaction commit];
     }
-    if (!hasSelection) return;
-
-    // Outlined in the highlight color and lifted on a soft dark shadow, like a
-    // selected window in Mission Control.
-    CALayer *focus = [CALayer layer];
-    focus.contentsGravity = kCAGravityResize;
-    focus.borderColor = [ringHighlightColor() colorWithAlphaComponent:0.95].CGColor;
-    focus.borderWidth = 2.0;
-    focus.cornerRadius = 8.0;
-    focus.shadowColor = NSColor.blackColor.CGColor;
-    focus.shadowOpacity = 0.5;
-    focus.shadowRadius = 16.0;
-    focus.shadowOffset = CGSizeMake(0, -6);
-    focus.zPosition = 5;   // above the cards, under the pointer
-    [self fillFocusLayer:focus index:index];
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    focus.transform = CATransform3DMakeScale(kSelectedCardScale, kSelectedCardScale, 1);
-    [self.layer addSublayer:focus];
-    if (animated) {
-        CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
-        fade.fromValue = @0.0;
-        fade.toValue = @1.0;
-        fade.duration = 0.16;
-        fade.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
-        [focus addAnimation:fade forKey:@"fade"];
-        CASpringAnimation *zoom = [CASpringAnimation animationWithKeyPath:@"transform.scale"];
-        zoom.fromValue = @1.0;
-        zoom.toValue = @(kSelectedCardScale);
-        zoom.stiffness = 320;
-        zoom.damping = 24;
-        zoom.duration = zoom.settlingDuration;
-        [focus addAnimation:zoom forKey:@"zoom"];
-    }
-    [CATransaction commit];
-    self.focusLayer = focus;
-    self.focusIndex = index;
 }
 
-// A picture that arrived while the card is selected, or a card that changed
-// size, is copied into the selection layer without animating it again.
-- (void)refreshFocusContents {
-    CALayer *focus = self.focusLayer;
-    if (!focus) return;
-    if (self.focusIndex != self.selectedIndex || self.focusIndex >= (NSInteger)self.entries.count) {
-        [self updateFocusAnimated:NO];
-        return;
+- (void)updateHubAnimated:(BOOL)animated {
+    if (!self.hubLayer) {
+        self.hubLayer = [CALayer layer];
+        self.hubLayer.zPosition = 6;
+        self.hubLayer.shadowColor = NSColor.blackColor.CGColor;
+        self.hubLayer.shadowOpacity = 0.55;
+        self.hubLayer.shadowRadius = 12;
+        self.hubLayer.shadowOffset = CGSizeMake(0, -2);
+        [self.layer addSublayer:self.hubLayer];
     }
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    [self fillFocusLayer:focus index:self.focusIndex];
+    NSInteger selected = self.selectedIndex;
+    BOOL valid = selected >= 0 && selected < (NSInteger)self.entries.count;
+    self.hubLayer.hidden = !valid;
+    if (valid) {
+        RingEntry *entry = self.entries[(NSUInteger)selected];
+        NSImage *siteIcon = [entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"] &&
+                            atomic_load(&g_settingShowSiteIcons) ? RingFaviconForURL(entry.tabURL) : nil;
+        NSImage *icon = siteIcon ?: entry.icon;
+        CGFloat size = siteIcon ? kHubRadius * 1.25 : kHubRadius * 1.8;
+        self.hubLayer.bounds = CGRectMake(0, 0, size, size);
+        self.hubLayer.position = NSPointToCGPoint(self.anchorPoint);
+        self.hubLayer.contentsScale = self.window.backingScaleFactor ?: 2.0;
+        NSRect iconRect = NSMakeRect(0, 0, size, size);
+        self.hubLayer.contents = (__bridge id)[icon CGImageForProposedRect:&iconRect context:nil hints:nil];
+        if (animated) {
+            CALayer *shown = (CALayer *)self.hubLayer.presentationLayer ?: self.hubLayer;
+            NSNumber *fromScale = [shown valueForKeyPath:@"transform.scale"] ?: @1.0;
+            CAKeyframeAnimation *pop = [CAKeyframeAnimation animationWithKeyPath:@"transform.scale"];
+            pop.values = @[fromScale, @0.86, @1.16, @1.0];
+            pop.keyTimes = @[@0, @0.16, @0.5, @1];
+            pop.duration = 0.34;
+            pop.calculationMode = kCAAnimationCubic;
+            [self.hubLayer addAnimation:pop forKey:@"pop"];
+        }
+    } else {
+        [self.hubLayer removeAllAnimations];
+    }
     [CATransaction commit];
 }
 
 - (void)resetSelectionVisuals {
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    [self.focusLayer removeFromSuperlayer];
-    self.focusLayer = nil;
-    [CATransaction commit];
+    for (CALayer *layer in self.cardLayers) [layer removeFromSuperlayer];
+    self.cardLayers = nil;
+    [self.hubLayer removeFromSuperlayer];
+    self.hubLayer = nil;
     [(SectorGlowView *)self.glowView hideAnimated:NO];
 }
 
 - (void)setSelectedIndex:(NSInteger)selectedIndex {
     if (_selectedIndex == selectedIndex) return;
     _selectedIndex = selectedIndex;
-    // Cards no longer change when selected, only the hub icon does; the
-    // outline and the light are layers.
-    // The center icon with its shadow can reach about 1.2 hub radii out.
-    CGFloat iconReach = kHubRadius * 1.2 + 16.0;
-    [self setNeedsDisplayInRect:NSMakeRect(self.anchorPoint.x - iconReach, self.anchorPoint.y - iconReach,
-                                           iconReach * 2.0, iconReach * 2.0)];
-    [self updateFocusAnimated:YES];
+    [self updateCardLayersAnimated:YES refreshContents:NO];
+    [self updateHubAnimated:YES];
     if (selectedIndex >= 0 && selectedIndex < (NSInteger)self.entries.count) {
         [self updateGlow];
         playRingSound(g_selectSound);
@@ -762,7 +907,7 @@ static const CGFloat kSelectedCardScale = 1.08;
         arrow.affineTransform = CGAffineTransformMakeRotation((CGFloat)M_PI_2);
         [holder.layer addSublayer:arrow];
         holder.hidden = atomic_load(&g_settingPointerStyle) == PointerStyleHidden;
-        holder.layer.zPosition = 10;   // above the selection outline
+        holder.layer.zPosition = 10;   // iznad kartica
         [self addSubview:holder];
         self.pointerView = holder;
         self.pointerArrow = arrow;
@@ -785,12 +930,6 @@ static const CGFloat kSelectedCardScale = 1.08;
 
 - (void)drawRect:(NSRect)dirtyRect {
     [super drawRect:dirtyRect];
-    NSRect selectedCard = [self cardRectForIndex:self.focusIndex];
-    if (self.focusLayer && NSIntersectsRect(NSInsetRect(selectedCard, -30.0, -30.0), dirtyRect)) {
-        // A picture that just arrived can change the selected card.
-        dispatch_async(dispatch_get_main_queue(), ^{ [self refreshFocusContents]; });
-    }
-    NSRect bounds = self.bounds;
     NSPoint center = self.anchorPoint;
     NSUInteger count = self.entries.count;
     if (count == 0) {
@@ -802,225 +941,43 @@ static const CGFloat kSelectedCardScale = 1.08;
         return;
     }
 
-    CGFloat radius = self.ringRadius;
-    CGFloat radiusX = radius, radiusY = radius;
-    ringEllipseRadii(count, radius, &radiusX, &radiusY);
-
-    NSInteger selectedIndex = self.selectedIndex;
-
-    // The icon of the selected app in the center, on its own without a
-    // circle behind it, so the choice is readable where the eye already is.
-    CGFloat hubRadius = kHubRadius;
-    if (selectedIndex >= 0 && selectedIndex < (NSInteger)count) {
-        // A Chrome tab shows its site's icon here too, when site icons are on.
-        RingEntry *selectedEntry = self.entries[(NSUInteger)selectedIndex];
-        NSImage *siteIcon = [selectedEntry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"] &&
-                            atomic_load(&g_settingShowSiteIcons) ? RingFaviconForURL(selectedEntry.tabURL) : nil;
-        // App icons carry their own margin, site icons do not.
-        CGFloat iconSize = siteIcon ? hubRadius * 1.25 : hubRadius * 1.8;
-        [NSGraphicsContext saveGraphicsState];
-        [NSGraphicsContext currentContext].imageInterpolation = NSImageInterpolationHigh;
-        NSShadow *iconShadow = [NSShadow new];
-        iconShadow.shadowBlurRadius = 12.0;
-        iconShadow.shadowOffset = NSMakeSize(0, -2);
-        iconShadow.shadowColor = [NSColor colorWithCalibratedWhite:0.0 alpha:0.55];
-        [iconShadow set];
-        [(siteIcon ?: selectedEntry.icon) drawInRect:NSMakeRect(center.x - iconSize / 2.0, center.y - iconSize / 2.0,
-                                                                iconSize, iconSize)];
-        [NSGraphicsContext restoreGraphicsState];
-    }
-
-    CGFloat cardWidth = safeCardWidthForRing(count, radiusX, radiusY, NSWidth(bounds));
-    CGFloat previewWidth = cardWidth * 0.94;
-    for (NSUInteger i = 0; i < count; i++) {
-        CGFloat rawAngle = rawItemAngle(i, count);
-        NSPoint itemCenter = NSMakePoint(center.x + cos(rawAngle) * radiusX,
-                                         center.y + sin(rawAngle) * radiusY);
-        CGFloat cardHeight = previewWidth * 0.60;
-        NSRect cardArea = NSInsetRect(NSMakeRect(itemCenter.x - previewWidth / 2.0, itemCenter.y - cardHeight / 2.0,
-                                                 previewWidth, cardHeight), -30.0, -30.0);
-        if (!NSIntersectsRect(cardArea, dirtyRect)) continue;
-        [self drawCardForEntry:self.entries[i] atCenter:itemCenter cardWidth:cardWidth];
-    }
+    // Nov thumbnail ili favicon osveži sadržaj bez ponavljanja animacije.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self updateCardLayersAnimated:NO refreshContents:YES];
+        [self updateHubAnimated:NO];
+    });
 }
 
-// One card around itemCenter: a preview for windows with a picture and for
-// Chrome tabs, a smaller icon card otherwise.
-- (void)drawCardForEntry:(RingEntry *)entry atCenter:(NSPoint)itemCenter cardWidth:(CGFloat)cardWidth {
-    CGFloat previewWidth = cardWidth * 0.94;
-    // The selection layer marks the selection; cards draw unselected.
-    BOOL selected = NO;
+// Bez podloge i okvira; ikonica je centrirana preko donje ivice snimka.
+- (void)drawCardForEntry:(RingEntry *)entry inRect:(NSRect)card {
+    CGFloat footer = cardFooterHeight(NSWidth(card));
+    NSRect content = NSMakeRect(NSMinX(card), NSMinY(card) + footer,
+                                NSWidth(card), MAX(1, NSHeight(card) - footer));
     NSImage *thumbnail = resolvedThumbnail(entry);
-    if (thumbnail) {
-        CGFloat itemPreviewWidth = previewWidth;
-        CGFloat previewHeight = itemPreviewWidth * 0.60;
-        CGFloat previewY = itemCenter.y - previewHeight / 2;
-        NSRect previewRect = NSMakeRect(itemCenter.x - itemPreviewWidth / 2,
-                                        previewY, itemPreviewWidth, previewHeight);
-
-        // 1. Drop shadow behind the card
+    NSGraphicsContext.currentContext.imageInterpolation = NSImageInterpolationHigh;
+    if (thumbnail && thumbnail.size.width > 0 && thumbnail.size.height > 0) {
+        CGFloat scale = MIN(NSWidth(content) / thumbnail.size.width, NSHeight(content) / thumbnail.size.height);
+        NSSize fitted = NSMakeSize(thumbnail.size.width * scale, thumbnail.size.height * scale);
+        NSRect imageRect = NSMakeRect(NSMidX(content) - fitted.width / 2, NSMidY(content) - fitted.height / 2,
+                                      fitted.width, fitted.height);
         [NSGraphicsContext saveGraphicsState];
-        NSShadow *shadow = [NSShadow new];
-        shadow.shadowBlurRadius = selected ? 18.0 : 14.0;
-        shadow.shadowColor = selected ? [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.40]
-                                      : [NSColor colorWithCalibratedWhite:0.0 alpha:0.45];
-        shadow.shadowOffset = NSMakeSize(0, -3);
-        [shadow set];
-        NSBezierPath *backPath = [NSBezierPath bezierPathWithRoundedRect:previewRect xRadius:8.0 yRadius:8.0];
-        [[NSColor colorWithCalibratedWhite:0.12 alpha:1.0] setFill];
-        [backPath fill];
+        [[NSBezierPath bezierPathWithRoundedRect:imageRect xRadius:8 yRadius:8] addClip];
+        [thumbnail drawInRect:imageRect fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1];
         [NSGraphicsContext restoreGraphicsState];
-
-        // 2. Clip thumbnail with rounded corners: cornerRadius = 8.0
-        [NSGraphicsContext saveGraphicsState];
-        NSBezierPath *clipPath = [NSBezierPath bezierPathWithRoundedRect:previewRect xRadius:8.0 yRadius:8.0];
-        [clipPath addClip];
-        // Fill the card without stretching; trim the sides of wide windows
-        // and the bottom of tall ones, so the title bar stays visible.
-        NSSize imageSize = thumbnail.size;
-        NSRect sourceRect = NSMakeRect(0, 0, imageSize.width, imageSize.height);
-        CGFloat cardAspect = itemPreviewWidth / previewHeight;
-        if (imageSize.width > 0 && imageSize.height > 0) {
-            if (imageSize.width / imageSize.height > cardAspect) {
-                sourceRect.size.width = imageSize.height * cardAspect;
-                sourceRect.origin.x = (imageSize.width - sourceRect.size.width) / 2.0;
-            } else {
-                sourceRect.size.height = imageSize.width / cardAspect;
-                sourceRect.origin.y = imageSize.height - sourceRect.size.height;
-            }
-        }
-        [thumbnail drawInRect:previewRect
-                     fromRect:sourceRect
-                    operation:NSCompositingOperationSourceOver
-                     fraction:1.0];
-        [NSGraphicsContext restoreGraphicsState];
-
-        BOOL isFinderEntry = [entry.application.bundleIdentifier isEqualToString:@"com.apple.finder"];
-        CGFloat badgeWidth = drawCardBadgeIcon(entry, previewRect);
-        if (shouldDrawCardLabel(entry)) {
-            drawCardLabel(cardLabelText(entry), previewRect, isFinderEntry && entry.folderPath.length > 0, badgeWidth);
-        }
-
-        // 4. Draw clean border around the card
-        [NSGraphicsContext saveGraphicsState];
-        NSBezierPath *borderPath = [NSBezierPath bezierPathWithRoundedRect:previewRect xRadius:8.0 yRadius:8.0];
-        if (selected) {
-            NSShadow *glow = [NSShadow new];
-            glow.shadowBlurRadius = 8.0;
-            glow.shadowColor = [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.75];
-            glow.shadowOffset = NSMakeSize(0, 0);
-            [glow set];
-            borderPath.lineWidth = 2.5;
-            [[NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.95] setStroke];
-            [borderPath stroke];
-        } else {
-            borderPath.lineWidth = 1.5;
-            [[NSColor colorWithCalibratedWhite:1.0 alpha:0.22] setStroke];
-            [borderPath stroke];
-        }
-        [NSGraphicsContext restoreGraphicsState];
-    } else if ([entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"]) {
-        // Chrome tabs share one CG window, so inactive tabs often have no
-        // screenshot. Keep the same card size and show title + site instead
-        // of a bare Chrome icon.
-        CGFloat cardHeight = previewWidth * 0.60;
-        NSRect cardRect = NSMakeRect(itemCenter.x - previewWidth / 2,
-                                     itemCenter.y - cardHeight / 2,
-                                     previewWidth, cardHeight);
-        NSString *host = chromeHostFromEntry(entry);
-        CGFloat hue = (CGFloat)(host.hash % 360) / 360.0;
-        NSColor *topColor = [NSColor colorWithCalibratedHue:hue saturation:0.48 brightness:0.27 alpha:1.0];
-        NSColor *bottomColor = [NSColor colorWithCalibratedHue:hue saturation:0.37 brightness:0.13 alpha:1.0];
-        NSBezierPath *cardPath = [NSBezierPath bezierPathWithRoundedRect:cardRect xRadius:8 yRadius:8];
-        [NSGraphicsContext saveGraphicsState];
-        NSShadow *shadow = [NSShadow new];
-        shadow.shadowBlurRadius = selected ? 18.0 : 14.0;
-        shadow.shadowColor = [NSColor colorWithCalibratedWhite:0 alpha:0.45];
-        shadow.shadowOffset = NSMakeSize(0, -3);
-        [shadow set];
-        [[NSColor colorWithCalibratedWhite:0.12 alpha:1.0] setFill];
-        [cardPath fill];
-        [NSGraphicsContext restoreGraphicsState];
-        NSGradient *gradient = [[NSGradient alloc] initWithStartingColor:topColor endingColor:bottomColor];
-        [gradient drawInBezierPath:cardPath angle:90];
-
-        CGFloat inset = MIN(20.0, previewWidth * 0.07);
-        CGFloat iconSize = MIN(38.0, cardHeight * 0.25);
-        NSImage *siteIcon = atomic_load(&g_settingShowSiteIcons) ? RingFaviconForURL(entry.tabURL) : nil;
-        [(siteIcon ?: entry.icon) drawInRect:NSMakeRect(NSMinX(cardRect) + inset,
-                                                        NSMaxY(cardRect) - inset - iconSize,
-                                                        iconSize, iconSize)];
-        NSMutableParagraphStyle *titleStyle = [NSMutableParagraphStyle new];
-        titleStyle.lineBreakMode = NSLineBreakByTruncatingTail;
-        NSDictionary *titleAttributes = @{
-            NSFontAttributeName: [NSFont systemFontOfSize:MIN(18.0, previewWidth * 0.063) weight:NSFontWeightSemibold],
-            NSForegroundColorAttributeName: NSColor.whiteColor,
-            NSParagraphStyleAttributeName: titleStyle
-        };
-        NSString *title = chromeDisplayTitle(entry);
-        [title drawInRect:NSMakeRect(NSMinX(cardRect) + inset,
-                                     NSMinY(cardRect) + cardHeight * 0.28,
-                                     previewWidth - inset * 2,
-                                     cardHeight * 0.35)
-               withAttributes:titleAttributes];
-        NSDictionary *hostAttributes = @{
-            NSFontAttributeName: [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium],
-            NSForegroundColorAttributeName: [NSColor colorWithCalibratedWhite:0.87 alpha:1.0],
-            NSParagraphStyleAttributeName: titleStyle
-        };
-        [host drawInRect:NSMakeRect(NSMinX(cardRect) + inset,
-                                    NSMinY(cardRect) + inset - 1,
-                                    previewWidth - inset * 2,
-                                    18)
-              withAttributes:hostAttributes];
-        cardPath.lineWidth = selected ? 2.5 : 1.5;
-        NSColor *borderColor = selected
-            ? [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.95]
-            : [NSColor colorWithCalibratedWhite:1.0 alpha:0.22];
-        [borderColor setStroke];
-        [cardPath stroke];
+        drawCardBadgeIcon(entry, content);
     } else {
-        CGFloat iconSize = MIN(140, MAX(54, cardWidth * 0.42));
-        NSRect iconRect = NSMakeRect(itemCenter.x - iconSize / 2,
-                                     itemCenter.y - iconSize / 2, iconSize, iconSize);
-        NSRect iconCardRect = NSInsetRect(iconRect, -8.0, -8.0);
-
-        [NSGraphicsContext saveGraphicsState];
-        NSShadow *iconShadow = [NSShadow new];
-        iconShadow.shadowBlurRadius = selected ? 18.0 : 14.0;
-        iconShadow.shadowColor = selected ? [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.40]
-                                          : [NSColor colorWithCalibratedWhite:0.0 alpha:0.45];
-        iconShadow.shadowOffset = NSMakeSize(0, -3);
-        [iconShadow set];
-        NSBezierPath *iconBackPath = [NSBezierPath bezierPathWithRoundedRect:iconCardRect xRadius:8.0 yRadius:8.0];
-        [[NSColor colorWithCalibratedWhite:0.12 alpha:1.0] setFill];
-        [iconBackPath fill];
-        [NSGraphicsContext restoreGraphicsState];
-
-        [entry.icon drawInRect:iconRect];
-        BOOL isFinderIcon = [entry.application.bundleIdentifier isEqualToString:@"com.apple.finder"];
-        if (shouldDrawCardLabel(entry)) {
-            drawCardLabel(cardLabelText(entry), iconCardRect, isFinderIcon && entry.folderPath.length > 0, 0);
-        }
-
-        [NSGraphicsContext saveGraphicsState];
-        NSBezierPath *iconBorderPath = [NSBezierPath bezierPathWithRoundedRect:iconCardRect xRadius:8.0 yRadius:8.0];
-        if (selected) {
-            NSShadow *iconGlow = [NSShadow new];
-            iconGlow.shadowBlurRadius = 8.0;
-            iconGlow.shadowColor = [NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.75];
-            iconGlow.shadowOffset = NSMakeSize(0, 0);
-            [iconGlow set];
-            iconBorderPath.lineWidth = 2.5;
-            [[NSColor colorWithCalibratedRed:0.24 green:0.82 blue:1.0 alpha:0.95] setStroke];
-        } else {
-            iconBorderPath.lineWidth = 1.5;
-            [[NSColor colorWithCalibratedWhite:1.0 alpha:0.22] setStroke];
-        }
-        [iconBorderPath stroke];
-        [NSGraphicsContext restoreGraphicsState];
+        BOOL chrome = [entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"];
+        NSImage *site = chrome && atomic_load(&g_settingShowSiteIcons) ? RingFaviconForURL(entry.tabURL) : nil;
+        CGFloat iconSide = MIN(144.0, NSHeight(content) * 0.85);
+        [(site ?: entry.icon) drawInRect:NSMakeRect(NSMidX(content) - iconSide / 2,
+                                                   NSMidY(content) - iconSide / 2, iconSide, iconSide)];
+    }
+    if (shouldDrawCardLabel(entry)) {
+        BOOL finder = [entry.application.bundleIdentifier isEqualToString:@"com.apple.finder"];
+        drawCardLabel(cardLabelText(entry), card, finder && entry.folderPath.length > 0, 0);
     }
 }
+
 @end
 
 @interface RingPanel : NSPanel
@@ -1644,54 +1601,6 @@ static void setPanelBlur(int radius) {
     if (g_panel) CGSSetWindowBackgroundBlurRadius(CGSMainConnectionID(), g_panel.windowNumber, radius);
 }
 
-static CGFloat fittedRingRadius(NSSize size, NSUInteger count, CGFloat *centerOffsetY) {
-    CGFloat radius = MIN(size.width * 0.44, (size.height - 100.0) / 2.0);
-    if (count == 0) {
-        if (centerOffsetY) *centerOffsetY = 0;
-        return MAX(0, radius);
-    }
-
-    CGFloat finalRadius = radius;
-    CGFloat finalOffsetY = 0;
-    for (int pass = 0; pass < 3; pass++) {
-        CGFloat radiusX = finalRadius, radiusY = finalRadius;
-        ringEllipseRadii(count, finalRadius, &radiusX, &radiusY);
-        CGFloat cardWidth = safeCardWidthForRing(count, radiusX, radiusY, size.width);
-        CGFloat previewWidth = cardWidth * 0.94;
-        CGFloat topContent = MAX(previewWidth * 0.30, 47.0);
-        CGFloat bottomContent = topContent;
-        finalOffsetY = (bottomContent - topContent) / 2.0;
-        CGFloat scaleX = radiusX / (finalRadius > 0 ? finalRadius : 1.0);
-        CGFloat scaleY = radiusY / (finalRadius > 0 ? finalRadius : 1.0);
-        CGFloat horizontalLimit = (size.width / 2.0 - 20 - cardWidth / 2.0) / scaleX;
-        CGFloat topLimit = (size.height / 2.0 - 20 - finalOffsetY - topContent) / scaleY;
-        CGFloat bottomLimit = (size.height / 2.0 - 20 + finalOffsetY - bottomContent) / scaleY;
-        finalRadius = MAX(0, MIN(radius, MIN(horizontalLimit, MIN(topLimit, bottomLimit))));
-    }
-    if (count <= 3) {
-        // With three cards or fewer the full-screen ring left a wide empty
-        // middle. Pull the cards in until they keep a clear gap to each other
-        // and to the hub.
-        const CGFloat gap = 48.0;
-        CGFloat previewWidth = safeCardWidthForRing(count, finalRadius, finalRadius, size.width) * 0.94;
-        CGFloat previewHeight = previewWidth * 0.60;
-        CGFloat needed = previewHeight / 2.0 + kHubRadius + gap;   // top card clears the hub
-        if (count == 3) {
-            // Lower cards sit at -30 and -150 degrees.
-            needed = MAX(needed, (previewWidth + gap) / (2.0 * cos(M_PI / 6.0)));
-            needed = MAX(needed, (previewHeight + gap) / 1.5);
-            // Their inner corner must clear the hub too: either the top edge
-            // passes below it or the inner edge passes beside it.
-            CGFloat clearBelow = 2.0 * (previewHeight / 2.0 + kHubRadius + gap);
-            CGFloat clearBeside = (previewWidth / 2.0 + kHubRadius + gap) / cos(M_PI / 6.0);
-            needed = MAX(needed, MIN(clearBelow, clearBeside));
-        }
-        finalRadius = MIN(finalRadius, needed);
-    }
-    if (centerOffsetY) *centerOffsetY = finalOffsetY;
-    return finalRadius;
-}
-
 static void pruneDeadWindowEntriesLive(void);
 
 static void showRing(uint64_t generation) {
@@ -1701,13 +1610,12 @@ static void showRing(uint64_t generation) {
     (void)appKitPointFromQuartz(g_cursorAtGestureStart, &screen); // Cursor chooses the display only.
     ensurePanel(screen);
     CGFloat width = NSWidth(screen.frame), height = NSHeight(screen.frame);
-    CGFloat centerOffsetY = 0;
-    CGFloat fittedRadius = fittedRingRadius(NSMakeSize(width, height), g_windowEntries.count, &centerOffsetY);
-    NSPoint anchor = NSMakePoint(width / 2.0, height / 2.0 + centerOffsetY);
+    NSPoint anchor = NSMakePoint(width / 2.0, height / 2.0);
     g_ringView.entries = g_windowEntries;
     g_ringView.selectedIndex = -1;
     g_ringView.anchorPoint = anchor;
-    g_ringView.ringRadius = fittedRadius;
+    g_ringView.layoutEntries = nil;
+    [g_ringView prepareCardLayout];
     [g_ringView resetSelectionVisuals];
     [g_ringView movePointerTo:NSZeroPoint];
     // Blur and dimming appear at once with the cards, no fade.
@@ -2094,9 +2002,7 @@ static NSString *cardLabelText(RingEntry *entry) {
     return appName.length ? appName : @"Window";
 }
 
-// The icon in a picture card's lower left corner: the site's icon for a
-// Chrome tab (Chrome's own when the site has none), the app icon for other
-// windows. Returns the width it takes, so the title starts after it.
+// Ikonica bez podloge, centrirana preko donje ivice snimka.
 static CGFloat drawCardBadgeIcon(RingEntry *entry, NSRect cardRect) {
     NSImage *icon = nil;
     if ([entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"] && atomic_load(&g_settingShowSiteIcons)) {
@@ -2106,7 +2012,8 @@ static CGFloat drawCardBadgeIcon(RingEntry *entry, NSRect cardRect) {
     }
     if (!icon) return 0;
     // No backing plate; a soft shadow keeps it readable on light pictures.
-    NSRect iconRect = NSMakeRect(NSMinX(cardRect) + 8.0, NSMinY(cardRect) + 6.0, kCardBadgeIconSize, kCardBadgeIconSize);
+    CGFloat iconSize = MIN(56.0, MAX(24.0, NSWidth(cardRect) * 0.15));
+    NSRect iconRect = NSMakeRect(NSMidX(cardRect) - iconSize / 2, NSMinY(cardRect) - iconSize * 0.40, iconSize, iconSize);
     [NSGraphicsContext saveGraphicsState];
     NSShadow *shadow = [NSShadow new];
     shadow.shadowBlurRadius = 6.0;
@@ -2116,37 +2023,30 @@ static CGFloat drawCardBadgeIcon(RingEntry *entry, NSRect cardRect) {
     [icon drawInRect:iconRect fromRect:NSZeroRect
            operation:NSCompositingOperationSourceOver fraction:1.0 respectFlipped:YES hints:nil];
     [NSGraphicsContext restoreGraphicsState];
-    return kCardBadgeIconSize + 6.0;
+    return iconSize + 6.0;
 }
 
 static void drawCardLabel(NSString *text, NSRect cardRect, BOOL truncateMiddle, CGFloat leading) {
     if (!text.length) return;
-    cardRect.origin.x += leading;
-    cardRect.size.width -= leading;
-    NSDictionary *measure = @{
-        NSFontAttributeName: [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium],
-        NSForegroundColorAttributeName: [NSColor colorWithCalibratedWhite:0.95 alpha:1.0]
-    };
-    NSSize textSize = [text sizeWithAttributes:measure];
-    CGFloat maxBadgeW = MAX(24.0, NSWidth(cardRect) - 16.0);
-    CGFloat badgeW = MIN(maxBadgeW, textSize.width + 16.0);
-    CGFloat badgeH = 22.0;
-    // Next to an icon the title sits on the icon's middle line.
-    CGFloat badgeY = leading > 0 ? NSMinY(cardRect) + 6.0 + (kCardBadgeIconSize - badgeH) / 2.0 : NSMinY(cardRect) + 8.0;
-    NSRect badgeRect = NSMakeRect(NSMinX(cardRect) + 8.0, badgeY, badgeW, badgeH);
-    NSBezierPath *pill = [NSBezierPath bezierPathWithRoundedRect:badgeRect xRadius:5.0 yRadius:5.0];
-    [[NSColor colorWithCalibratedWhite:0.06 alpha:0.78] setFill];
-    [pill fill];
+    (void)leading;
+    CGFloat iconSize = MIN(56.0, MAX(24.0, NSWidth(cardRect) * 0.15));
+    CGFloat titleSpace = cardFooterHeight(NSWidth(cardRect)) - iconSize * 0.40 - 3;
+    CGFloat fontSize = MIN(11.5, MAX(6.0, titleSpace / 1.4));
     NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
+    style.alignment = NSTextAlignmentCenter;
     style.lineBreakMode = truncateMiddle ? NSLineBreakByTruncatingMiddle : NSLineBreakByTruncatingTail;
+    NSShadow *shadow = [NSShadow new];
+    shadow.shadowBlurRadius = 4;
+    shadow.shadowOffset = NSMakeSize(0, -1);
+    shadow.shadowColor = [NSColor blackColor];
     NSDictionary *drawAttr = @{
-        NSFontAttributeName: [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium],
-        NSForegroundColorAttributeName: [NSColor colorWithCalibratedWhite:0.95 alpha:1.0],
-        NSParagraphStyleAttributeName: style
+        NSFontAttributeName: [NSFont systemFontOfSize:fontSize weight:NSFontWeightMedium],
+        NSForegroundColorAttributeName: [NSColor whiteColor],
+        NSParagraphStyleAttributeName: style,
+        NSShadowAttributeName: shadow
     };
-    NSRect textRect = NSMakeRect(NSMinX(badgeRect) + 8.0, NSMinY(badgeRect) + 3.0,
-                                 badgeW - 16.0, badgeH - 6.0);
-    [text drawInRect:textRect withAttributes:drawAttr];
+    [text drawInRect:NSMakeRect(NSMinX(cardRect), NSMinY(cardRect), NSWidth(cardRect), fontSize * 1.4)
+       withAttributes:drawAttr];
 }
 
 static NSString *chromeHostFromEntry(RingEntry *entry) {
@@ -3023,7 +2923,8 @@ static NSArray<RingEntry *> *collectOpenWindows(void) {
         // is never a card, and raising it from the activation queue crashed
         // AppKit (window ordering is main-thread only).
         if (app.activationPolicy == NSApplicationActivationPolicyRegular && !app.isTerminated &&
-            app.processIdentifier != getpid()) {
+            app.processIdentifier != getpid() &&
+            ![app.bundleIdentifier isEqualToString:@"com.milev.touchpad-layout-preview"]) {
             appsByPID[@(app.processIdentifier)] = app;
         }
     }
@@ -4688,13 +4589,21 @@ static NSInteger selectionForLift(void) {
     return g_selectedIndex;
 }
 
+// Trackpad može poslati samo jedan prazan frejm pri podizanju prstiju.
+// Zato oporavak ne sme čekati naredni prazan frejm ili protek vremena.
+static BOOL suppressTouchFrameAfterFourFingers(int activeCount, BOOL *waitingForLift) {
+    if (activeCount >= 4) *waitingForLift = YES;
+    if (!*waitingForLift) return NO;
+    if (activeCount == 0) *waitingForLift = NO;
+    return YES;
+}
+
 static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouches, double timestamp, int frame) {
     (void)frame;
+    (void)timestamp;
     @autoreleasepool {
         static BOOL suppressUntilFourFingerLift = NO;
-        static double allFingersUpSince = -1.0;
         static BOOL liftCompletionScheduled = NO;
-        static uint64_t fourFingerAbortGeneration = 0;
         static BOOL threeFingersLastFrame = NO;
         int activeCount = 0;
         double sumX = 0.0, sumY = 0.0;
@@ -4717,32 +4626,22 @@ static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouche
         }
 
         BOOL gestureActive = atomic_load(&g_gestureActive);
+        BOOL suppressed = suppressTouchFrameAfterFourFingers(activeCount, &suppressUntilFourFingerLift);
         if (activeCount >= 4) {
-            suppressUntilFourFingerLift = YES;
-            allFingersUpSince = -1.0;
             liftCompletionScheduled = NO;
             if (gestureActive) {
                 // Invalidate any pending normal lift completion so it cannot
                 // activate the previously selected entry after a four-touch.
-                fourFingerAbortGeneration = atomic_fetch_add(&g_gestureGeneration, 1) + 1;
+                uint64_t generation = atomic_fetch_add(&g_gestureGeneration, 1) + 1;
                 atomic_store(&g_gestureEnding, true);
                 atomic_store(&g_gestureActive, false);
-                uint64_t generation = fourFingerAbortGeneration;
                 dispatch_async(dispatch_get_main_queue(), ^{ finishGesture(generation, -1); });
             }
             return 0;
         }
 
-        if (suppressUntilFourFingerLift) {
-            if (activeCount == 0) {
-                if (allFingersUpSince < 0.0) allFingersUpSince = timestamp;
-                else if ((timestamp - allFingersUpSince) >= 0.200) {
-                    suppressUntilFourFingerLift = NO;
-                    allFingersUpSince = -1.0;
-                }
-                return 0;
-            }
-            allFingersUpSince = -1.0;
+        if (suppressed) {
+            liftCompletionScheduled = NO;
             return 0;
         }
 
@@ -4751,7 +4650,6 @@ static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouche
             atomic_store(&g_gestureActive, true);
             atomic_store(&g_gestureEnding, false);
             hideSystemCursorForGesture();
-            allFingersUpSince = -1.0;
             liftCompletionScheduled = NO;
             g_previousX = x;
             g_previousY = y;
@@ -4775,9 +4673,7 @@ static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouche
             // Keep the overlay and input suppression active while any of the
             // three fingers remain down. A temporary count of one or two must
             // not finish the selection and send later trackpad input to apps.
-            BOOL shouldEnd = activeCount >= 4;
             if (activeCount == 0) {
-                if (allFingersUpSince < 0.0) allFingersUpSince = timestamp;
                 if (!liftCompletionScheduled) {
                     liftCompletionScheduled = YES;
                     uint64_t generation = atomic_load(&g_gestureGeneration);
@@ -4790,19 +4686,10 @@ static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouche
                     });
                 }
             } else {
-                allFingersUpSince = -1.0;
                 liftCompletionScheduled = NO;
             }
 
-            if (shouldEnd) {
-                atomic_store(&g_gestureEnding, true);
-                NSInteger selection = (activeCount == 0 || activeCount < 3) ? selectionForLift() : -1;
-                uint64_t generation = atomic_load(&g_gestureGeneration);
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    NSInteger finalSelection = (fourFingerAbortGeneration == generation) ? -1 : selection;
-                    finishGesture(generation, finalSelection);
-                });
-            } else if (activeCount == 3) {
+            if (activeCount == 3) {
                 double x = sumX / 3.0, y = sumY / 3.0;
                 if (hadThreeFingers) {
                     moveRingPointer(x - g_previousX, (y - g_previousY) * g_trackpadAspect,
@@ -5372,7 +5259,7 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
     pointer.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
     pointer.selectedSegment = atomic_load(&g_settingPointerStyle);
 
-    NSTextField *highlightLabel = [self noteWithText:@"Okvir izabrane kartice i svetlo"];
+    NSTextField *highlightLabel = [self noteWithText:@"Boja pokazivača i svetla"];
     NSSegmentedControl *highlight = [NSSegmentedControl segmentedControlWithLabels:@[@"Boja sistema", @"Belo"]
                                                                       trackingMode:NSSegmentSwitchTrackingSelectOne
                                                                             target:self

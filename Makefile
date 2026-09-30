@@ -73,3 +73,17 @@ dist: $(RING_SOURCES) ring_media.h ring_favicons.h ring_update.h
 clean:
 	rm -f $(TARGET)
 	@echo "Obrisan binarni fajl $(TARGET)"
+
+# Poseban vizuelni pregled bez trackpad gestova i sistemskih dozvola.
+.PHONY: layout-preview
+layout-preview: layout-preview-bundle
+	open -n "/tmp/Touchpad Layout Preview.app"
+
+/tmp/touchpad-layout-preview: tools/ring_layout_preview.m $(RING_SOURCES) ring_media.h ring_favicons.h ring_update.h
+	$(CC) $(CFLAGS) $(FRAMEWORKS) tools/ring_layout_preview.m ring_media.m ring_favicons.m ring_update.m -o $@
+
+.PHONY: layout-preview-bundle
+layout-preview-bundle: /tmp/touchpad-layout-preview tools/layout_preview_Info.plist
+	mkdir -p "/tmp/Touchpad Layout Preview.app/Contents/MacOS"
+	cp /tmp/touchpad-layout-preview "/tmp/Touchpad Layout Preview.app/Contents/MacOS/"
+	cp tools/layout_preview_Info.plist "/tmp/Touchpad Layout Preview.app/Contents/Info.plist"

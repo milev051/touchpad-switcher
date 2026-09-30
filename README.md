@@ -209,10 +209,20 @@ pokret prebacuje na drugu stranu prstena. Kad se gura dalje od kartica,
 pokazivač klizi po prstenu. Pokret gore-dole vredi isto koliko i levo-desno,
 jer se uzima prava veličina trackpada.
 
-Izabrana kartica se blago uveća, dobije beo okvir (ili u akcentnoj boji
-sistema, po izboru) i mekanu tamnu senku, kao izabran prozor u Mission Control-u. Okvir ne klizi od
-kartice do kartice: na novoj kartici se pojavi postepeno, a prethodna se vrati
-na svoju veličinu i okvir joj nestane.
+Izabrana kartica se uveća za 20%, bez dodatnog okvira i duplirane kartice
+ispod nje. Susedne kartice se blago odmaknu i vrate kada se izbor promeni.
+Thumbnailovi nemaju dodatnu podlogu ni okvir. Raspored se prilagođava
+odnosima stranica svih snimaka i dostupnom prostoru na ekranu. Snimak zadržava proporcije i prikazuje se ceo,
+sa ikonicom centriranom preko donje ivice i nazivom bez podloge ispod nje.
+Prozor bez snimka prikazuje samo veću ikonicu i naziv. Razmaci se računaju između stvarnih pravougaonih površina, uključujući
+dijagonalni razmak. Dodatni korak približava susede prema razmaku njihovih
+ivica, uz proveru redosleda i sudara. Horizontalni snimci sabijaju prsten po visini;
+uspravni i mešoviti snimci imaju sopstvene dimenzije. Raspored ostaje
+stabilan tokom jedne geste, uz rezervu za zoom, susede i centralnu ikonicu.
+Veličina kartica automatski se prilagođava ekranu i njihovom broju.
+Centralna ikonica se kratko smanji, uveća i vrati na svoju veličinu pri
+svakom izboru kartice. Iza izabranog thumbnaila pojavi se mekan svetleći
+sjaj u boji pokazivača i svetla.
 
 Svetlo iza kartica pokazuje smer prstiju, ako je uključeno u podešavanjima. Njegov vrh se kreće pravo ka novom
 smeru, ubrza pa uspori bez preletanja. Za susednu karticu to izgleda kao
@@ -295,7 +305,7 @@ Ikonica šake u gornjoj traci otvara panel sa podešavanjima:
 |---|---|---|
 | Kartice | prozori i tabovi, ili samo aplikacije (jedna kartica po aplikaciji, Chrome po prozoru, jer su prozori obično različiti profili) | prozori i tabovi |
 | Naslovi, pokazivač, zvuci, zamućenje | izgled menija | svi naslovi, nevidljiv pokazivač, bez zvuka, zamućenje 15 |
-| Okvir izabrane kartice i svetlo | boja sistema (akcentna boja iz System Settings > Appearance) ili belo | belo |
+| Boja pokazivača i svetla | boja sistema (akcentna boja iz System Settings > Appearance) ili belo | belo |
 | Svetlo u smeru prstiju | svetlo iza kartica koje pokazuje smer prstiju | isključeno |
 | Pozadina iza kartica | boja preko (zamućenog) ekrana i njena jačina, 0 do 90% | skoro crna, 38% |
 | Finder tabovi jednog prozora kao jedna kartica | tabovi jednog Finder prozora daju jednu karticu | uključeno |
@@ -335,3 +345,27 @@ screen-u, i bez Accessibility dozvole.
 Sakrivena ikonica se vraća kad se aplikacija ponovo otvori dok već radi (npr.
 iz Spotlight-a ili `/Applications`). Podešavanja se čuvaju pod
 `com.milev.touchpad-switcher` (`defaults read com.milev.touchpad-switcher`).
+
+### Vizuelni pregled rasporeda
+
+`make layout-preview` otvara poseban prozor sa stvarnim karticama iz istog
+koda za crtanje. Može da se bira broj kartica, odnos stranica ekrana i
+selekcija klikom na karticu. Opcija „Prsten i uglovi“ pokazuje linije između centara i stvarne ugaone korake.
+Dodatna kontrola bira horizontalne, uspravne ili mešovite uzorke.
+
+Za snimak bez otvaranja prozora:
+
+```bash
+make /tmp/touchpad-layout-preview
+/tmp/touchpad-layout-preview --count 5 --width 1100 --height 688 --render /tmp/raspored.png
+```
+
+`/tmp/touchpad-layout-preview --verify` proverava proporcije svakog snimka,
+stvarne smerove, svaki izbor i preklapanja na pet veličina
+ekrana, za 1, 2, 3, 4, 5, 6, 7, 8, 12 i 16 kartica,
+u horizontalnim, uspravnim i mešovitim rasporedima. Fotografije za lokalni pregled ostaju van Git-a u
+folderu `layout-previews/`.
+
+Posle dodira sa četiri ili više prstiju, prvi signal potpunog podizanja
+prstiju odmah oslobađa sledeću gestu. Provera `--verify` pokriva i ovaj
+oporavak bez dodatnih praznih frejmova sa trackpada.
