@@ -233,7 +233,11 @@ static const CGFloat kSelectedCardScale = 1.20;
 static _Atomic(double) g_layoutAxisRatio = 1.0;
 static _Atomic(double) g_layoutCardAngles[512];
 static _Atomic(NSUInteger) g_layoutAngleCount = 0;
-static CGFloat cardFooterHeight(CGFloat width) { return MAX(26.0, width * 0.14); }
+static CGFloat cardFooterHeight(CGFloat width) {
+    if (atomic_load(&g_settingCardTitles)==CardTitlesNone)
+        return MIN(56.0,MAX(24.0,width*0.15))*0.40+4;
+    return MAX(26.0,width*0.14);
+}
 
 // Elipsa sabija prazninu po visini kada su snimci pretežno horizontalni.
 static void ringEllipseRadii(NSUInteger count, CGFloat baseRadius, CGFloat *outRadiusX, CGFloat *outRadiusY) {
@@ -251,10 +255,22 @@ static CGFloat rectangleGap(NSPoint a, NSSize sa, NSPoint b, NSSize sb) {
                  MAX(0, fabs(a.y - b.y) - (sa.height + sb.height) / 2));
 }
 
+// Samo jedna kartica može biti uvećana. Za svaku osu čuva se prostor
+// za veći od oba moguća izbora, umesto za dva istovremena zooma.
+static CGFloat zoomReservedPairGap(NSPoint a, NSSize scaledA, NSPoint b, NSSize scaledB) {
+    CGFloat halfX=MAX(scaledA.width+scaledB.width/kSelectedCardScale,
+                      scaledA.width/kSelectedCardScale+scaledB.width)/2;
+    CGFloat halfY=MAX(scaledA.height+scaledB.height/kSelectedCardScale,
+                      scaledA.height/kSelectedCardScale+scaledB.height)/2;
+    return hypot(MAX(0,fabs(a.x-b.x)-halfX),MAX(0,fabs(a.y-b.y)-halfY));
+}
+
 static NSSize layoutCardSize(NSSize unit, CGFloat longSide) {
     CGFloat width = unit.width * longSide;
     return NSMakeSize(width, unit.height * longSide + cardFooterHeight(width));
 }
+
+static NSRect visibleCardRect(RingEntry *entry, NSRect card);
 
 // Traži najkrupnije snimke i najkompaktniju elipsu bez sudara, sa prostorom
 // za selekciju, susede i centralnu ikonicu. Računa se jednom po otvaranju.
@@ -276,7 +292,8 @@ static NSArray<NSValue *> *adaptiveCardLayout(NSArray<RingEntry *> *entries, NSS
     CGFloat bestSize = 0, bestRadius = 0, bestRatio = 1, bestArea = CGFLOAT_MAX;
     for (int shape = 0; shape <= 36; shape++) {
         CGFloat ratio = 0.35 + shape * 0.05;
-        CGFloat low = 0, high = 480;
+        // Veličinu ograničava slobodan prostor ekrana, umesto fiksnih 480 pt.
+        CGFloat low = 0, high = MIN(screen.width, screen.height) * 0.85;
         CGFloat acceptedRadius = 0;
         for (int pass = 0; pass < 19; pass++) {
             CGFloat candidate = (low + high) / 2;
@@ -300,7 +317,7 @@ static NSArray<NSValue *> *adaptiveCardLayout(NSArray<RingEntry *> *entries, NSS
                     clear = rectangleGap(a, sizes[i], NSZeroPoint, NSMakeSize(kHubRadius * 2, kHubRadius * 2)) >= 30;
                     for (NSUInteger j = i + 1; j < count && clear; j++) {
                         NSPoint b = NSMakePoint(directions[j].x * radius, directions[j].y * radius * ratio);
-                        clear = rectangleGap(a, sizes[i], b, sizes[j]) >= 24;
+                        clear = zoomReservedPairGap(a, sizes[i], b, sizes[j]) >= 24;
                     }
                 }
                 if (clear) upperRadius = radius;
@@ -312,7 +329,7 @@ static NSArray<NSValue *> *adaptiveCardLayout(NSArray<RingEntry *> *entries, NSS
                 fits = rectangleGap(a, sizes[i], NSZeroPoint, NSMakeSize(kHubRadius * 2, kHubRadius * 2)) >= 29.99;
                 for (NSUInteger j = i + 1; j < count && fits; j++) {
                     NSPoint b = NSMakePoint(directions[j].x * upperRadius, directions[j].y * upperRadius * ratio);
-                    fits = rectangleGap(a, sizes[i], b, sizes[j]) >= 23.99;
+                    fits = zoomReservedPairGap(a, sizes[i], b, sizes[j]) >= 23.99;
                 }
             }
             if (fits) { low = candidate; acceptedRadius = upperRadius; }
@@ -337,8 +354,10 @@ static NSArray<NSValue *> *adaptiveCardLayout(NSArray<RingEntry *> *entries, NSS
             for (NSUInteger j = i + 1; j < count; j++) {
                 CGFloat dx = positions[j].x - positions[i].x;
                 CGFloat dy = positions[j].y - positions[i].y;
-                CGFloat halfX = (sizes[i].width + sizes[j].width) * kSelectedCardScale / 2;
-                CGFloat halfY = (sizes[i].height + sizes[j].height) * kSelectedCardScale / 2;
+                CGFloat halfX = MAX(sizes[i].width*kSelectedCardScale+sizes[j].width,
+                                    sizes[i].width+sizes[j].width*kSelectedCardScale)/2;
+                CGFloat halfY = MAX(sizes[i].height*kSelectedCardScale+sizes[j].height,
+                                    sizes[i].height+sizes[j].height*kSelectedCardScale)/2;
                 CGFloat gapX = MAX(0, fabs(dx) - halfX), gapY = MAX(0, fabs(dy) - halfY);
                 CGFloat distance = hypot(gapX, gapY);
                 BOOL neighbors = j == i + 1 || (i == 0 && j == count - 1);
@@ -393,12 +412,40 @@ static NSArray<NSValue *> *adaptiveCardLayout(NSArray<RingEntry *> *entries, NSS
         }
         for (NSUInteger j = i+1; j < count && compactFits; j++) {
             NSSize other = NSMakeSize(sizes[j].width*kSelectedCardScale, sizes[j].height*kSelectedCardScale);
-            compactFits = rectangleGap(positions[i],scaled,positions[j],other) >= 20;
+            compactFits = zoomReservedPairGap(positions[i],scaled,positions[j],other) >= 24;
         }
     }
     if (!compactFits) for (NSUInteger i = 0; i < count; i++) {
         positions[i] = NSMakePoint(directions[i].x * bestRadius, directions[i].y * bestRadius * bestRatio);
     }
+    // Posle sabijanja koristi preostale margine za uvećanje cele grupe.
+    // Proporcije snimaka ostaju iste, a rezerva obuhvata zoom i pomeranje suseda.
+    CGFloat expansionLow=1,expansionHigh=2;
+    for (int pass=0;pass<18;pass++) {
+        CGFloat scale=(expansionLow+expansionHigh)/2;
+        NSRect envelope=NSMakeRect(-kHubRadius,-kHubRadius,kHubRadius*2,kHubRadius*2);
+        NSRect visible=envelope;
+        for (NSUInteger i=0;i<count;i++) {
+            NSSize expanded=layoutCardSize(units[i],bestSize*scale);
+            NSPoint center=NSMakePoint(positions[i].x*scale,positions[i].y*scale);
+            NSRect card=NSMakeRect(center.x-expanded.width/2,center.y-expanded.height/2,expanded.width,expanded.height);
+            visible=NSUnionRect(visible,visibleCardRect(entries[i],card));
+            envelope=NSUnionRect(envelope,NSMakeRect(center.x-expanded.width*kSelectedCardScale/2,
+                center.y-expanded.height*kSelectedCardScale/2,expanded.width*kSelectedCardScale,expanded.height*kSelectedCardScale));
+        }
+        BOOL fits=NSMinX(envelope)-NSMidX(visible)>=-screen.width/2+26 &&
+                  NSMaxX(envelope)-NSMidX(visible)<=screen.width/2-26 &&
+                  NSMinY(envelope)-NSMidY(visible)>=-screen.height/2+26 &&
+                  NSMaxY(envelope)-NSMidY(visible)<=screen.height/2-26;
+        if (fits) expansionLow=scale;
+        else expansionHigh=scale;
+    }
+    for (NSUInteger i=0;i<count;i++) {
+        positions[i].x*=expansionLow;
+        positions[i].y*=expansionLow;
+        sizes[i]=layoutCardSize(units[i],bestSize*expansionLow);
+    }
+    bestRadius*=expansionLow;
     NSMutableArray *rects = [NSMutableArray arrayWithCapacity:count];
     for (NSUInteger i = 0; i < count; i++) {
         NSSize size = sizes[i];
@@ -425,26 +472,6 @@ static CGFloat hubClearance(NSArray<NSValue *> *rects, NSPoint point) {
     return clearance;
 }
 
-static NSPoint balancedHubPoint(NSArray<NSValue *> *rects, NSSize screen) {
-    NSPoint origin = NSMakePoint(screen.width/2,screen.height/2);
-    if (rects.count < 3) return origin;
-    NSPoint best = origin;
-    CGFloat range = MIN(100.0, MIN(screen.width,screen.height)*0.16);
-    CGFloat step = range/3;
-    CGFloat score = hubClearance(rects,best);
-    for (int pass=0; pass<8; pass++) {
-        NSPoint center = best;
-        for (int x=-3;x<=3;x++) for (int y=-3;y<=3;y++) {
-            NSPoint candidate = NSMakePoint(center.x+x*step,center.y+y*step);
-            if (fabs(candidate.x-origin.x)>range || fabs(candidate.y-origin.y)>range) continue;
-            CGFloat candidateScore = hubClearance(rects,candidate)-hypot(candidate.x-origin.x,candidate.y-origin.y)*0.002;
-            if (candidateScore>score) { score=candidateScore; best=candidate; }
-        }
-        step/=3;
-    }
-    return best;
-}
-
 // Vidljiva površina kartice, bez prazne rezerve oko ikonice i naziva.
 static NSRect visibleCardRect(RingEntry *entry, NSRect card) {
     CGFloat footer = cardFooterHeight(NSWidth(card));
@@ -469,6 +496,47 @@ static NSRect visibleCardRect(RingEntry *entry, NSRect card) {
     if (shouldDrawCardLabel(entry) && cardLabelText(entry).length)
         visible = NSUnionRect(visible,NSMakeRect(NSMinX(card),NSMinY(card),NSWidth(card),16));
     return visible;
+}
+
+// Ujednačava razmake do vidljivih ivica, uz rezervu za uvećanje kartica.
+static CGFloat hubGapVariation(NSArray<NSValue *> *visibleRects, NSPoint point) {
+    CGFloat sum=0, squares=0;
+    for (NSValue *value in visibleRects) {
+        NSRect rect=value.rectValue;
+        CGFloat gap=rectangleGap(point,NSMakeSize(kHubRadius*2,kHubRadius*2),
+            NSMakePoint(NSMidX(rect),NSMidY(rect)),rect.size);
+        sum+=gap;
+        squares+=gap*gap;
+    }
+    CGFloat mean=sum/MAX(1,visibleRects.count);
+    return sqrt(MAX(0,squares/MAX(1,visibleRects.count)-mean*mean));
+}
+
+static NSPoint balancedHubPoint(NSArray<RingEntry *> *entries, NSArray<NSValue *> *rects, NSSize screen) {
+    NSPoint origin=NSMakePoint(screen.width/2,screen.height/2);
+    if (rects.count<3) return origin;
+    NSMutableArray *visible=[NSMutableArray arrayWithCapacity:rects.count];
+    for (NSUInteger i=0;i<rects.count;i++)
+        [visible addObject:[NSValue valueWithRect:visibleCardRect(entries[i],rects[i].rectValue)]];
+    NSPoint best=origin;
+    CGFloat range=MIN(100.0,MIN(screen.width,screen.height)*0.16);
+    CGFloat step=range/3;
+    CGFloat minimumClearance=MIN(28.0,hubClearance(rects,origin));
+    CGFloat score=hubGapVariation(visible,best);
+    for (int pass=0;pass<8;pass++) {
+        NSPoint center=best;
+        for (int x=-3;x<=3;x++) for (int y=-3;y<=3;y++) {
+            NSPoint candidate=NSMakePoint(center.x+x*step,center.y+y*step);
+            if (fabs(candidate.x-origin.x)>range || fabs(candidate.y-origin.y)>range ||
+                hubClearance(rects,candidate)<minimumClearance ||
+                candidate.x<kHubRadius || candidate.x>screen.width-kHubRadius ||
+                candidate.y<kHubRadius || candidate.y>screen.height-kHubRadius) continue;
+            CGFloat candidateScore=hubGapVariation(visible,candidate)+hypot(candidate.x-origin.x,candidate.y-origin.y)*0.002;
+            if (candidateScore<score) { score=candidateScore; best=candidate; }
+        }
+        step/=3;
+    }
+    return best;
 }
 
 static NSRect visibleLayoutBounds(NSArray<RingEntry *> *entries, NSArray<NSValue *> *rects, NSPoint hub) {
@@ -742,7 +810,7 @@ static const CGFloat kBeamMaxWidth = 3.6;   // radians; a soft glow all around t
     self.layoutSize = self.bounds.size;
     self.ringRadius = radiusX;
     self.ringRadiusY = radiusY;
-    self.anchorPoint = balancedHubPoint(self.layoutRects,self.bounds.size);
+    self.anchorPoint = balancedHubPoint(self.entries,self.layoutRects,self.bounds.size);
     NSPoint offset = centeredLayoutOffset(self.entries,self.layoutRects,self.anchorPoint,self.bounds.size);
     NSMutableArray *centeredRects = [NSMutableArray arrayWithCapacity:self.layoutRects.count];
     for (NSValue *value in self.layoutRects)
@@ -2575,6 +2643,13 @@ static NSSet<NSString *> *liveChromeTabs(void) {
     return tabs;
 }
 
+// -1 znači da pouzdan spisak nije dostupan; URL i naslov nisu identitet taba.
+static NSInteger chromeTabMembership(RingEntry *entry, NSSet<NSString *> *openTabs) {
+    if (!openTabs || !entry.chromeTabID.length || !entry.chromeWindowID.length) return -1;
+    NSString *key=[NSString stringWithFormat:@"%@:%@",entry.chromeWindowID,entry.chromeTabID];
+    return [openTabs containsObject:key] ? 1 : 0;
+}
+
 static void pruneDeadWindowEntriesLive(void) {
     if (!g_windowEntries || !g_windowEntries.count) return;
     // A tab closed in Chrome keeps its window, so the CG check below misses it.
@@ -2620,20 +2695,20 @@ static void pruneDeadWindowEntriesLive(void) {
             continue;
         }
 
-        // Window existence check via CGWindowListCopyWindowInfo
-        BOOL windowAliveInCG = (entry.windowID != kCGNullWindowID &&
-                                (!canCheckWindowIDs || [liveWindowIDs containsObject:@(entry.windowID)]));
-        if (canCheckWindowIDs && entry.windowID != kCGNullWindowID && !windowAliveInCG) {
-            changed = YES;
-            [deadWindowIDs addObject:@(entry.windowID)];
-            if (entry.isTab) [deadTabKeys addObject:tabThumbnailKey(entry)];
+        NSInteger membership=chromeTabMembership(entry,openChromeTabs);
+        if (membership==0) {
+            changed=YES;
+            [deadTabKeys addObject:tabThumbnailKey(entry)];
             continue;
         }
-
-        if (openChromeTabs && entry.chromeTabID.length && entry.chromeWindowID.length &&
-            ![openChromeTabs containsObject:[NSString stringWithFormat:@"%@:%@", entry.chromeWindowID, entry.chromeTabID]]) {
-            changed = YES;
-            [deadTabKeys addObject:tabThumbnailKey(entry)];
+        // Chrome potvrđuje postojanje konkretnog taba. Njegova CG površina
+        // može nestati ili se promeniti dok se drugi tab istog naslova zatvara.
+        BOOL windowAliveInCG=membership==1 || (entry.windowID!=kCGNullWindowID &&
+            (!canCheckWindowIDs || [liveWindowIDs containsObject:@(entry.windowID)]));
+        if (membership!=1 && canCheckWindowIDs && entry.windowID!=kCGNullWindowID && !windowAliveInCG) {
+            changed=YES;
+            [deadWindowIDs addObject:@(entry.windowID)];
+            if (entry.isTab) [deadTabKeys addObject:tabThumbnailKey(entry)];
             continue;
         }
 
@@ -2653,7 +2728,7 @@ static void pruneDeadWindowEntriesLive(void) {
         }
 
         // For tabs: check if accessibility tab element is still alive and attached to parent
-        if (entry.isTab && entry.accessibilityTabObject) {
+        if (membership!=1 && entry.isTab && entry.accessibilityTabObject) {
             AXUIElementRef tabElem = (__bridge AXUIElementRef)entry.accessibilityTabObject;
             AXUIElementSetMessagingTimeout(tabElem, 0.010f);
             CFTypeRef roleVal = NULL;
@@ -2800,9 +2875,11 @@ static NSArray<NSDictionary *> *fetchChromeTabRows(void) {
                          "      set AppleScript's text item delimiters to \" \"\n"
                          "      set activeTitle to titleParts as text\n"
                          "      set AppleScript's text item delimiters to \"\"\n"
-                         "      repeat with tabIndex from 1 to count of tabs of chromeWindow\n"
+                         "      set tabIDs to id of every tab of chromeWindow\n"
+                         "      repeat with tabIndex from 1 to count of tabIDs\n"
                          "        try\n"
-                         "          set chromeTab to tab tabIndex of chromeWindow\n"
+                         "          set wantedTabID to item tabIndex of tabIDs\n"
+                         "          set chromeTab to first tab of chromeWindow whose id is wantedTabID\n"
                          "          set tabID to (id of chromeTab) as text\n"
                          "          set tabTitle to (title of chromeTab) as text\n"
                          "          set tabURL to \"\"\n"
@@ -5333,7 +5410,7 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
 
 - (NSTextField *)noteWithText:(NSString *)text {
     NSTextField *note = [NSTextField wrappingLabelWithString:text];
-    note.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+    note.font = [NSFont systemFontOfSize:12];
     note.textColor = NSColor.secondaryLabelColor;
     note.preferredMaxLayoutWidth = kSettingsColumnWidth;
     return note;
@@ -5349,7 +5426,7 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
     NSStackView *column = [NSStackView stackViewWithViews:rows];
     column.orientation = NSUserInterfaceLayoutOrientationVertical;
     column.alignment = NSLayoutAttributeLeading;
-    column.spacing = 8;
+    column.spacing = 10;
     [column.widthAnchor constraintEqualToConstant:kSettingsColumnWidth].active = YES;
     // A row wider than the column was centered and lost its left margin.
     // Rows may not be squeezed: labels gave way first and vanished, instead
@@ -5426,9 +5503,13 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
     backdropWell.target = self;
     backdropWell.action = @selector(backdropColorChanged:);
     [backdropWell.widthAnchor constraintEqualToConstant:44].active = YES;
+    [backdropWell.heightAnchor constraintEqualToConstant:24].active = YES;
+    [dimmingSlider.heightAnchor constraintEqualToConstant:24].active = YES;
     NSStackView *backdropRow = [NSStackView stackViewWithViews:@[backdropWell, dimmingSlider]];
     backdropRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    backdropRow.spacing = 10;
+    backdropRow.spacing = 12;
+    backdropRow.alignment = NSLayoutAttributeCenterY;
+    [backdropRow.heightAnchor constraintEqualToConstant:28].active = YES;
     [backdropRow.widthAnchor constraintEqualToConstant:kSettingsColumnWidth].active = YES;
 
     NSTextField *mouseTitle = [self sectionTitle:@"Aktivacija mišem"];
@@ -5486,6 +5567,7 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
                                         target:self action:@selector(blurRadiusChanged:)];
     blur.controlSize = NSControlSizeSmall;
     [blur.widthAnchor constraintEqualToConstant:kSettingsColumnWidth].active = YES;
+    [blur.heightAnchor constraintEqualToConstant:24].active = YES;
 
     NSButton *hideIcon = [NSButton checkboxWithTitle:@"Sakrij ikonicu iz gornje trake"
                                               target:self action:@selector(hideIconChanged:)];
@@ -5516,18 +5598,18 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
                                                       self.blurLabel, blur, sounds]];
     [cardsColumn setCustomSpacing:kSettingsTitleGap afterView:cardsTitle];
     [cardsColumn setCustomSpacing:14 afterView:grouping];
-    [cardsColumn setCustomSpacing:4 afterView:titlesLabel];
+    [cardsColumn setCustomSpacing:6 afterView:titlesLabel];
     [cardsColumn setCustomSpacing:14 afterView:titles];
     [cardsColumn setCustomSpacing:kSettingsSectionGap afterView:finderTabs];
     [cardsColumn setCustomSpacing:kSettingsTitleGap afterView:lookTitle];
-    [cardsColumn setCustomSpacing:4 afterView:pointerLabel];
+    [cardsColumn setCustomSpacing:6 afterView:pointerLabel];
     [cardsColumn setCustomSpacing:14 afterView:pointer];
-    [cardsColumn setCustomSpacing:4 afterView:highlightLabel];
+    [cardsColumn setCustomSpacing:6 afterView:highlightLabel];
     [cardsColumn setCustomSpacing:8 afterView:highlight];
     [cardsColumn setCustomSpacing:14 afterView:light];
-    [cardsColumn setCustomSpacing:4 afterView:self.dimmingLabel];
+    [cardsColumn setCustomSpacing:6 afterView:self.dimmingLabel];
     [cardsColumn setCustomSpacing:14 afterView:backdropRow];
-    [cardsColumn setCustomSpacing:4 afterView:self.blurLabel];
+    [cardsColumn setCustomSpacing:6 afterView:self.blurLabel];
     [cardsColumn setCustomSpacing:14 afterView:blur];
 
     NSStackView *mouseColumn = [self settingsColumn:@[mouseTitle, self.mouseActivationLabel, mouseButtons, holdToSelect,
@@ -5536,7 +5618,7 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
     [mouseColumn setCustomSpacing:kSettingsTitleGap afterView:mouseTitle];
     [mouseColumn setCustomSpacing:kSettingsSectionGap afterView:mouseNote];
     [mouseColumn setCustomSpacing:kSettingsTitleGap afterView:menuBarTitle];
-    [mouseColumn setCustomSpacing:4 afterView:hideIcon];
+    [mouseColumn setCustomSpacing:6 afterView:hideIcon];
 
     NSMutableArray<NSView *> *mediaColumnRows = [NSMutableArray arrayWithObject:mediaTitle];
     [mediaColumnRows addObjectsFromArray:mediaRows];
@@ -5569,9 +5651,9 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeCenterX;
     stack.spacing = 12;
-    [stack setCustomSpacing:28 afterView:self.gestureWarning];
-    [stack setCustomSpacing:28 afterView:self.updateStatus];
-    [stack setCustomSpacing:28 afterView:buttons];
+    [stack setCustomSpacing:20 afterView:self.gestureWarning];
+    [stack setCustomSpacing:20 afterView:self.updateStatus];
+    [stack setCustomSpacing:20 afterView:buttons];
     [self.gestureWarning.widthAnchor constraintLessThanOrEqualToConstant:columnsWidth].active = YES;
     // Margins as constraints on a container: the stack's own edgeInsets were
     // left out of fittingSize, so the window came out too small and clipped.
@@ -5620,7 +5702,7 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
                                                                   NSWindowStyleMaskMiniaturizable
                                                           backing:NSBackingStoreBuffered
                                                             defer:NO];
-        self.window.title = @"Touchpad Switcher — Podešavanja";
+        self.window.title = @"Touchpad Switcher - Podešavanja";
         self.window.releasedWhenClosed = NO;
         // Its own place in Mission Control instead of a helper panel above
         // another app's window.
@@ -5692,10 +5774,10 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
                     self.updateStatus.stringValue = [NSString stringWithFormat:@"Dostupna je nova verzija %@.", release.version];
                 } else {
                     self.updateButton.title = [NSString stringWithFormat:@"Proveri ažuriranje (%@)", current];
-                    self.updateStatus.stringValue = [NSString stringWithFormat:@"Imaš najnoviju verziju (%@).", current];
+                    self.updateStatus.stringValue = @"";
                 }
             }
-            self.updateStatus.hidden = NO;
+            self.updateStatus.hidden = self.updateStatus.stringValue.length == 0;
             [self fitWindow];
         });
     });

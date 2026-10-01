@@ -179,6 +179,18 @@ static void verifyPreview(LayoutPreview *preview) {
     assert([g_tabThumbnailCache[@"tab"] isEqualToData:savedPicture]);
     assert(!g_windowLastCaptured.count && !g_tabLastCaptured.count && !g_chromeWindowLastCapture.count);
     printf("Chrome: promene taba i stranice odbacuju snimak; promena teme čuva postojeće slike.\n");
+    RingEntry *duplicateA=[RingEntry new],*duplicateB=[RingEntry new];
+    duplicateA.chromeWindowID=duplicateB.chromeWindowID=@"100";
+    duplicateA.chromeTabID=@"200"; duplicateB.chromeTabID=@"201";
+    duplicateA.tabURL=duplicateB.tabURL=@"https://example.com/ista-stranica";
+    duplicateA.tabTitle=duplicateB.tabTitle=@"Isti naslov";
+    duplicateA.isTab=duplicateB.isTab=YES;
+    assert(![tabThumbnailKey(duplicateA) isEqualToString:tabThumbnailKey(duplicateB)]);
+    NSSet *survivors=[NSSet setWithObject:@"100:201"];
+    assert(chromeTabMembership(duplicateA,survivors)==0);
+    assert(chromeTabMembership(duplicateB,survivors)==1);
+    assert(chromeTabMembership(duplicateB,nil)==-1);
+    printf("Isti link i naslov: zatvoreni tab se uklanja, drugi ostaje prema svom ID-u.\n");
     // Jedan prazan frejm mora osloboditi novu gestu, bez daljih callbackova.
     BOOL waiting = NO;
     assert(suppressTouchFrameAfterFourFingers(4, &waiting) && waiting);
@@ -203,6 +215,23 @@ static void verifyPreview(LayoutPreview *preview) {
     [preview.ring updateCardLayersAnimated:NO refreshContents:YES];
     assert(NSWidth([preview.ring cardRectForIndex:4])>iconWidth*1.5);
     printf("Novi thumbnail odmah dobija punu veličinu bez ponovnog otvaranja menija.\n");
+    // Poređenje sa sredinom ekrana pre zajedničkog pomeranja grupe.
+    for (NSInteger shape=0;shape<3;shape++) {
+        preview.shapeControl.selectedSegment=shape;
+        [preview rebuild:5];
+        NSSize screen=preview.ring.bounds.size;
+        CGFloat rx,ry;
+        NSArray *rects=adaptiveCardLayout(preview.ring.entries,screen,&rx,&ry);
+        NSMutableArray *visible=[NSMutableArray array];
+        for (NSUInteger i=0;i<rects.count;i++)
+            [visible addObject:[NSValue valueWithRect:visibleCardRect(preview.ring.entries[i],[rects[i] rectValue])]];
+        NSPoint origin=NSMakePoint(screen.width/2,screen.height/2);
+        NSPoint balanced=balancedHubPoint(preview.ring.entries,rects,screen);
+        CGFloat before=hubGapVariation(visible,origin),after=hubGapVariation(visible,balanced);
+        assert(after<=before+0.001);
+        assert(hubClearance(rects,balanced)+0.001>=MIN(28.0,hubClearance(rects,origin)));
+        printf("Balans, oblik %ld: odstupanje razmaka %.1f -> %.1f pt.\n",(long)shape,before,after);
+    }
     const NSSize sizes[] = {{800,600},{1100,688},{1440,900},{1600,900},{1996,1248}};
     const NSUInteger counts[] = {1,2,3,4,5,6,7,8,12,16};
     for (NSUInteger sizeIndex=0;sizeIndex<5;sizeIndex++) {

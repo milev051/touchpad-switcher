@@ -384,3 +384,22 @@ menija, raspored se osvežava i snimak odmah dobija normalnu veličinu.
 Ceo raspored je centriran prema vidljivim površinama thumbnailova, ikonica
 i naziva. Kartice i centralna ikonica pomeraju se zajedno, uz rezervu za
 zoom i susede. Položaj grupe ostaje isti kada se promeni samo izbor.
+
+Položaj centralne ikonice ujednačava razmake do vidljivih ivica thumbnailova
+i njihovih ikonica. Računa se odstupanje tih razmaka, uz bezbedan prostor
+za uvećanu karticu. Cela grupa zatim ostaje centrirana na ekranu.
+
+Maksimalna veličina thumbnailova prati dimenzije ekrana, uz proveru prostora
+za zoom i susede. Na većim ekranima kartice mogu preći prethodnih 480 pt.
+Posle sabijanja rasporeda cela grupa se dodatno uvećava prema preostalim
+marginama, uz očuvanje centra i proporcija thumbnailova.
+
+Kada su nazivi skriveni, kartice čuvaju samo prostor potreban za ikonicu.
+Rezerva između suseda računa jedan izabrani thumbnail, pa snimci mogu biti
+veći bez preklapanja. Chrome tabovi se čitaju prema zasebnim ID-evima,
+a potvrđeni otvoren tab ne uklanja se zbog promene CG površine prozora.
+Dva taba sa istim linkom i naslovom zadržavaju odvojene identitete i keš.
+
+Podešavanja imaju ujednačene razmake i odvojene redove za boju, jačinu
+pozadine i zamućenje. Broj instalirane verzije stoji u dugmetu za proveru
+ažuriranja; poruka da je verzija najnovija ne prikazuje se zasebno.
