@@ -367,9 +367,19 @@ ekrana, za 1, 2, 3, 4, 5, 6, 7, 8, 12 i 16 kartica,
 u horizontalnim, uspravnim i mešovitim rasporedima. Fotografije za lokalni pregled ostaju van Git-a u
 folderu `layout-previews/`.
 
-Posle dodira sa četiri ili više prstiju, prvi signal potpunog podizanja
-prstiju odmah oslobađa sledeću gestu. Provera `--verify` pokriva i ovaj
-oporavak bez dodatnih praznih frejmova sa trackpada.
+Prelazak sa tri na jedan ili dva prsta potvrđuje izbor. Ponovno dodavanje
+prstiju do tri otvara novi meni, bez potpunog podizanja ruke. Ako se treći
+prst vrati dok se prethodni izbor završava, otvaranje čeka taj završetak.
+Skrol i pomeranje pokazivača su blokirani tokom menija, a zaostala inercija
+skrola se odbacuje. Novi skrol posle zatvaranja opet radi normalno.
+Provera `--verify` pokriva 20 ponavljanja tih prelaza, brzo vraćanje,
+zakašnjele zahteve i skrol pre, tokom i posle menija.
+
+Četiri ili više prstiju poništavaju trenutni izbor. Povratak na tri prsta
+odmah omogućava novi meni, bez potpunog podizanja ruke. Provera `--verify`
+pokriva i taj prelaz. `--verify-input` dodatno proverava stvarno asinhrono
+zatvaranje i ponovno otvaranje menija kroz 12 ciklusa sa jednim, dva i
+kratkim četvrtim kontaktom, bez ručnog menjanja stanja završetka.
 
 Ponovno otvaranje aplikacije vraća sakrivenu ikonicu i otvara podešavanja.
 Pokretanje nove instance i dalje zamenjuje prethodnu. Chrome snimci se
@@ -403,3 +413,75 @@ Dva taba sa istim linkom i naslovom zadržavaju odvojene identitete i keš.
 Podešavanja imaju ujednačene razmake i odvojene redove za boju, jačinu
 pozadine i zamućenje. Broj instalirane verzije stoji u dugmetu za proveru
 ažuriranja; poruka da je verzija najnovija ne prikazuje se zasebno.
+
+U sredini kružnog menija prikazuje se X i poruka „Otpusti za izlazak“.
+Poništavanje ima širu zonu i odvojenu granicu za ponovni izbor.
+Dok držiš Cmd, prikazuju se uključene prečice za Downloads, Desktop,
+Documents i novi Chrome tab. Opcije se biraju u odeljku „Prečice uz Cmd“.
+Otpusti tri prsta dok je Cmd i dalje pritisnut da otvoriš izabranu prečicu;
+puštanje Cmd vraća meni na prozore i tabove.
+Otvorena podešavanja imaju svoju karticu i ostaju otvorena pri promeni
+fokusa. Zatvaraju se preko X, Esc ili Cmd+W. Aplikacija ima zasebnu ikonicu
+sa karticama i tri prsta, generisanu pomoću `tools/generate_app_icon.m`.
+
+### Stalne prečice i novi YouTube tab
+
+U Podešavanjima > Prečice svaka stavka ima nezavisne opcije **Cmd** i
+**Stalno**. Stalno prikazuje prečicu među aplikacijama bez držanja Cmd-a;
+Cmd prikazuje je u posebnom meniju dok je taster pritisnut. Dostupni su
+Downloads, Desktop, Documents, novi Chrome tab i novi YouTube tab.
+Chrome i YouTube svaki put otvaraju nov tab u Chrome-u. Izbor se pamti
+posle ponovnog pokretanja aplikacije. Stalne prečice su podrazumevano
+isključene, a YouTube možeš uključiti u jednoj ili obe kolone.
+
+### Dijagnostika i praćenje problema
+
+Podešavanja > **Otvori logove** otvara `~/Library/Logs/TouchpadSwitcher/`.
+`events.jsonl` sadrži vreme, PID, generaciju geste, broj prstiju, stanje
+menija, izbor, ID prozora/taba, rezultat skripte i naknadnu proveru aktivnog
+Chrome taba. Naslovi stranica i URL-ovi ne beleže se u ovom dnevniku.
+Dnevnik se rotira na 4 MB; prethodni je `events.jsonl.previous`.
+
+Praćenje uživo u Terminalu:
+
+```bash
+tail -F ~/Library/Logs/TouchpadSwitcher/events.jsonl
+```
+
+`permissions` beleži Accessibility, Input Monitoring i Screen Recording;
+`input_filter` govori da li radi sistemski filter skrola. `touch_count` i
+`gesture_start` pokazuju da li je trackpad prepoznat. `menu_open`,
+`touch_release` i `menu_close` prate izbor. `chrome_switch_requested`,
+`chrome_script_result` i `chrome_verify` razlikuju zahtev od potvrde da je
+stvarno aktivan očekivani tab. `activation_skipped` objašnjava zastareli
+zahtev, a `chrome_background_switch` prati promene radi snimanja thumbnaila.
+
+Za pregled sistemskih zapisa pokreni macOS **Console** i filtriraj proces
+`touchpad_ring_test`. **Activity Monitor** pokazuje da li proces radi, CPU
+i memoriju; opcija Sample Process pomaže pri zastoju. Izveštaji o rušenju
+nalaze se u `~/Library/Logs/DiagnosticReports/`.
+
+Provera pisanja dnevnika, paralelnih zapisa i rotacije:
+
+```bash
+make /tmp/touchpad-layout-preview
+/tmp/touchpad-layout-preview --verify-logs
+```
+
+Kada ponoviš problem, zabeleži približno vreme i koji izbor nije uspeo.
+Tako možemo povezati gestu, izbor i rezultat aktivacije u istom dnevniku.
+
+### Prikaži desktop (1.0.3)
+
+Drži Cmd u otvorenom meniju i izaberi **Prikaži desktop**. Ova akcija
+sklanja prozore koristeći macOS prikaz desktopa; prozori se ne zatvaraju.
+To je posebna prečica u odnosu na **Desktop**, koja otvara folder.
+U Podešavanjima > Prečice možeš isključiti Cmd prikaz ove akcije ili
+uključiti **Stalno**, da bude dostupna i među aplikacijama. Na sistemu
+bez dostupne Dock akcije aplikacije se sakrivaju umesto zatvaranja.
+
+Verzija 1.0.3 objedinjuje Cmd i stalne prečice, novi Chrome/YouTube tab,
+Prikaži desktop, novu ikonicu aplikacije, X sa animacijom i svetlom,
+popravljene prelaze broja prstiju i lokalni dijagnostički dnevnik.
+Ažuriranje se preuzima iz GitHub Releases preko dugmeta u podešavanjima;
+klon repozitorijuma nije potreban za instaliranje novog izdanja.

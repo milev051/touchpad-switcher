@@ -7,8 +7,10 @@
 @interface PreviewRingView : RingView
 @property BOOL showGuides;
 @property(copy) void (^selectionChanged)(NSInteger);
+- (void)testDesktop:(id)sender;
 @end
 @implementation PreviewRingView
+- (void)testDesktop:(id)sender { showDesktop(); }
 - (void)mouseDown:(NSEvent *)event {
     NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
     NSInteger hit = -1;
@@ -191,16 +193,167 @@ static void verifyPreview(LayoutPreview *preview) {
     assert(chromeTabMembership(duplicateB,survivors)==1);
     assert(chromeTabMembership(duplicateB,nil)==-1);
     printf("Isti link i naslov: zatvoreni tab se uklanja, drugi ostaje prema svom ID-u.\n");
+    g_pointerX=0.20; g_pointerY=0;
+    assert(pointerSelection(5,0)==-1);
+    g_pointerX=0.24;
+    assert(pointerSelection(5,-1)==-1);
+    g_pointerX=0.31;
+    assert(pointerSelection(5,-1)>=0);
+    unsigned savedMask=atomic_load(&g_shortcutMask);
+    atomic_store(&g_shortcutMask,7);
+    NSArray *shortcuts=commandShortcutEntries();
+    assert(shortcuts.count==3);
+    for (RingEntry *entry in shortcuts) assert(entry.isShortcut && entry.folderPath.length && entry.icon);
+    RingView *savedRing=g_ringView;
+    NSArray *savedEntries=g_windowEntries;
+    NSArray *savedStandard=g_standardRingEntries;
+    int savedCount=atomic_load(&g_windowEntryCount);
+    BOOL savedMode=g_commandShortcutMode;
+    g_ringView=preview.ring;
+    g_standardRingEntries=preview.ring.entries;
+    NSArray *normal=g_standardRingEntries;
+    g_commandShortcutMode=NO;
+    setCommandShortcutMode(YES);
+    assert(g_commandShortcutMode && g_windowEntries.count==3 && atomic_load(&g_windowEntryCount)==3);
+    setCommandShortcutMode(NO);
+    assert(!g_commandShortcutMode && g_windowEntries==normal && preview.ring.entries==normal);
+    g_ringView=savedRing; g_windowEntries=savedEntries;
+    g_standardRingEntries=savedStandard; g_commandShortcutMode=savedMode;
+    atomic_store(&g_windowEntryCount,savedCount);
+    atomic_store(&g_shortcutMask,0);
+    assert(commandShortcutEntries().count==0);
+    unsigned savedPersistent=atomic_load(&g_persistentShortcutMask);
+    atomic_store(&g_persistentShortcutMask,7);
+    NSArray *withFolders=entriesWithPersistentShortcuts(normal);
+    assert(withFolders.count==normal.count+3);
+    assert(entriesWithPersistentShortcuts(withFolders).count==withFolders.count);
+    atomic_store(&g_persistentShortcutMask,0);
+    assert(entriesWithPersistentShortcuts(withFolders).count==normal.count);
+    NSArray *desktop=shortcutEntriesForMask(32);
+    assert(desktop.count==1);
+    RingEntry *desktopEntry=desktop.firstObject;
+    assert(desktopEntry.showsDesktop && desktopEntry.isShortcut && desktopEntry.icon);
+    assert(!desktopEntry.opensNewChromeTab && !desktopEntry.folderPath.length);
+    atomic_store(&g_persistentShortcutMask,32);
+    assert(entriesWithPersistentShortcuts(normal).count==normal.count+1);
+    NSArray *newTabs=shortcutEntriesForMask(24);
+    NSURL *chromeURL=[NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:@"com.google.Chrome"];
+    assert(newTabs.count==(chromeURL ? 2 : 0));
+    if (chromeURL) {
+        RingEntry *chrome=newTabs[0], *youtube=newTabs[1];
+        assert(chrome.opensNewChromeTab && youtube.opensNewChromeTab);
+        assert([youtube.tabURL isEqualToString:@"https://www.youtube.com/"] && youtube.icon);
+        assert([newChromeTabScript(chrome) containsString:@"chrome://newtab/"]);
+        assert([newChromeTabScript(youtube) containsString:@"https://www.youtube.com/"]);
+        atomic_store(&g_persistentShortcutMask,24);
+        NSArray *permanent=entriesWithPersistentShortcuts(normal);
+        assert(permanent.count==normal.count+2);
+        assert(entriesWithPersistentShortcuts(permanent).count==permanent.count);
+        g_ringView=preview.ring;
+        g_standardRingEntries=permanent;
+        g_commandShortcutMode=NO;
+        atomic_store(&g_shortcutMask,7);
+        setCommandShortcutMode(YES);
+        assert(g_windowEntries.count==3);
+        setCommandShortcutMode(NO);
+        assert(g_windowEntries==permanent && g_windowEntries.count==normal.count+2);
+        g_ringView=savedRing; g_windowEntries=savedEntries;
+        g_standardRingEntries=savedStandard; g_commandShortcutMode=savedMode;
+        atomic_store(&g_windowEntryCount,savedCount);
+    }
+    atomic_store(&g_persistentShortcutMask,savedPersistent);
+    atomic_store(&g_shortcutMask,savedMask);
+    printf("Stalne prečice: bez duplikata, uklanjanje, novi Chrome/YouTube tab i povratak sa Cmd-a prolaze.\n");
+    printf("Poništavanje: šira zona sa histerezom. Cmd prečice poštuju izabrane opcije.\n");
+    MTTouch contacts[4]={0};
+    for (int i=0;i<4;i++) {
+        contacts[i].state=MTTouchStateTouching;
+        contacts[i].normalizedVector.position.x=0.4;
+        contacts[i].normalizedVector.position.y=0.6;
+    }
+    CGEventRef scroll=CGEventCreateScrollWheelEvent(NULL,kCGScrollEventUnitPixel,1,12);
+    CGEventRef motion=CGEventCreateMouseEvent(NULL,kCGEventMouseMoved,CGPointZero,kCGMouseButtonLeft);
+    for (int repeat=0;repeat<20;repeat++) for (int fingers=2;fingers>=0;fingers--) {
+        // Skrol sa dva prsta prolazi pre otvaranja menija.
+        atomic_store(&g_gestureActive,false);
+        atomic_store(&g_gestureEnding,false);
+        atomic_store(&g_ringOverlayVisible,false);
+        atomic_store(&g_scrollSuppressionActive,false);
+        atomic_store(&g_suppressGestureMomentum,false);
+        CGEventSetIntegerValueField(scroll,kCGScrollWheelEventMomentumPhase,kCGMomentumScrollPhaseNone);
+        assert(filterScrollDuringRing(NULL,kCGEventScrollWheel,scroll,NULL)==scroll);
+        ringTouchCallback(NULL,contacts,3,0,0);
+        assert(atomic_load(&g_gestureActive) && !atomic_load(&g_gestureEnding));
+        uint64_t generation=atomic_load(&g_gestureGeneration);
+        ringTouchCallback(NULL,contacts,3,0,0);
+        assert(atomic_load(&g_gestureGeneration)==generation); // Isti dodir ne otvara novi meni.
+        assert(filterScrollDuringRing(NULL,kCGEventScrollWheel,scroll,NULL)==NULL);
+        assert(filterScrollDuringRing(NULL,kCGEventMouseMoved,motion,NULL)==NULL);
+        g_selectedIndex=2;
+        ringTouchCallback(NULL,contacts,fingers,0,0);
+        assert(atomic_load(&g_gestureEnding) && selectionForLift()==2);
+        ringTouchCallback(NULL,contacts,3,0,0);
+        assert(atomic_load(&g_gestureEnding)); // Brz povratak čeka završetak prethodnog izbora.
+        assert(atomic_load(&g_gestureGeneration)==generation);
+        // Simulacija završenog izbora, bez aktiviranja stvarnih aplikacija u testu.
+        atomic_store(&g_gestureActive,false);
+        atomic_store(&g_gestureEnding,false);
+        if (repeat%2==0) reopenTouchGestureWhenReady(NULL,generation);
+        else ringTouchCallback(NULL,contacts,3,0,0);
+        assert(atomic_load(&g_gestureActive) && !atomic_load(&g_gestureEnding));
+        assert(atomic_load(&g_gestureGeneration)==generation+1);
+        assert(g_selectedIndex==-1 && g_pointerX==0 && g_pointerY==0);
+        assert(fabs(g_previousX-0.4)<0.001 && fabs(g_previousY-0.6)<0.001);
+        // Stari zahtevi više ne smeju promeniti novu gestu.
+        reopenTouchGestureWhenReady(NULL,generation);
+        assert(atomic_load(&g_gestureGeneration)==generation+1);
+        assert(filterScrollDuringRing(NULL,kCGEventScrollWheel,scroll,NULL)==NULL);
+        atomic_fetch_add(&g_gestureGeneration,1); // Otkaži UI i aktivaciju zakazane iz testa.
+        atomic_store(&g_gestureActive,false);
+        atomic_store(&g_gestureEnding,false);
+        ringTouchCallback(NULL,NULL,0,0,0);
+        // Inercija starog skrola ostaje blokirana i posle isteka kratke zaštite.
+        atomic_store(&g_scrollSuppressionUntilNanos,0);
+        CGEventSetIntegerValueField(scroll,kCGScrollWheelEventMomentumPhase,kCGMomentumScrollPhaseContinue);
+        assert(filterScrollDuringRing(NULL,kCGEventScrollWheel,scroll,NULL)==NULL);
+        CGEventSetIntegerValueField(scroll,kCGScrollWheelEventMomentumPhase,kCGMomentumScrollPhaseEnd);
+        assert(filterScrollDuringRing(NULL,kCGEventScrollWheel,scroll,NULL)==NULL);
+        CGEventSetIntegerValueField(scroll,kCGScrollWheelEventMomentumPhase,kCGMomentumScrollPhaseNone);
+        assert(filterScrollDuringRing(NULL,kCGEventScrollWheel,scroll,NULL)==scroll);
+        assert(filterScrollDuringRing(NULL,kCGEventMouseMoved,motion,NULL)==motion);
+        showSystemCursorAfterGesture();
+    }
+    // Zakašnjeni zahtev otpada ako su prsti već ponovo podignuti.
+    uint64_t idleGeneration=atomic_load(&g_gestureGeneration);
+    atomic_store(&g_activeTouchCount,2);
+    reopenTouchGestureWhenReady(NULL,idleGeneration);
+    assert(!atomic_load(&g_gestureActive));
+    ringTouchCallback(NULL,contacts,4,0,0);
+    ringTouchCallback(NULL,contacts,3,0,0);
+    reopenTouchGestureWhenReady(NULL,idleGeneration);
+    assert(atomic_load(&g_gestureActive));
+    ringTouchCallback(NULL,NULL,0,0,0);
+    atomic_store(&g_gestureActive,false);
+    atomic_store(&g_gestureEnding,false);
+    ringTouchCallback(NULL,contacts,3,0,0);
+    assert(atomic_load(&g_gestureActive));
+    atomic_fetch_add(&g_gestureGeneration,1);
+    atomic_store(&g_gestureActive,false);
+    atomic_store(&g_gestureEnding,false);
+    ringTouchCallback(NULL,NULL,0,0,0);
+    showSystemCursorAfterGesture();
+    CFRelease(scroll); CFRelease(motion);
+    printf("20 ponavljanja: 3 -> 2/1/0 -> 3, brz povratak, stari zahtevi i blokiranje skrola prolaze.\n");
     // Jedan prazan frejm mora osloboditi novu gestu, bez daljih callbackova.
     BOOL waiting = NO;
     assert(suppressTouchFrameAfterFourFingers(4, &waiting) && waiting);
-    assert(suppressTouchFrameAfterFourFingers(3, &waiting) && waiting);
-    assert(suppressTouchFrameAfterFourFingers(1, &waiting) && waiting);
-    assert(suppressTouchFrameAfterFourFingers(0, &waiting) && !waiting);
+    assert(!suppressTouchFrameAfterFourFingers(3, &waiting) && !waiting);
+    assert(!suppressTouchFrameAfterFourFingers(1, &waiting) && !waiting);
+    assert(!suppressTouchFrameAfterFourFingers(0, &waiting) && !waiting);
     assert(!suppressTouchFrameAfterFourFingers(3, &waiting));
     for (int repeat = 0; repeat < 20; repeat++) {
         assert(suppressTouchFrameAfterFourFingers(5, &waiting));
-        assert(suppressTouchFrameAfterFourFingers(0, &waiting) && !waiting);
+        assert(!suppressTouchFrameAfterFourFingers(0, &waiting) && !waiting);
         assert(!suppressTouchFrameAfterFourFingers(3, &waiting));
     }
     printf("Četiri prsta: oporavak nakon jednog praznog frejma i 20 ponavljanja prolaze.\n");
@@ -274,7 +427,9 @@ static void verifyPreview(LayoutPreview *preview) {
                 preview.ring.selectedIndex=selected;
                 assert([preview.ring.hubLayer animationForKey:@"pop"] != nil);
                 CGFloat angle=cardScreenAngle(selected,count);
-                g_pointerX=cos(angle)*0.5;g_pointerY=sin(angle)*0.5;
+                // Stvarno kretanje i ograničavanje elipsom, uključujući uske rasporede.
+                g_pointerX=g_pointerY=0;
+                moveRingPointer(cos(angle)*0.2,sin(angle)*0.2,count);
                 assert(pointerSelection(count,-1)==selected);
                 NSRect visible[16];
                 for (NSUInteger i=0;i<count;i++) {
@@ -294,6 +449,12 @@ static void verifyPreview(LayoutPreview *preview) {
                     assert(!NSIntersectsRect(visible[i],visible[j]));
             }
             preview.ring.selectedIndex=-1;
+            assert(!preview.ring.hubLayer.hidden && preview.ring.hubLayer.contents);
+            assert([preview.ring.hubLayer animationForKey:@"pop"] != nil);
+            [preview.ring updateHubAnimated:NO];
+            assert([preview.ring.hubLayer animationForKey:@"pop"] != nil);
+            assert(fabs(preview.ring.hubLayer.shadowOpacity-0.42)<0.001);
+            assert(preview.ring.hubLayer.shadowPath!=NULL);
             for (CALayer *layer in preview.ring.cardLayers) {
                 assert(fabs(layer.transform.m11-1)<0.001);
                 assert(layer.shadowOpacity==0);
@@ -302,6 +463,79 @@ static void verifyPreview(LayoutPreview *preview) {
         }
         printf("%.0f×%.0f: horizontalni, uspravni i mešoviti snimci; 1-16 kartica, proporcionalni snimci i tačni smerovi izbora, svaki izbor bez preklapanja.\n",size.width,size.height);
     }
+}
+
+// Provera stvarnih asinhronih završetaka, bez zamene stanja ručno.
+static void waitForInputCondition(BOOL (^condition)(void)) {
+    NSDate *deadline=[NSDate dateWithTimeIntervalSinceNow:2];
+    while (!condition() && deadline.timeIntervalSinceNow>0)
+        [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    assert(condition());
+}
+
+static void verifyInputLifecycle(LayoutPreview *preview) {
+    g_windowEntries=preview.ring.entries;
+    atomic_store(&g_windowEntryCount,(int)g_windowEntries.count);
+    g_windowScanQueue=dispatch_queue_create("touchpad.test.scan",DISPATCH_QUEUE_SERIAL);
+    atomic_store(&g_isScanning,true); // Test ne pokreće inventar stvarnih prozora.
+    MTTouch contacts[4]={0};
+    for (int i=0;i<4;i++) {
+        contacts[i].state=MTTouchStateTouching;
+        contacts[i].normalizedVector.position.x=0.4;
+        contacts[i].normalizedVector.position.y=0.6;
+    }
+    for (int cycle=0;cycle<12;cycle++) {
+        ringTouchCallback(NULL,contacts,3,0,0);
+        waitForInputCondition(^BOOL{ return atomic_load(&g_ringOverlayVisible); });
+        uint64_t previous=atomic_load(&g_gestureGeneration);
+        ringTouchCallback(NULL,contacts,cycle%2+1,0,0);
+        // Povratak pre obrade glavnog reda ili nakon stvarnog zatvaranja.
+        if (cycle%3==0)
+            waitForInputCondition(^BOOL{ return !atomic_load(&g_gestureActive); });
+        ringTouchCallback(NULL,contacts,3,0,0);
+        waitForInputCondition(^BOOL{
+            return atomic_load(&g_gestureGeneration)>previous && atomic_load(&g_ringOverlayVisible) &&
+                !atomic_load(&g_gestureEnding) && atomic_load(&g_ringShownGeneration)==atomic_load(&g_gestureGeneration);
+        });
+        assert(g_selectedIndex==-1 && g_pointerX==0 && g_pointerY==0);
+        // Kratak četvrti kontakt takođe ne zahteva potpuno podizanje.
+        previous=atomic_load(&g_gestureGeneration);
+        ringTouchCallback(NULL,contacts,4,0,0);
+        ringTouchCallback(NULL,contacts,3,0,0);
+        waitForInputCondition(^BOOL{
+            return atomic_load(&g_gestureGeneration)>previous+1 && atomic_load(&g_ringOverlayVisible) &&
+                !atomic_load(&g_gestureEnding);
+        });
+        ringTouchCallback(NULL,NULL,0,0,0);
+        waitForInputCondition(^BOOL{ return !atomic_load(&g_gestureActive) && !atomic_load(&g_ringOverlayVisible); });
+    }
+    printf("Stvarni asinhroni tok: 12 ciklusa, brz/spor povratak sa 1/2 prsta i 4 -> 3 prolaze.\n");
+}
+
+static void verifyDiagnosticLogging(void) {
+    char tempPath[]="/tmp/touchpad-log-test-XXXXXX";
+    assert(mkdtemp(tempPath));
+    NSString *directory=[NSString stringWithUTF8String:tempPath];
+    startDiagnosticLoggingAt(directory,1024);
+    assert(g_diagnosticQueue && g_diagnosticFD>=0);
+    dispatch_apply(40,dispatch_get_global_queue(QOS_CLASS_UTILITY,0), ^(size_t index) {
+        diagnosticEvent(@"test_event",@{@"index":@(index)});
+    });
+    dispatch_sync(g_diagnosticQueue, ^{ fsync(g_diagnosticFD); });
+    for (NSString *name in @[@"events.jsonl",@"events.jsonl.previous"]) {
+        NSString *path=[directory stringByAppendingPathComponent:name];
+        NSString *contents=[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+        assert(contents.length);
+        assert([NSFileManager.defaultManager attributesOfItemAtPath:path error:nil].fileSize<=1024);
+        for (NSString *line in [contents componentsSeparatedByString:@"\n"]) {
+            if (!line.length) continue;
+            NSDictionary *record=[NSJSONSerialization JSONObjectWithData:[line dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+            assert([record[@"event"] isEqualToString:@"test_event"]);
+            assert(record[@"time"] && record[@"uptime"] && record[@"pid"] && record[@"generation"] && record[@"fingers"]);
+        }
+    }
+    dispatch_sync(g_diagnosticQueue, ^{ close(g_diagnosticFD); g_diagnosticFD=-1; });
+    printf("Dijagnostika: paralelni zapisi, JSON i rotacija prolaze. Putanja: %s\n",tempPath);
 }
 
 int main(int argc,const char *argv[]) {
@@ -366,10 +600,23 @@ int main(int argc,const char *argv[]) {
             weakPreview.selectionLabel.stringValue=selection<0?@"Bez izbora":[NSString stringWithFormat:@"Izbor: %ld",selection+1];
         };
         [preview rebuild:argument(@"--count") ? argument(@"--count").integerValue : 5];
+        if ([args containsObject:@"--shortcuts"]) {
+            preview.ring.entries=commandShortcutEntries();
+            preview.ring.layoutEntries=nil;
+            [preview.ring updateCardLayersAnimated:NO refreshContents:YES];
+            [preview.ring updateHubAnimated:NO];
+        }
         preview.ring.selectedIndex=argument(@"--selected") ? argument(@"--selected").integerValue : -1;
+        if ([args containsObject:@"--verify-logs"]) { verifyDiagnosticLogging(); return 0; }
+        if ([args containsObject:@"--verify-input"]) { verifyInputLifecycle(preview); return 0; }
         if ([args containsObject:@"--verify"]) { verifyPreview(preview); return 0; }
         NSString *output=argument(@"--render");
         if (output) { renderPreview(preview.ring,output); return 0; }
+        if ([args containsObject:@"--test-desktop"]) {
+            NSButton *desktopTest=[NSButton buttonWithTitle:@"Prikaži desktop" target:preview.ring action:@selector(testDesktop:)];
+            desktopTest.frame=NSMakeRect(20,20,160,32);
+            [preview.window.contentView addSubview:desktopTest];
+        }
         [preview.window makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
         [NSApp run];
