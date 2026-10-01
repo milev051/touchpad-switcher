@@ -4,17 +4,32 @@
 #undef main
 #include <assert.h>
 
-// Zamene aplikacija proveravaju skrivanje bez pomeranja stvarnih prozora.
-@interface HideTestApplication : NSObject
-@property NSApplicationActivationPolicy activationPolicy;
-@property(getter=isTerminated) BOOL terminated;
-@property(copy) NSString *bundleIdentifier;
-@property NSUInteger hideCalls;
-- (BOOL)hide;
-@end
-@implementation HideTestApplication
-- (BOOL)hide { self.hideCalls++; return YES; }
-@end
+// Provera AX protokola bez pomeranja stvarnih prozora.
+typedef struct { BOOL minimized; BOOL ignoresWrite; AXError error; int writes; BOOL button; int presses; BOOL ignoresPress; } TestMinimizeWindow;
+static AXError testReadWindow(AXUIElementRef reference,CFStringRef attribute,CFTypeRef *value) {
+    TestMinimizeWindow *window=(void *)reference;
+    if (CFEqual(attribute,kAXMinimizeButtonAttribute)) {
+        *value=window->button ? CFRetain((__bridge CFTypeRef)[NSValue valueWithPointer:window]) : NULL;
+        return window->button ? kAXErrorSuccess : kAXErrorAttributeUnsupported;
+    }
+    *value=CFRetain(window->minimized ? kCFBooleanTrue : kCFBooleanFalse);
+    return kAXErrorSuccess;
+}
+static AXError testWriteWindow(AXUIElementRef reference,CFStringRef attribute,CFTypeRef value) {
+    TestMinimizeWindow *window=(void *)reference;
+    window->writes++;
+    if (window->error) return window->error;
+    if (!window->ignoresWrite) window->minimized=CFEqual(value,kCFBooleanTrue);
+    return kAXErrorSuccess;
+}
+
+static AXError testPressWindow(AXUIElementRef reference,CFStringRef action) {
+    assert(CFEqual(action,kAXPressAction));
+    TestMinimizeWindow *window=[(__bridge NSValue *)reference pointerValue];
+    window->presses++;
+    if (!window->ignoresPress) window->minimized=YES;
+    return kAXErrorSuccess;
+}
 
 @interface PreviewRingView : RingView
 @property BOOL showGuides;
@@ -22,7 +37,7 @@
 - (void)testDesktop:(id)sender;
 @end
 @implementation PreviewRingView
-- (void)testDesktop:(id)sender { hideAllWindows(); }
+- (void)testDesktop:(id)sender { minimizeAllWindows(); }
 - (void)mouseDown:(NSEvent *)event {
     NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
     NSInteger hit = -1;
@@ -241,17 +256,45 @@ static void verifyPreview(LayoutPreview *preview) {
     assert(entriesWithPersistentShortcuts(withFolders).count==withFolders.count);
     atomic_store(&g_persistentShortcutMask,0);
     assert(entriesWithPersistentShortcuts(withFolders).count==normal.count);
-    HideTestApplication *regular=[HideTestApplication new], *accessory=[HideTestApplication new], *terminated=[HideTestApplication new];
-    regular.activationPolicy=NSApplicationActivationPolicyRegular;
-    accessory.activationPolicy=NSApplicationActivationPolicyAccessory;
-    terminated.activationPolicy=NSApplicationActivationPolicyRegular;
-    terminated.terminated=YES;
-    assert(hideApplicationWindows((id)@[regular,accessory,terminated])==1);
-    assert(regular.hideCalls==1 && accessory.hideCalls==0 && terminated.hideCalls==0);
+    assert(windowAccessAllowsMinimizing(NO,kAXErrorSuccess));
+    assert(!windowAccessAllowsMinimizing(NO,kAXErrorAPIDisabled));
+    assert(!windowAccessAllowsMinimizing(NO,kAXErrorCannotComplete));
+    assert(!windowAccessAllowsMinimizing(NO,kAXErrorAttributeUnsupported));
+    assert(windowAccessAllowsMinimizing(YES,kAXErrorCannotComplete));
+    TestMinimizeWindow first={0},second={0},already={.minimized=YES},denied={.error=kAXErrorAPIDisabled},ignored={.ignoresWrite=YES};
+    assert(minimizeWindow((void *)&first,testReadWindow,testWriteWindow,testPressWindow)==kAXErrorSuccess);
+    assert(minimizeWindow((void *)&second,testReadWindow,testWriteWindow,testPressWindow)==kAXErrorSuccess);
+    assert(first.minimized && second.minimized && first.writes==1 && second.writes==1);
+    assert(minimizeWindow((void *)&already,testReadWindow,testWriteWindow,testPressWindow)==kAXErrorSuccess && already.writes==0);
+    assert(minimizeWindow((void *)&denied,testReadWindow,testWriteWindow,testPressWindow)==kAXErrorAPIDisabled);
+    assert(minimizeWindow((void *)&ignored,testReadWindow,testWriteWindow,testPressWindow)==kAXErrorCannotComplete);
+    TestMinimizeWindow buttonOnly={.error=kAXErrorAttributeUnsupported,.button=YES};
+    TestMinimizeWindow ignoredButton={.ignoresWrite=YES,.button=YES,.ignoresPress=YES};
+    assert(minimizeWindow((void *)&buttonOnly,testReadWindow,testWriteWindow,testPressWindow)==kAXErrorSuccess);
+    assert(buttonOnly.minimized && buttonOnly.presses==1);
+    assert(minimizeWindow((void *)&ignoredButton,testReadWindow,testWriteWindow,testPressWindow)==kAXErrorCannotComplete);
+    assert(ignoredButton.presses==1 && !ignoredButton.minimized);
+    RingView *pointerTest=[[RingView alloc] initWithFrame:NSMakeRect(0,0,800,600)];
+    pointerTest.anchorPoint=NSMakePoint(400,300); pointerTest.ringRadius=200;
+    int savedStyle=atomic_load(&g_settingPointerStyle);
+    for (int style=PointerStyleArrow;style<=PointerStyleDot;style++) {
+        atomic_store(&g_settingPointerStyle,style);
+        [pointerTest resetPointer]; [pointerTest movePointerTo:NSZeroPoint];
+        assert(![pointerTest.pointerView.layer animationForKey:@"pointerMovement"]);
+        [pointerTest movePointerTo:NSMakePoint(-0.5,0.01)];
+        [pointerTest movePointerTo:NSMakePoint(-0.5,-0.01)];
+        CABasicAnimation *rotation=(id)[pointerTest.pointerArrow animationForKey:@"pointerRotation"];
+        assert(rotation && fabs([rotation.toValue doubleValue]-[rotation.fromValue doubleValue])<=M_PI);
+        assert([pointerTest.pointerView.layer animationForKey:@"pointerMovement"]);
+        assert(NSEqualPoints(pointerTest.lastPointer,NSMakePoint(-0.5,-0.01)));
+        [pointerTest movePointerTo:NSZeroPoint];
+        assert(![pointerTest.pointerArrow animationForKey:@"pointerRotation"]);
+    }
+    atomic_store(&g_settingPointerStyle,savedStyle);
     NSArray *desktop=shortcutEntriesForMask(32);
     assert(desktop.count==1);
     RingEntry *desktopEntry=desktop.firstObject;
-    assert(desktopEntry.hidesAllWindows && desktopEntry.isShortcut && desktopEntry.icon);
+    assert(desktopEntry.minimizesAllWindows && desktopEntry.isShortcut && desktopEntry.icon);
     assert(!desktopEntry.opensNewChromeTab && !desktopEntry.folderPath.length);
     atomic_store(&g_persistentShortcutMask,32);
     assert(entriesWithPersistentShortcuts(normal).count==normal.count+1);
@@ -632,7 +675,7 @@ int main(int argc,const char *argv[]) {
         NSString *output=argument(@"--render");
         if (output) { renderPreview(preview.ring,output); return 0; }
         if ([args containsObject:@"--test-hide-windows"]) {
-            NSButton *desktopTest=[NSButton buttonWithTitle:@"Sakrij sve prozore" target:preview.ring action:@selector(testDesktop:)];
+            NSButton *desktopTest=[NSButton buttonWithTitle:@"Spusti sve prozore" target:preview.ring action:@selector(testDesktop:)];
             desktopTest.frame=NSMakeRect(20,20,160,32);
             [preview.window.contentView addSubview:desktopTest];
         }

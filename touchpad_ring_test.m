@@ -84,7 +84,7 @@ extern CGError CGSSetWindowBackgroundBlurRadius(CGSConnectionID connection, NSIn
 @property(nonatomic) BOOL isSettings;
 @property(nonatomic) BOOL isShortcut;
 @property(nonatomic) BOOL opensNewChromeTab;
-@property(nonatomic) BOOL hidesAllWindows;
+@property(nonatomic) BOOL minimizesAllWindows;
 @property(nonatomic) BOOL isTab;
 @property(nonatomic) BOOL isSelectedTab;
 @property(nonatomic) NSUInteger tabIndex;
@@ -136,6 +136,7 @@ static void noteChromeSelectionChanges(NSArray<RingEntry *> *entries);
 @property(nonatomic, strong) CAShapeLayer *pointerArrow;
 @property(nonatomic, weak) NSView *glowView;
 @property(nonatomic) NSPoint lastPointer;
+@property(nonatomic) CGFloat pointerAngle;
 @property(nonatomic, strong) NSMutableArray<CALayer *> *cardLayers;
 @property(nonatomic, strong) CALayer *hubLayer;
 - (void)movePointerTo:(NSPoint)ringPoint;
@@ -1097,6 +1098,7 @@ static const CGFloat kCardImagePadding = 24.0;
 }
 
 - (void)movePointerTo:(NSPoint)ringPoint {
+    BOOL created = !self.pointerView;
     if (!self.pointerView) {
         const CGFloat size = 40.0;
         NSView *holder = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, size, size)];
@@ -1134,17 +1136,42 @@ static const CGFloat kCardImagePadding = 24.0;
     }
     self.lastPointer = ringPoint;
     [self updateGlow];
-    // At the very center there is no direction; start pointing up.
-    CGFloat angle = hypot(ringPoint.x, ringPoint.y) > 0.001 ? (CGFloat)atan2(ringPoint.y, ringPoint.x) : (CGFloat)M_PI_2;
-    // The arrow never hides the icon in the hub: it rides on the hub's edge
-    // until the pointer moves further out.
-    CGFloat distance = MAX(hypot(ringPoint.x, ringPoint.y) * self.ringRadius, kHubRadius + 16.0);
+    CGFloat radius = hypot(ringPoint.x, ringPoint.y);
+    BOOL reset = radius < 0.001;
+    // U samom centru sitno podrhtavanje prstiju nema pouzdan pravac.
+    CGFloat angle = reset ? M_PI_2 : (radius < 0.025 && !created ? self.pointerAngle : atan2(ringPoint.y, ringPoint.x));
+    CGFloat distance = MAX(radius * self.ringRadius, kHubRadius + 16.0);
+    CALayer *layer = self.pointerView.layer;
+    CALayer *visible = layer.presentationLayer;
+    CGPoint start = visible ? visible.position : layer.position;
+    CALayer *visibleArrow = self.pointerArrow.presentationLayer;
+    CGFloat startAngle = visibleArrow ? [[visibleArrow valueForKeyPath:@"transform.rotation.z"] doubleValue] : self.pointerAngle;
+    CGFloat targetAngle = startAngle + remainder(angle - startAngle, 2.0 * M_PI);
+    self.pointerAngle = angle;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
     NSSize size = self.pointerView.frame.size;
     [self.pointerView setFrameOrigin:NSMakePoint(self.anchorPoint.x + cos(angle) * distance - size.width / 2.0,
                                                  self.anchorPoint.y + sin(angle) * distance - size.height / 2.0)];
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    self.pointerArrow.affineTransform = CGAffineTransformMakeRotation(angle);
+    self.pointerArrow.affineTransform = CGAffineTransformMakeRotation(targetAngle);
+    if (!created && !reset && !self.pointerView.hidden) {
+        // Nastavi od trenutno prikazanog položaja, bez skoka pri novom uzorku.
+        CABasicAnimation *movement = [CABasicAnimation animationWithKeyPath:@"position"];
+        movement.fromValue = [NSValue valueWithPoint:NSPointFromCGPoint(start)];
+        movement.toValue = [NSValue valueWithPoint:NSPointFromCGPoint(layer.position)];
+        movement.duration = 0.065;
+        movement.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+        [layer addAnimation:movement forKey:@"pointerMovement"];
+        CABasicAnimation *rotation = [CABasicAnimation animationWithKeyPath:@"transform.rotation.z"];
+        rotation.fromValue = @(startAngle);
+        rotation.toValue = @(targetAngle);
+        rotation.duration = movement.duration;
+        rotation.timingFunction = movement.timingFunction;
+        [self.pointerArrow addAnimation:rotation forKey:@"pointerRotation"];
+    } else {
+        [layer removeAnimationForKey:@"pointerMovement"];
+        [self.pointerArrow removeAnimationForKey:@"pointerRotation"];
+    }
     [CATransaction commit];
 }
 
@@ -2162,27 +2189,139 @@ static void raiseWindowForEntry(RingEntry *entry, uint64_t generation) {
     }
 }
 
-// Skrivanje aplikacije čuva njene prozore i vraća ih klikom na Dock ikonicu.
-static NSUInteger hideApplicationWindows(NSArray<NSRunningApplication *> *applications) {
-    NSUInteger hidden=0;
-    for (NSRunningApplication *app in applications) {
-        if (app.activationPolicy!=NSApplicationActivationPolicyRegular || app.isTerminated) continue;
-        BOOL success=[app hide];
-        if (success) hidden++;
-        diagnosticEvent(@"hide_application",@{@"app":app.bundleIdentifier ?: @"",@"success":@(success)});
+typedef AXError (*WindowAttributeReader)(AXUIElementRef,CFStringRef,CFTypeRef *);
+typedef AXError (*WindowAttributeWriter)(AXUIElementRef,CFStringRef,CFTypeRef);
+typedef AXError (*WindowActionPerformer)(AXUIElementRef,CFStringRef);
+
+// Proveri stvarno stanje umesto oslanjanja samo na povratnu vrednost zahteva.
+static AXError minimizeWindow(AXUIElementRef window,WindowAttributeReader read,WindowAttributeWriter writeAttribute,WindowActionPerformer performAction) {
+    CFTypeRef value=NULL;
+    AXError result=read(window,kAXMinimizedAttribute,&value);
+    BOOL minimized=result==kAXErrorSuccess && value && CFEqual(value,kCFBooleanTrue);
+    if (value) CFRelease(value);
+    if (minimized) return kAXErrorSuccess;
+    result=writeAttribute(window,kAXMinimizedAttribute,kCFBooleanTrue);
+    AXError writeResult=result;
+    value=NULL;
+    result=read(window,kAXMinimizedAttribute,&value);
+    minimized=result==kAXErrorSuccess && value && CFEqual(value,kCFBooleanTrue);
+    if (value) CFRelease(value);
+    if (minimized) return kAXErrorSuccess;
+    // Neke aplikacije podržavaju dugme, ali odbijaju direktan upis AXMinimized.
+    CFTypeRef button=NULL;
+    AXError buttonResult=read(window,kAXMinimizeButtonAttribute,&button);
+    if (buttonResult==kAXErrorSuccess && button) {
+        AXError pressResult=performAction((AXUIElementRef)button,kAXPressAction);
+        CFRelease(button);
+        if (pressResult!=kAXErrorSuccess) return pressResult;
+        value=NULL;
+        result=read(window,kAXMinimizedAttribute,&value);
+        minimized=result==kAXErrorSuccess && value && CFEqual(value,kCFBooleanTrue);
+        if (value) CFRelease(value);
+        return minimized ? kAXErrorSuccess : (result==kAXErrorSuccess ? kAXErrorCannotComplete : result);
     }
-    return hidden;
+    if (button) CFRelease(button);
+    return writeResult!=kAXErrorSuccess ? writeResult : (result==kAXErrorSuccess ? kAXErrorCannotComplete : result);
 }
 
-static void hideAllWindows(void) {
-    NSUInteger hidden=hideApplicationWindows(NSWorkspace.sharedWorkspace.runningApplications);
-    [NSApp hide:nil];
-    diagnosticEvent(@"hide_all_windows",@{@"hiddenApps":@(hidden)});
+// Status dozvole dopuni stvarnim AX zahtevom, bez menjanja sistemskih dozvola.
+static BOOL windowAccessAllowsMinimizing(BOOL trusted,AXError probe) {
+    return trusted || probe==kAXErrorSuccess;
+}
+
+static BOOL canAccessOtherApplicationWindows(void) {
+    BOOL trusted=AXIsProcessTrusted();
+    if (trusted) return YES;
+    NSMutableArray<NSRunningApplication *> *candidates=[NSMutableArray array];
+    NSRunningApplication *front=NSWorkspace.sharedWorkspace.frontmostApplication;
+    if (front && front.processIdentifier!=getpid()) [candidates addObject:front];
+    for (NSRunningApplication *app in [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.finder"])
+        if (![candidates containsObject:app]) [candidates addObject:app];
+    for (NSRunningApplication *app in candidates) {
+        AXUIElementRef element=AXUIElementCreateApplication(app.processIdentifier);
+        AXUIElementSetMessagingTimeout(element,0.4);
+        CFTypeRef windows=NULL;
+        AXError result=AXUIElementCopyAttributeValue(element,kAXWindowsAttribute,&windows);
+        BOOL valid=windows && CFGetTypeID(windows)==CFArrayGetTypeID();
+        diagnosticEvent(@"accessibility_probe",@{@"trusted":@(trusted),@"app":app.bundleIdentifier ?: @"",
+            @"error":@(result),@"validWindows":@(valid)});
+        if (windows) CFRelease(windows);
+        CFRelease(element);
+        if (valid && windowAccessAllowsMinimizing(trusted,result)) return YES;
+    }
+    return NO;
+}
+
+static _Atomic(bool) g_minimizingAllWindows=false;
+static void minimizeAllWindows(void) {
+    if (!canAccessOtherApplicationWindows()) {
+        diagnosticEvent(@"minimize_all_blocked",@{@"reason":@"accessibility_permission"});
+        NSAlert *alert=[NSAlert new];
+        alert.messageText=@"macOS ne dozvoljava pristup prozorima";
+        NSString *permissionName=NSProcessInfo.processInfo.operatingSystemVersion.majorVersion>=27 ? @"Device Control and Data Access" : @"Accessibility";
+        alert.informativeText=[NSString stringWithFormat:@"Otvori System Settings > Privacy & Security > %@ i proveri Touchpad Switcher. Ako je već uključen, isključi ga pa ponovo uključi, zatim ponovo pokreni aplikaciju. Ako to ne pomogne, ukloni samo njen unos i dodaj Touchpad Switcher iz foldera Applications.",permissionName];
+        [alert addButtonWithTitle:@"Otvori podešavanja"];
+        [alert addButtonWithTitle:@"U redu"];
+        if ([alert runModal]==NSAlertFirstButtonReturn)
+            [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"]];
+        return;
+    }
+    if (atomic_exchange(&g_minimizingAllWindows,true)) return;
+    NSArray *applications=[NSWorkspace.sharedWorkspace.runningApplications copy];
+    __block _Atomic(unsigned) minimized=0,failed=0;
+    dispatch_group_t group=dispatch_group_create();
+    diagnosticEvent(@"minimize_all_start",nil);
+    // Ne čekaj animaciju jedne aplikacije pre slanja zahteva drugima.
+    for (NSRunningApplication *app in applications) {
+        if (app.isTerminated || app.processIdentifier==getpid() ||
+            app.activationPolicy==NSApplicationActivationPolicyProhibited) continue;
+        dispatch_group_async(group,dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0), ^{
+            @autoreleasepool {
+                AXUIElementRef element=AXUIElementCreateApplication(app.processIdentifier);
+                AXUIElementSetMessagingTimeout(element,0.4);
+                CFTypeRef windows=NULL;
+                AXError enumeration=AXUIElementCopyAttributeValue(element,kAXWindowsAttribute,&windows);
+                diagnosticEvent(@"minimize_enumeration",@{@"app":app.bundleIdentifier ?: @"",@"error":@(enumeration),
+                    @"windows":@(windows && CFGetTypeID(windows)==CFArrayGetTypeID() ? CFArrayGetCount(windows) : 0)});
+                if (enumeration==kAXErrorSuccess && windows && CFGetTypeID(windows)==CFArrayGetTypeID()) {
+                    for (id item in (__bridge NSArray *)windows) {
+                        AXUIElementRef window=(__bridge AXUIElementRef)item;
+                        AXUIElementSetMessagingTimeout(window,0.4);
+                        CFTypeRef fullscreen=NULL;
+                        AXUIElementCopyAttributeValue(window,CFSTR("AXFullScreen"),&fullscreen);
+                        if (fullscreen && CFEqual(fullscreen,kCFBooleanTrue)) {
+                            AXError exitResult=AXUIElementSetAttributeValue(window,CFSTR("AXFullScreen"),kCFBooleanFalse);
+                            diagnosticEvent(@"minimize_exit_fullscreen",@{@"app":app.bundleIdentifier ?: @"",@"error":@(exitResult)});
+                            if (exitResult==kAXErrorSuccess) usleep(250000);
+                        }
+                        if (fullscreen) CFRelease(fullscreen);
+                        AXError result=minimizeWindow(window,AXUIElementCopyAttributeValue,AXUIElementSetAttributeValue,AXUIElementPerformAction);
+                        for (int retry=0;result==kAXErrorCannotComplete && retry<2;retry++) {
+                            usleep(150000);
+                            result=minimizeWindow(window,AXUIElementCopyAttributeValue,AXUIElementSetAttributeValue,AXUIElementPerformAction);
+                        }
+                        if (result==kAXErrorSuccess) atomic_fetch_add(&minimized,1);
+                        else atomic_fetch_add(&failed,1);
+                        diagnosticEvent(@"minimize_window",@{@"app":app.bundleIdentifier ?: @"",@"success":@(result==kAXErrorSuccess),@"error":@(result)});
+                    }
+                } else if (enumeration!=kAXErrorSuccess) {
+                    atomic_fetch_add(&failed,1);
+                }
+                if (windows) CFRelease(windows);
+                CFRelease(element);
+            }
+        });
+    }
+    [NSApp hide:nil]; // Sakrij i sopstveni panel podešavanja.
+    dispatch_group_notify(group,dispatch_get_main_queue(), ^{
+        atomic_store(&g_minimizingAllWindows,false);
+        diagnosticEvent(@"minimize_all_done",@{@"minimized":@(atomic_load(&minimized)),@"failed":@(atomic_load(&failed))});
+    });
 }
 
 static NSArray<RingEntry *> *shortcutEntriesForMask(unsigned mask) {
     NSMutableArray *entries=[NSMutableArray array];
-    NSArray *names=@[@"Downloads",@"Desktop",@"Documents",@"Novi Chrome tab",@"Novi YouTube tab",@"Sakrij sve prozore"];
+    NSArray *names=@[@"Downloads",@"Desktop",@"Documents",@"Novi Chrome tab",@"Novi YouTube tab",@"Spusti sve prozore"];
     NSArray *folders=@[@"Downloads",@"Desktop",@"Documents"];
     for (NSUInteger i=0;i<names.count;i++) {
         if (!(mask&(1u<<i))) continue;
@@ -2193,8 +2332,8 @@ static NSArray<RingEntry *> *shortcutEntriesForMask(unsigned mask) {
             entry.folderPath=[NSHomeDirectory() stringByAppendingPathComponent:folders[i]];
             entry.icon=[NSWorkspace.sharedWorkspace iconForFile:entry.folderPath];
         } else if (i==5) {
-            entry.hidesAllWindows=YES;
-            NSImage *symbol=[NSImage imageWithSystemSymbolName:@"arrow.down.right.and.arrow.up.left" accessibilityDescription:@"Sakrij sve prozore"];
+            entry.minimizesAllWindows=YES;
+            NSImage *symbol=[NSImage imageWithSystemSymbolName:@"arrow.down.right.and.arrow.up.left" accessibilityDescription:@"Spusti sve prozore"];
             entry.icon=[symbol imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPaletteColors:@[NSColor.systemBlueColor]]];
         } else {
             entry.opensNewChromeTab=YES;
@@ -2374,9 +2513,9 @@ static void finishGesture(uint64_t generation, NSInteger selection) {
     RingEntry *entry=picked;
     if (entry.isSettings) { raiseSettingsWindow(); return; }
     if (entry.isShortcut) {
-        if (entry.hidesAllWindows) {
+        if (entry.minimizesAllWindows) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,80*NSEC_PER_MSEC),dispatch_get_main_queue(), ^{
-                if (generation==atomic_load(&g_gestureGeneration) && !atomic_load(&g_gestureActive)) hideAllWindows();
+                if (generation==atomic_load(&g_gestureGeneration) && !atomic_load(&g_gestureActive)) minimizeAllWindows();
             });
         } else if (entry.opensNewChromeTab) {
             dispatch_async(g_windowActivationQueue, ^{
@@ -5982,7 +6121,7 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
 
     NSTextField *shortcutsTitle=[self sectionTitle:@"Prečice"];
     NSMutableArray *shortcutRows=[NSMutableArray array];
-    NSArray *shortcutNames=@[@"Downloads",@"Desktop",@"Documents",@"Novi Chrome tab",@"Novi YouTube tab",@"Sakrij sve prozore"];
+    NSArray *shortcutNames=@[@"Downloads",@"Desktop",@"Documents",@"Novi Chrome tab",@"Novi YouTube tab",@"Spusti sve prozore"];
     for (NSUInteger i=0;i<shortcutNames.count;i++) {
         NSTextField *name=[NSTextField labelWithString:shortcutNames[i]];
         [name.widthAnchor constraintEqualToConstant:145].active=YES;
@@ -5997,7 +6136,7 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
         row.spacing=10;
         [shortcutRows addObject:row];
     }
-    NSTextField *shortcutNote=[self noteWithText:@"Cmd: prikaži dok držiš taster. Stalno: prikaži među aplikacijama i bez Cmd-a. Sakrij sve prozore sklanja aplikacije u Dock; ostale prečice otvaraju tab ili folder."];
+    NSTextField *shortcutNote=[self noteWithText:@"Cmd: prikaži dok držiš taster. Stalno: prikaži među aplikacijama i bez Cmd-a. Spusti sve prozore spušta prozore u Dock; ostale prečice otvaraju tab ili folder."];
     NSStackView *mouseColumn = [self settingsColumn:@[mouseTitle, self.mouseActivationLabel, mouseButtons, holdToSelect,
                                                       self.mouseLearnStatus, mouseNote, menuBarTitle, hideIcon, hideNote,
                                                       startAtLogin, shortcutsTitle, shortcutRows[0], shortcutRows[1],

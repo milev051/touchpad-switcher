@@ -471,17 +471,42 @@ make /tmp/touchpad-layout-preview
 Kada ponoviš problem, zabeleži približno vreme i koji izbor nije uspeo.
 Tako možemo povezati gestu, izbor i rezultat aktivacije u istom dnevniku.
 
-### Sakrij sve prozore (1.0.4)
+### Spusti sve prozore (1.0.5)
 
-Drži Cmd u otvorenom meniju i izaberi **Sakrij sve prozore**. Prozori
-se sakrivaju sa svojim aplikacijama i vraćaju klikom na odgovarajuću
-ikonicu u Dock-u. Aplikacije ostaju pokrenute, a prozori zadržavaju
-svoj raspored. Akcija koristi skrivanje aplikacija, bez aktiviranja
-macOS režima Show Desktop.
+Drži Cmd u otvorenom meniju i izaberi **Spusti sve prozore**. Akcija
+minimizuje svaki prozor preko Accessibility interfejsa i proverava njegovo
+stvarno stanje. Ako direktan zahtev ne uspe, pokušava preko dugmeta za
+minimizovanje tog prozora. Zahtevi različitim aplikacijama šalju se paralelno.
+Prozori koji su već spušteni ostaju takvi. Full-screen prozor prvo dobija
+zahtev za izlazak iz full-screen režima, pa za minimizovanje.
 
-U Podešavanjima > Prečice možeš isključiti Cmd prikaz ove akcije ili
-uključiti **Stalno**, da bude dostupna i među aplikacijama. Podešavanje
-prethodne akcije iz 1.0.3 ostaje sačuvano. **Desktop** i dalje otvara folder.
+Potrebna je dozvola System Settings > Privacy & Security > Accessibility
+za instalirani Touchpad Switcher. Na macOS-u 27 dozvola se zove
+**Device Control and Data Access**. Ako provera statusa vrati da dozvola
+nije aktivna, aplikacija prvo proverava stvarni pristup prozorima Finder-a
+ili aktivne aplikacije. Uspešan pristup omogućava nastavak akcije; ako i
+sistemski zahtev bude odbijen, prikazuje se objašnjenje i dugme za
+otvaranje podešavanja. Uključen prekidač uz odbijen pristup može zahtevati
+osvežavanje unosa dozvole i ponovno pokretanje aplikacije. U Dock podešavanjima uključi
+**Minimize windows into application icon** da prozori budu u svojim
+aplikacijama. Aplikacija ne menja tu sistemsku opciju.
+
+`accessibility_probe` beleži odgovor stvarnog AX zahteva kada status
+dozvole nije potvrđen. `minimize_window` beleži rezultat svakog prozora, `minimize_enumeration`
+broj pronađenih prozora i grešku čitanja aplikacije, a `minimize_all_done` ukupan rezultat. Neke
+pomoćne prozore aplikacije ne dozvoljavaju minimizovanje; greška se beleži
+umesto prijavljivanja uspeha.
+
+U Podešavanjima > Prečice možeš izabrati Cmd i/ili Stalno. Podešavanje
+prethodne akcije ostaje sačuvano. **Desktop** i dalje otvara folder.
 
 Ažuriranje se preuzima iz GitHub Releases preko dugmeta u podešavanjima;
 klon repozitorijuma nije potreban za instaliranje novog izdanja.
+
+### Glatkiji pokazivač (1.0.5)
+
+Strelica i kružić imaju kratak prelaz od 65 ms koji nastavlja od trenutno
+prikazanog položaja. Strelica se okreće kraćim putem preko granice uglova,
+a sitno podrhtavanje u centru ne menja pravac. Izbor kartice koristi
+neizmenjene koordinate prstiju, pa zaglađivanje ne usporava aktivaciju.
+Otvaranje menija i prelazak na Cmd prečice odmah resetuju pokazivač.
