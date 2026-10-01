@@ -4,13 +4,25 @@
 #undef main
 #include <assert.h>
 
+// Zamene aplikacija proveravaju skrivanje bez pomeranja stvarnih prozora.
+@interface HideTestApplication : NSObject
+@property NSApplicationActivationPolicy activationPolicy;
+@property(getter=isTerminated) BOOL terminated;
+@property(copy) NSString *bundleIdentifier;
+@property NSUInteger hideCalls;
+- (BOOL)hide;
+@end
+@implementation HideTestApplication
+- (BOOL)hide { self.hideCalls++; return YES; }
+@end
+
 @interface PreviewRingView : RingView
 @property BOOL showGuides;
 @property(copy) void (^selectionChanged)(NSInteger);
 - (void)testDesktop:(id)sender;
 @end
 @implementation PreviewRingView
-- (void)testDesktop:(id)sender { showDesktop(); }
+- (void)testDesktop:(id)sender { hideAllWindows(); }
 - (void)mouseDown:(NSEvent *)event {
     NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
     NSInteger hit = -1;
@@ -229,10 +241,17 @@ static void verifyPreview(LayoutPreview *preview) {
     assert(entriesWithPersistentShortcuts(withFolders).count==withFolders.count);
     atomic_store(&g_persistentShortcutMask,0);
     assert(entriesWithPersistentShortcuts(withFolders).count==normal.count);
+    HideTestApplication *regular=[HideTestApplication new], *accessory=[HideTestApplication new], *terminated=[HideTestApplication new];
+    regular.activationPolicy=NSApplicationActivationPolicyRegular;
+    accessory.activationPolicy=NSApplicationActivationPolicyAccessory;
+    terminated.activationPolicy=NSApplicationActivationPolicyRegular;
+    terminated.terminated=YES;
+    assert(hideApplicationWindows((id)@[regular,accessory,terminated])==1);
+    assert(regular.hideCalls==1 && accessory.hideCalls==0 && terminated.hideCalls==0);
     NSArray *desktop=shortcutEntriesForMask(32);
     assert(desktop.count==1);
     RingEntry *desktopEntry=desktop.firstObject;
-    assert(desktopEntry.showsDesktop && desktopEntry.isShortcut && desktopEntry.icon);
+    assert(desktopEntry.hidesAllWindows && desktopEntry.isShortcut && desktopEntry.icon);
     assert(!desktopEntry.opensNewChromeTab && !desktopEntry.folderPath.length);
     atomic_store(&g_persistentShortcutMask,32);
     assert(entriesWithPersistentShortcuts(normal).count==normal.count+1);
@@ -612,8 +631,8 @@ int main(int argc,const char *argv[]) {
         if ([args containsObject:@"--verify"]) { verifyPreview(preview); return 0; }
         NSString *output=argument(@"--render");
         if (output) { renderPreview(preview.ring,output); return 0; }
-        if ([args containsObject:@"--test-desktop"]) {
-            NSButton *desktopTest=[NSButton buttonWithTitle:@"Prikaži desktop" target:preview.ring action:@selector(testDesktop:)];
+        if ([args containsObject:@"--test-hide-windows"]) {
+            NSButton *desktopTest=[NSButton buttonWithTitle:@"Sakrij sve prozore" target:preview.ring action:@selector(testDesktop:)];
             desktopTest.frame=NSMakeRect(20,20,160,32);
             [preview.window.contentView addSubview:desktopTest];
         }

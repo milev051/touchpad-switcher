@@ -84,7 +84,7 @@ extern CGError CGSSetWindowBackgroundBlurRadius(CGSConnectionID connection, NSIn
 @property(nonatomic) BOOL isSettings;
 @property(nonatomic) BOOL isShortcut;
 @property(nonatomic) BOOL opensNewChromeTab;
-@property(nonatomic) BOOL showsDesktop;
+@property(nonatomic) BOOL hidesAllWindows;
 @property(nonatomic) BOOL isTab;
 @property(nonatomic) BOOL isSelectedTab;
 @property(nonatomic) NSUInteger tabIndex;
@@ -2162,36 +2162,27 @@ static void raiseWindowForEntry(RingEntry *entry, uint64_t generation) {
     }
 }
 
-// Dock-ova akcija čuva raspored prozora; simbol se proverava pri izvršavanju.
-// Referenca: https://gist.github.com/unixzii/7091dda6aea958c6da669e436365df65
-typedef void (*ShowDesktopNotification)(CFStringRef, int);
-static ShowDesktopNotification desktopNotificationFunction(void) {
-    static ShowDesktopNotification function=NULL;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        void *library=dlopen("/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/HIServices.framework/Versions/A/HIServices",RTLD_LAZY);
-        if (library) function=(ShowDesktopNotification)dlsym(library,"CoreDockSendNotification");
-    });
-    return function;
+// Skrivanje aplikacije čuva njene prozore i vraća ih klikom na Dock ikonicu.
+static NSUInteger hideApplicationWindows(NSArray<NSRunningApplication *> *applications) {
+    NSUInteger hidden=0;
+    for (NSRunningApplication *app in applications) {
+        if (app.activationPolicy!=NSApplicationActivationPolicyRegular || app.isTerminated) continue;
+        BOOL success=[app hide];
+        if (success) hidden++;
+        diagnosticEvent(@"hide_application",@{@"app":app.bundleIdentifier ?: @"",@"success":@(success)});
+    }
+    return hidden;
 }
 
-static void showDesktop(void) {
-    ShowDesktopNotification function=desktopNotificationFunction();
-    if (function) {
-        function(CFSTR("com.apple.showdesktop.awake"),0);
-        diagnosticEvent(@"show_desktop",@{@"method":@"dock"});
-    } else {
-        // Na sistemu bez Dock simbola sakrij prozore aplikacija bez zatvaranja.
-        for (NSRunningApplication *app in NSWorkspace.sharedWorkspace.runningApplications)
-            if (app.activationPolicy==NSApplicationActivationPolicyRegular) [app hide];
-        [NSApp hide:nil];
-        diagnosticEvent(@"show_desktop",@{@"method":@"hide_apps"});
-    }
+static void hideAllWindows(void) {
+    NSUInteger hidden=hideApplicationWindows(NSWorkspace.sharedWorkspace.runningApplications);
+    [NSApp hide:nil];
+    diagnosticEvent(@"hide_all_windows",@{@"hiddenApps":@(hidden)});
 }
 
 static NSArray<RingEntry *> *shortcutEntriesForMask(unsigned mask) {
     NSMutableArray *entries=[NSMutableArray array];
-    NSArray *names=@[@"Downloads",@"Desktop",@"Documents",@"Novi Chrome tab",@"Novi YouTube tab",@"Prikaži desktop"];
+    NSArray *names=@[@"Downloads",@"Desktop",@"Documents",@"Novi Chrome tab",@"Novi YouTube tab",@"Sakrij sve prozore"];
     NSArray *folders=@[@"Downloads",@"Desktop",@"Documents"];
     for (NSUInteger i=0;i<names.count;i++) {
         if (!(mask&(1u<<i))) continue;
@@ -2202,8 +2193,8 @@ static NSArray<RingEntry *> *shortcutEntriesForMask(unsigned mask) {
             entry.folderPath=[NSHomeDirectory() stringByAppendingPathComponent:folders[i]];
             entry.icon=[NSWorkspace.sharedWorkspace iconForFile:entry.folderPath];
         } else if (i==5) {
-            entry.showsDesktop=YES;
-            NSImage *symbol=[NSImage imageWithSystemSymbolName:@"desktopcomputer" accessibilityDescription:@"Prikaži desktop"];
+            entry.hidesAllWindows=YES;
+            NSImage *symbol=[NSImage imageWithSystemSymbolName:@"arrow.down.right.and.arrow.up.left" accessibilityDescription:@"Sakrij sve prozore"];
             entry.icon=[symbol imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPaletteColors:@[NSColor.systemBlueColor]]];
         } else {
             entry.opensNewChromeTab=YES;
@@ -2383,9 +2374,9 @@ static void finishGesture(uint64_t generation, NSInteger selection) {
     RingEntry *entry=picked;
     if (entry.isSettings) { raiseSettingsWindow(); return; }
     if (entry.isShortcut) {
-        if (entry.showsDesktop) {
+        if (entry.hidesAllWindows) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,80*NSEC_PER_MSEC),dispatch_get_main_queue(), ^{
-                if (generation==atomic_load(&g_gestureGeneration) && !atomic_load(&g_gestureActive)) showDesktop();
+                if (generation==atomic_load(&g_gestureGeneration) && !atomic_load(&g_gestureActive)) hideAllWindows();
             });
         } else if (entry.opensNewChromeTab) {
             dispatch_async(g_windowActivationQueue, ^{
@@ -5991,7 +5982,7 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
 
     NSTextField *shortcutsTitle=[self sectionTitle:@"Prečice"];
     NSMutableArray *shortcutRows=[NSMutableArray array];
-    NSArray *shortcutNames=@[@"Downloads",@"Desktop",@"Documents",@"Novi Chrome tab",@"Novi YouTube tab",@"Prikaži desktop"];
+    NSArray *shortcutNames=@[@"Downloads",@"Desktop",@"Documents",@"Novi Chrome tab",@"Novi YouTube tab",@"Sakrij sve prozore"];
     for (NSUInteger i=0;i<shortcutNames.count;i++) {
         NSTextField *name=[NSTextField labelWithString:shortcutNames[i]];
         [name.widthAnchor constraintEqualToConstant:145].active=YES;
@@ -6006,7 +5997,7 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
         row.spacing=10;
         [shortcutRows addObject:row];
     }
-    NSTextField *shortcutNote=[self noteWithText:@"Cmd: prikaži dok držiš taster. Stalno: prikaži među aplikacijama i bez Cmd-a. Desktop sklanja prozore; ostale prečice otvaraju novi tab ili folder."];
+    NSTextField *shortcutNote=[self noteWithText:@"Cmd: prikaži dok držiš taster. Stalno: prikaži među aplikacijama i bez Cmd-a. Sakrij sve prozore sklanja aplikacije u Dock; ostale prečice otvaraju tab ili folder."];
     NSStackView *mouseColumn = [self settingsColumn:@[mouseTitle, self.mouseActivationLabel, mouseButtons, holdToSelect,
                                                       self.mouseLearnStatus, mouseNote, menuBarTitle, hideIcon, hideNote,
                                                       startAtLogin, shortcutsTitle, shortcutRows[0], shortcutRows[1],

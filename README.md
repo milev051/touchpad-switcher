@@ -471,17 +471,17 @@ make /tmp/touchpad-layout-preview
 Kada ponoviš problem, zabeleži približno vreme i koji izbor nije uspeo.
 Tako možemo povezati gestu, izbor i rezultat aktivacije u istom dnevniku.
 
-### Prikaži desktop (1.0.3)
+### Sakrij sve prozore (1.0.4)
 
-Drži Cmd u otvorenom meniju i izaberi **Prikaži desktop**. Ova akcija
-sklanja prozore koristeći macOS prikaz desktopa; prozori se ne zatvaraju.
-To je posebna prečica u odnosu na **Desktop**, koja otvara folder.
+Drži Cmd u otvorenom meniju i izaberi **Sakrij sve prozore**. Prozori
+se sakrivaju sa svojim aplikacijama i vraćaju klikom na odgovarajuću
+ikonicu u Dock-u. Aplikacije ostaju pokrenute, a prozori zadržavaju
+svoj raspored. Akcija koristi skrivanje aplikacija, bez aktiviranja
+macOS režima Show Desktop.
+
 U Podešavanjima > Prečice možeš isključiti Cmd prikaz ove akcije ili
-uključiti **Stalno**, da bude dostupna i među aplikacijama. Na sistemu
-bez dostupne Dock akcije aplikacije se sakrivaju umesto zatvaranja.
+uključiti **Stalno**, da bude dostupna i među aplikacijama. Podešavanje
+prethodne akcije iz 1.0.3 ostaje sačuvano. **Desktop** i dalje otvara folder.
 
-Verzija 1.0.3 objedinjuje Cmd i stalne prečice, novi Chrome/YouTube tab,
-Prikaži desktop, novu ikonicu aplikacije, X sa animacijom i svetlom,
-popravljene prelaze broja prstiju i lokalni dijagnostički dnevnik.
 Ažuriranje se preuzima iz GitHub Releases preko dugmeta u podešavanjima;
 klon repozitorijuma nije potreban za instaliranje novog izdanja.
