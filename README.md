@@ -380,3 +380,7 @@ slike dok se nove učitavaju; vidljivi prozori se osvežavaju u pozadini.
 Centralna ikonica se pozicionira u slobodnom prostoru između ivica kartica,
 sa rezervom za zoom. Kada ikonica prozora dobije thumbnail tokom otvorenog
 menija, raspored se osvežava i snimak odmah dobija normalnu veličinu.
+
+Ceo raspored je centriran prema vidljivim površinama thumbnailova, ikonica
+i naziva. Kartice i centralna ikonica pomeraju se zajedno, uz rezervu za
+zoom i susede. Položaj grupe ostaje isti kada se promeni samo izbor.

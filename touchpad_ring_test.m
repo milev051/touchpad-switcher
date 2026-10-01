@@ -127,6 +127,7 @@ static void noteChromeSelectionChanges(NSArray<RingEntry *> *entries);
 @property(nonatomic, strong) NSArray<RingEntry *> *layoutEntries;
 @property(nonatomic) NSSize layoutSize;
 @property(nonatomic, strong) NSArray<NSNumber *> *layoutThumbnailShapes;
+@property(nonatomic) NSUInteger layoutAdornmentFlags;
 @property(nonatomic, strong) NSView *pointerView;
 @property(nonatomic, strong) CAShapeLayer *pointerArrow;
 @property(nonatomic, weak) NSView *glowView;
@@ -444,6 +445,57 @@ static NSPoint balancedHubPoint(NSArray<NSValue *> *rects, NSSize screen) {
     return best;
 }
 
+// Vidljiva površina kartice, bez prazne rezerve oko ikonice i naziva.
+static NSRect visibleCardRect(RingEntry *entry, NSRect card) {
+    CGFloat footer = cardFooterHeight(NSWidth(card));
+    NSRect content = NSMakeRect(NSMinX(card), NSMinY(card)+footer,
+                                NSWidth(card), MAX(1,NSHeight(card)-footer));
+    NSImage *thumbnail = resolvedThumbnail(entry);
+    NSRect visible;
+    if (thumbnail.size.width>0 && thumbnail.size.height>0) {
+        CGFloat fit = MIN(NSWidth(content)/thumbnail.size.width,NSHeight(content)/thumbnail.size.height);
+        NSSize size = NSMakeSize(thumbnail.size.width*fit,thumbnail.size.height*fit);
+        visible = NSMakeRect(NSMidX(content)-size.width/2,NSMidY(content)-size.height/2,size.width,size.height);
+        BOOL chrome = [entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"];
+        BOOL badge = (chrome && atomic_load(&g_settingShowSiteIcons)) || atomic_load(&g_settingShowAppIcons);
+        if (badge && entry.icon) {
+            CGFloat side = MIN(56.0,MAX(24.0,NSWidth(card)*0.15));
+            visible = NSUnionRect(visible,NSMakeRect(NSMidX(content)-side/2,NSMinY(content)-side*0.40,side,side));
+        }
+    } else {
+        CGFloat side = MIN(144.0,NSHeight(content)*0.85);
+        visible = NSMakeRect(NSMidX(content)-side/2,NSMidY(content)-side/2,side,side);
+    }
+    if (shouldDrawCardLabel(entry) && cardLabelText(entry).length)
+        visible = NSUnionRect(visible,NSMakeRect(NSMinX(card),NSMinY(card),NSWidth(card),16));
+    return visible;
+}
+
+static NSRect visibleLayoutBounds(NSArray<RingEntry *> *entries, NSArray<NSValue *> *rects, NSPoint hub) {
+    NSRect bounds = NSMakeRect(hub.x-kHubRadius,hub.y-kHubRadius,kHubRadius*2,kHubRadius*2);
+    for (NSUInteger i=0;i<rects.count;i++) bounds=NSUnionRect(bounds,visibleCardRect(entries[i],rects[i].rectValue));
+    return bounds;
+}
+
+// Cela grupa se pomera kao jedna celina; međusobni razmaci se ne menjaju.
+// Rezerva za izabranu karticu i susede sprečava izlazak pri zoomu.
+static NSPoint centeredLayoutOffset(NSArray<RingEntry *> *entries, NSArray<NSValue *> *rects,
+                                    NSPoint hub, NSSize screen) {
+    if (!rects.count) return NSZeroPoint;
+    NSRect visible = visibleLayoutBounds(entries,rects,hub);
+    NSPoint offset = NSMakePoint(screen.width/2-NSMidX(visible),screen.height/2-NSMidY(visible));
+    NSRect envelope = NSMakeRect(hub.x-kHubRadius,hub.y-kHubRadius,kHubRadius*2,kHubRadius*2);
+    for (NSValue *value in rects) {
+        NSRect rect=value.rectValue;
+        CGFloat halfX=NSWidth(rect)*kSelectedCardScale/2+18;
+        CGFloat halfY=NSHeight(rect)*kSelectedCardScale/2+18;
+        envelope=NSUnionRect(envelope,NSMakeRect(NSMidX(rect)-halfX,NSMidY(rect)-halfY,halfX*2,halfY*2));
+    }
+    offset.x=MAX(8-NSMinX(envelope),MIN(screen.width-8-NSMaxX(envelope),offset.x));
+    offset.y=MAX(8-NSMinY(envelope),MIN(screen.height-8-NSMaxY(envelope),offset.y));
+    return offset;
+}
+
 // Direction of a card as seen on screen (the ring is an ellipse, so this is not
 // the raw layout angle).
 static CGFloat cardScreenAngle(NSInteger i, NSUInteger count) {
@@ -679,8 +731,10 @@ static const CGFloat kBeamMaxWidth = 3.6;   // radians; a soft glow all around t
         NSSize size = resolvedThumbnail(entry).size;
         [shapes addObject:@(size.width > 0 && size.height > 0 ? size.height/size.width : 0)];
     }
+    NSUInteger flags = atomic_load(&g_settingCardTitles)*4 + atomic_load(&g_settingShowAppIcons)*2 + atomic_load(&g_settingShowSiteIcons);
     if (self.layoutEntries == self.entries && NSEqualSizes(self.layoutSize, self.bounds.size) &&
-        [self.layoutThumbnailShapes isEqualToArray:shapes]) return;
+        self.layoutAdornmentFlags == flags && [self.layoutThumbnailShapes isEqualToArray:shapes]) return;
+    self.layoutAdornmentFlags = flags;
     self.layoutThumbnailShapes = shapes;
     CGFloat radiusX, radiusY;
     self.layoutRects = adaptiveCardLayout(self.entries, self.bounds.size, &radiusX, &radiusY);
@@ -689,6 +743,12 @@ static const CGFloat kBeamMaxWidth = 3.6;   // radians; a soft glow all around t
     self.ringRadius = radiusX;
     self.ringRadiusY = radiusY;
     self.anchorPoint = balancedHubPoint(self.layoutRects,self.bounds.size);
+    NSPoint offset = centeredLayoutOffset(self.entries,self.layoutRects,self.anchorPoint,self.bounds.size);
+    NSMutableArray *centeredRects = [NSMutableArray arrayWithCapacity:self.layoutRects.count];
+    for (NSValue *value in self.layoutRects)
+        [centeredRects addObject:[NSValue valueWithRect:NSOffsetRect(value.rectValue,offset.x,offset.y)]];
+    self.layoutRects = centeredRects;
+    self.anchorPoint = NSMakePoint(self.anchorPoint.x+offset.x,self.anchorPoint.y+offset.y);
     atomic_store(&g_layoutAxisRatio, radiusX > 0 ? radiusY / radiusX : 1);
     NSUInteger count = self.layoutRects.count;
     if (count <= 512) for (NSUInteger i = 0; i < count; i++) {

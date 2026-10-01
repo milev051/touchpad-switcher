@@ -217,9 +217,14 @@ static void verifyPreview(LayoutPreview *preview) {
             preview.ring.entries.lastObject.thumbnail=nil;
             preview.ring.layoutEntries=nil;
             [preview.ring updateCardLayersAnimated:NO refreshContents:YES];
-            NSPoint originalHub=NSMakePoint(size.width/2,size.height/2);
-            assert(hubClearance(preview.ring.layoutRects,preview.ring.anchorPoint)+0.001 >=
-                   hubClearance(preview.ring.layoutRects,originalHub));
+            NSRect visibleBounds=visibleLayoutBounds(preview.ring.entries,preview.ring.layoutRects,preview.ring.anchorPoint);
+            NSPoint remaining=centeredLayoutOffset(preview.ring.entries,preview.ring.layoutRects,preview.ring.anchorPoint,size);
+            assert(fabs(remaining.x)<0.001 && fabs(remaining.y)<0.001);
+            // Pet horizontalnih kartica mora imati jednake spoljne margine.
+            if (shape==0 && count==5) {
+                assert(fabs(NSMidX(visibleBounds)-size.width/2)<0.001);
+                assert(fabs(NSMidY(visibleBounds)-size.height/2)<0.001);
+            }
             for (NSUInteger i=0;i<count;i++) {
                 NSRect rect=[preview.ring cardRectForIndex:i];
                 assert(NSWidth(rect)>0 && NSHeight(rect)>0);
@@ -279,6 +284,7 @@ int main(int argc,const char *argv[]) {
             NSUInteger i=[args indexOfObject:flag];
             return i!=NSNotFound && i+1<args.count ? args[i+1] : nil;
         };
+        if ([args containsObject:@"--no-titles"]) atomic_store(&g_settingCardTitles,CardTitlesNone);
         CGFloat width=argument(@"--width") ? argument(@"--width").doubleValue : 1100;
         CGFloat height=argument(@"--height") ? argument(@"--height").doubleValue : width/1.6;
         LayoutPreview *preview=[LayoutPreview new];
