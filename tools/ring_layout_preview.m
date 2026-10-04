@@ -219,6 +219,19 @@ static void verifyPreview(LayoutPreview *preview) {
     assert(chromeTabMembership(duplicateA,survivors)==0);
     assert(chromeTabMembership(duplicateB,survivors)==1);
     assert(chromeTabMembership(duplicateB,nil)==-1);
+    RingEntry *repeated=[RingEntry new];
+    repeated.chromeWindowID=duplicateB.chromeWindowID;
+    repeated.chromeTabID=duplicateB.chromeTabID;
+    repeated.tabIndex=99;
+    RingEntry *shortcut=[RingEntry new]; shortcut.isShortcut=YES;
+    NSArray *inventory=@[duplicateA,duplicateB,repeated,shortcut];
+    NSArray *unknown=reconcileChromeEntries(inventory,nil);
+    assert(unknown.count==3 && unknown[0]==duplicateA && unknown[1]==duplicateB);
+    NSArray *fresh=reconcileChromeEntries(inventory,survivors);
+    assert(fresh.count==2 && fresh[0]==duplicateB && fresh[1]==shortcut);
+    assert(reconcileChromeEntries(inventory,[NSSet set]).count==1);
+    assert(reconcileChromeEntries(fresh,survivors)==fresh);
+
     printf("Isti link i naslov: zatvoreni tab se uklanja, drugi ostaje prema svom ID-u.\n");
     g_pointerX=0.20; g_pointerY=0;
     assert(pointerSelection(5,0)==-1);
@@ -261,6 +274,53 @@ static void verifyPreview(LayoutPreview *preview) {
     assert(!windowAccessAllowsMinimizing(NO,kAXErrorCannotComplete));
     assert(!windowAccessAllowsMinimizing(NO,kAXErrorAttributeUnsupported));
     assert(windowAccessAllowsMinimizing(YES,kAXErrorCannotComplete));
+    NSMutableArray *manyCards=[NSMutableArray array];
+    for (int i=0;i<37;i++) [manyCards addObject:[RingEntry new]];
+    NSMutableSet *seenPages=[NSMutableSet set];
+    for (NSUInteger page=0;page<4;page++) {
+        NSArray *cards=ringEntriesOnPage(manyCards,page);
+        assert(cards.count<=10 && cards.count>0);
+        for (RingEntry *entry in cards) { assert(![seenPages containsObject:entry]); [seenPages addObject:entry]; }
+    }
+    assert(seenPages.count==37);
+    assert(ringEntriesOnPage(@[],0).count==0);
+    assert(ringEntriesOnPage(manyCards,99).count==7);
+    assert(ringEntriesOnPage([manyCards subarrayWithRange:NSMakeRange(0,10)],0).count==10);
+    assert(!atomic_load(&g_hiddenTabLoaderRunning));
+    loadHiddenChromeTabs(123);
+    assert(!atomic_load(&g_hiddenTabLoaderRunning));
+    printf("37 kartica: četiri stranice, bez duplikata i gubitka; skriveni tabovi se ne aktiviraju.\n");
+    uint64_t start=1000000000ULL;
+    assert(isQuickThreeFingerTap(start,start+499000000ULL,0,YES));
+    assert(!isQuickThreeFingerTap(start,start+500000000ULL,0,YES));
+    assert(!isQuickThreeFingerTap(start,start+100000000ULL,0.2,YES));
+    assert(!isQuickThreeFingerTap(start,start+100000000ULL,0,NO));
+    assert(!isQuickThreeFingerTap(start,start-1,0,YES));
+    NSMutableArray *savedHistory=g_recentWindowKeys;
+    RingEntry *recentA=[RingEntry new],*recentB=[RingEntry new],*recentC=[RingEntry new];
+    recentA.application=recentB.application=recentC.application=NSRunningApplication.currentApplication;
+    recentA.windowID=101; recentB.windowID=102; recentC.windowID=103;
+    NSArray *recentEntries=@[recentA,recentB,recentC];
+    g_recentWindowKeys=[NSMutableArray array];
+    recordRecentWindow(recentWindowKey(recentA));
+    assert(previousRecentWindow(recentEntries)==nil);
+    recordRecentWindow(recentWindowKey(recentB));
+    assert(previousWindowIndex(recentEntries,previousRecentWindow(recentEntries))==0);
+    recordRecentWindow(recentWindowKey(recentA));
+    assert(previousWindowIndex(recentEntries,previousRecentWindow(recentEntries))==1);
+    recordRecentWindow(recentWindowKey(recentA));
+    assert(g_recentWindowKeys.count==2); // Ponovljeni uzorak fokusa ne pravi duplikate.
+    recordRecentWindow(recentWindowKey(recentC));
+    assert([previousRecentWindow(@[recentB,recentC]) isEqualToString:recentWindowKey(recentB)]);
+    assert(previousWindowIndex(@[recentC],recentWindowKey(recentB))==-1);
+    recentB.isTab=YES; recentB.isSelectedTab=YES; recentB.chromeTabID=@"123";
+    RingEntry *quickWindow=windowEntryForQuickSwitch(recentB);
+    assert(quickWindow.windowID==recentB.windowID && quickWindow.application==recentB.application);
+    assert(!quickWindow.isTab && quickWindow.chromeTabID==nil && recentB.isTab);
+    recentB.isSelectedTab=NO;
+    assert(recentWindowKey(recentB)==nil); // Ne aktiviraj drugi tab istog prozora.
+    g_recentWindowKeys=savedHistory;
+    printf("Brzi tap: prag 0.5 s, povlačenje, ponavljanje A/B i uklonjen prozor prolaze.\n");
     TestMinimizeWindow first={0},second={0},already={.minimized=YES},denied={.error=kAXErrorAPIDisabled},ignored={.ignoresWrite=YES};
     assert(minimizeWindow((void *)&first,testReadWindow,testWriteWindow,testPressWindow)==kAXErrorSuccess);
     assert(minimizeWindow((void *)&second,testReadWindow,testWriteWindow,testPressWindow)==kAXErrorSuccess);
@@ -419,6 +479,43 @@ static void verifyPreview(LayoutPreview *preview) {
         assert(!suppressTouchFrameAfterFourFingers(3, &waiting));
     }
     printf("Četiri prsta: oporavak nakon jednog praznog frejma i 20 ponavljanja prolaze.\n");
+    assert(!shortcutSectionWanted(ShortcutTriggerNone, YES, YES));
+    assert(shortcutSectionWanted(ShortcutTriggerCommand, YES, NO));
+    assert(!shortcutSectionWanted(ShortcutTriggerCommand, NO, YES));
+    assert(shortcutSectionWanted(ShortcutTriggerFourFingers, NO, YES));
+    assert(!shortcutSectionWanted(ShortcutTriggerFourFingers, YES, NO));
+    assert(shortcutSectionWanted(ShortcutTriggerBoth, NO, YES));
+    assert(shortcutSectionWanted(ShortcutTriggerBoth, YES, NO));
+    assert(!shortcutSectionWanted(ShortcutTriggerBoth, NO, NO));
+    assert(fourFingersCancelOpenMenu(ShortcutTriggerNone));
+    assert(fourFingersCancelOpenMenu(ShortcutTriggerCommand));
+    assert(!fourFingersCancelOpenMenu(ShortcutTriggerFourFingers));
+    assert(!fourFingersCancelOpenMenu(ShortcutTriggerBoth));
+    int savedTrigger=atomic_load(&g_settingShortcutTrigger);
+    atomic_store(&g_settingShortcutTrigger, ShortcutTriggerFourFingers);
+    atomic_store(&g_gestureActive, false);
+    atomic_store(&g_gestureEnding, false);
+    atomic_store(&g_fourFingerShortcutHeld, false);
+    atomic_store(&g_fourFingerReleaseCandidateNanos, 0);
+    ringTouchCallback(NULL, contacts, 3, 0, 0);
+    assert(atomic_load(&g_gestureActive) && !atomic_load(&g_fourFingerShortcutHeld));
+    uint64_t shortcutGeneration=atomic_load(&g_gestureGeneration);
+    ringTouchCallback(NULL, contacts, 4, 0, 0);
+    assert(atomic_load(&g_gestureActive) && !atomic_load(&g_gestureEnding));
+    assert(atomic_load(&g_gestureGeneration)==shortcutGeneration);
+    assert(atomic_load(&g_fourFingerShortcutHeld));
+    ringTouchCallback(NULL, contacts, 3, 0, 0);
+    assert(atomic_load(&g_fourFingerShortcutHeld) && atomic_load(&g_gestureActive));
+    atomic_store(&g_settingShortcutTrigger, ShortcutTriggerCommand);
+    ringTouchCallback(NULL, contacts, 4, 0, 0);
+    assert(!atomic_load(&g_gestureActive) && !atomic_load(&g_fourFingerShortcutHeld));
+    atomic_fetch_add(&g_gestureGeneration, 1);
+    atomic_store(&g_gestureEnding, false);
+    atomic_store(&g_fourFingerReleaseCandidateNanos, 0);
+    ringTouchCallback(NULL, NULL, 0, 0, 0);
+    showSystemCursorAfterGesture();
+    atomic_store(&g_settingShortcutTrigger, savedTrigger);
+    printf("Poseban meni: Cmd, četiri prsta, oba ili ništa; četvrti prst ne gasi gestu kad otvara meni.\n");
     preview.shapeControl.selectedSegment=0;
     [preview rebuild:5];
     RingEntry *arriving=preview.ring.entries.lastObject;
@@ -448,13 +545,13 @@ static void verifyPreview(LayoutPreview *preview) {
         printf("Balans, oblik %ld: odstupanje razmaka %.1f -> %.1f pt.\n",(long)shape,before,after);
     }
     const NSSize sizes[] = {{800,600},{1100,688},{1440,900},{1600,900},{1996,1248}};
-    const NSUInteger counts[] = {1,2,3,4,5,6,7,8,12,16};
+    const NSUInteger counts[] = {1,2,3,4,5,6,7,8,9,10,12,16};
     for (NSUInteger sizeIndex=0;sizeIndex<5;sizeIndex++) {
         NSSize size=sizes[sizeIndex];
         [preview.window setContentSize:NSMakeSize(size.width,size.height+88)];
         for (NSInteger shape=0;shape<3;shape++) {
         preview.shapeControl.selectedSegment=shape;
-        for (NSUInteger countIndex=0;countIndex<10;countIndex++) {
+        for (NSUInteger countIndex=0;countIndex<sizeof(counts)/sizeof(counts[0]);countIndex++) {
             NSUInteger count=counts[countIndex];
             [preview rebuild:count];
             // Bez snimka prostor pripada samo ikonici i nazivu.
@@ -571,6 +668,28 @@ static void verifyInputLifecycle(LayoutPreview *preview) {
         ringTouchCallback(NULL,NULL,0,0,0);
         waitForInputCondition(^BOOL{ return !atomic_load(&g_gestureActive) && !atomic_load(&g_ringOverlayVisible); });
     }
+    NSMutableArray *many=[NSMutableArray array];
+    for (int i=0;i<37;i++) {
+        RingEntry *entry=[RingEntry new]; entry.windowTitle=[NSString stringWithFormat:@"Tab %d",i];
+        entry.icon=[NSImage imageNamed:NSImageNameFolder]; [many addObject:entry];
+    }
+    g_windowEntries=many;
+    atomic_store(&g_windowEntryCount,37);
+    ringTouchCallback(NULL,contacts,3,0,0);
+    waitForInputCondition(^BOOL{ return atomic_load(&g_ringOverlayVisible); });
+    assert(g_windowEntries.count==10 && g_standardRingEntries.count==37 && !g_ringPageLabel.hidden);
+    changeRingPage(1);
+    assert(g_ringPage==1 && g_windowEntries.firstObject==many[10] && g_selectedIndex==-1);
+    assert(!atomic_load(&g_quickTapEligible));
+    setCommandShortcutMode(YES); assert(g_commandShortcutMode && g_ringPageLabel.hidden);
+    setCommandShortcutMode(NO); assert(!g_commandShortcutMode && !g_ringPageLabel.hidden);
+    changeRingPage(1); changeRingPage(1); changeRingPage(1); changeRingPage(1);
+    assert(g_ringPage==3 && g_windowEntries.count==7 && g_windowEntries.firstObject==many[30]);
+    g_selectedIndex=0;
+    ringTouchCallback(NULL,NULL,0,0,0);
+    waitForInputCondition(^BOOL{ return !atomic_load(&g_gestureActive) && !atomic_load(&g_ringOverlayVisible); });
+    assert(g_windowEntries.count==37 && g_standardRingEntries==nil);
+    printf("Stranice u stvarnom meniju: 37 kartica, reset izbora, Cmd i zatvaranje prolaze.\n");
     printf("Stvarni asinhroni tok: 12 ciklusa, brz/spor povratak sa 1/2 prsta i 4 -> 3 prolaze.\n");
 }
 

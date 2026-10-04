@@ -4,7 +4,7 @@
 CC = clang
 # macOS 14 is the oldest system with every API the ring uses.
 CFLAGS = -fobjc-arc -O2 -mmacosx-version-min=14.0
-FRAMEWORKS = -framework Cocoa -framework ApplicationServices -framework ScreenCaptureKit -framework QuartzCore -framework ImageIO -F/System/Library/PrivateFrameworks -framework MultitouchSupport
+FRAMEWORKS = -framework Cocoa -framework ScriptingBridge -framework ApplicationServices -framework ScreenCaptureKit -framework QuartzCore -framework ImageIO -F/System/Library/PrivateFrameworks -framework MultitouchSupport
 TARGET = touchpad_switcher
 SRC = touchpad_switcher.m
 RING_APP = Touchpad Switcher.app

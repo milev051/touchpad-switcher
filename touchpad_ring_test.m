@@ -2,6 +2,7 @@
 // A deliberate movement selects a window direction; lifting all three fingers activates it.
 
 #import <Cocoa/Cocoa.h>
+#import <ScriptingBridge/ScriptingBridge.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <ImageIO/ImageIO.h>
@@ -139,6 +140,7 @@ static void noteChromeSelectionChanges(NSArray<RingEntry *> *entries);
 @property(nonatomic) CGFloat pointerAngle;
 @property(nonatomic, strong) NSMutableArray<CALayer *> *cardLayers;
 @property(nonatomic, strong) CALayer *hubLayer;
+@property(nonatomic, strong) RingEntry *currentEntry;
 - (void)movePointerTo:(NSPoint)ringPoint;
 - (void)resetPointer;
 - (void)resetSelectionVisuals;
@@ -166,11 +168,19 @@ static const double kPointerReach = 0.80;
 // and the .app bundle share them; read from the scan, touch and main threads.
 #define kSettingsID CFSTR("com.milev.touchpad-switcher")
 typedef enum { CardTitlesAll = 0, CardTitlesFinderAndChrome = 1, CardTitlesNone = 2 } CardTitlesMode;
-static _Atomic(int) g_settingCardTitles = CardTitlesAll;
+static _Atomic(int) g_settingCardTitles = CardTitlesNone;
 static RingMediaOptions g_mediaOptions;   // main thread; the media module keeps its own copy
-static _Atomic(bool) g_settingFinderTabsOneCard = true;
+static _Atomic(bool) g_settingFinderTabsOneCard = false;
 typedef enum { CardGroupingWindows = 0, CardGroupingApps = 1 } CardGrouping;
 static _Atomic(int) g_settingCardGrouping = CardGroupingWindows;
+// Poseban meni prečica: nema ga, drži se Cmd, dodaje se četvrti prst, ili oba.
+typedef enum {
+    ShortcutTriggerNone = 0,
+    ShortcutTriggerCommand = 1,
+    ShortcutTriggerFourFingers = 2,
+    ShortcutTriggerBoth = 3,
+} ShortcutTrigger;
+static _Atomic(int) g_settingShortcutTrigger = ShortcutTriggerCommand;
 static _Atomic(bool) g_settingHideMenuIcon = false;
 static _Atomic(bool) g_settingSoundEffects = false;
 // Mouse activation by holding the button and releasing it on a card. Off: one
@@ -178,7 +188,9 @@ static _Atomic(bool) g_settingSoundEffects = false;
 static _Atomic(bool) g_settingMouseHoldToSelect = true;
 static _Atomic(bool) g_settingShowSiteIcons = true;   // Chrome tabs: the site's icon
 static _Atomic(bool) g_settingShowAppIcons = true;    // other windows: the app's icon
-static _Atomic(int) g_settingBlurRadius = 15;   // 0 turns the blur off
+static _Atomic(int) g_settingBlurRadius = 20;   // 0 turns the blur off
+static _Atomic(int) g_settingBackdropZoom = 5;  // percentage beyond screen size
+static _Atomic(bool) g_settingCurrentWindowInCenter = false;
 // -1 disables mouse activation. Values 2...31 are Quartz mouse button numbers
 // (middle is 2, the usual side buttons 3 and 4); kMouseActivationKeyBase plus a
 // key code is a recorded key, such as F18 sent by Logi Options+.
@@ -190,10 +202,10 @@ static _Atomic(int) g_settingPointerStyle = PointerStyleHidden;
 // Boja pokazivača i svetla iza kartica: akcentna boja
 // color from System Settings > Appearance, like the rest of macOS, or white.
 typedef enum { HighlightSystem = 0, HighlightWhite = 1 } HighlightColor;
-static _Atomic(int) g_settingHighlightColor = HighlightWhite;
-static _Atomic(bool) g_settingShowLight = false;   // light in the direction of the fingers
+static _Atomic(int) g_settingHighlightColor = HighlightSystem;
+static _Atomic(bool) g_settingShowLight = true;   // light in the direction of the fingers
 // The backdrop behind the cards: a color laid over the (blurred) screen.
-static _Atomic(int) g_settingBackdropDimming = 38;   // percent
+static _Atomic(int) g_settingBackdropDimming = 50;   // percent
 static NSColor *g_backdropColor;                     // main thread; nil is near black
 
 static NSColor *ringHighlightColor(void) {
@@ -981,7 +993,53 @@ static const CGFloat kCardImagePadding = 24.0;
     NSInteger selected = self.selectedIndex;
     BOOL valid = selected >= 0 && selected < (NSInteger)self.entries.count;
     self.hubLayer.hidden = NO;
-    if (valid) {
+    if (self.currentEntry) {
+        NSImage *thumbnail = resolvedThumbnail(self.currentEntry);
+        NSImage *icon = self.currentEntry.icon;
+        NSImage *center = [NSImage imageWithSize:NSMakeSize(112, 112) flipped:NO drawingHandler:^BOOL(NSRect rect) {
+            NSRect picture = NSMakeRect(5, 24, 102, 78);
+            NSBezierPath *shape = [NSBezierPath bezierPathWithRoundedRect:picture xRadius:10 yRadius:10];
+            [[NSColor colorWithWhite:0.08 alpha:0.94] setFill];
+            [shape fill];
+            if (thumbnail) {
+                [NSGraphicsContext saveGraphicsState];
+                [shape addClip];
+                CGFloat ratio = thumbnail.size.width / MAX(thumbnail.size.height, 1);
+                NSRect imageRect = picture;
+                if (ratio > NSWidth(picture) / NSHeight(picture)) {
+                    imageRect.size.width = NSHeight(picture) * ratio;
+                    imageRect.origin.x = NSMidX(picture) - imageRect.size.width / 2;
+                } else {
+                    imageRect.size.height = NSWidth(picture) / MAX(ratio, 0.01);
+                    imageRect.origin.y = NSMidY(picture) - imageRect.size.height / 2;
+                }
+                [thumbnail drawInRect:imageRect fromRect:NSZeroRect operation:NSCompositingOperationSourceOver
+                            fraction:1 respectFlipped:YES hints:nil];
+                [NSGraphicsContext restoreGraphicsState];
+            } else if (icon) {
+                [icon drawInRect:NSInsetRect(picture, 25, 13)];
+            }
+            [[NSColor colorWithWhite:1 alpha:0.8] setStroke];
+            shape.lineWidth = 1.5;
+            [shape stroke];
+            NSString *label = @"Ostani ovde";
+            NSDictionary *attrs = @{NSFontAttributeName:[NSFont systemFontOfSize:11 weight:NSFontWeightMedium],
+                                    NSForegroundColorAttributeName:NSColor.whiteColor};
+            NSSize textSize = [label sizeWithAttributes:attrs];
+            [label drawAtPoint:NSMakePoint((NSWidth(rect)-textSize.width)/2, 5) withAttributes:attrs];
+            return YES;
+        }];
+        self.hubLayer.shadowColor = NSColor.blackColor.CGColor;
+        self.hubLayer.shadowOpacity = 0.65;
+        self.hubLayer.shadowRadius = 12;
+        self.hubLayer.shadowOffset = CGSizeMake(0, -2);
+        self.hubLayer.shadowPath = NULL;
+        self.hubLayer.bounds = CGRectMake(0, 0, 112, 112);
+        self.hubLayer.position = NSPointToCGPoint(self.anchorPoint);
+        self.hubLayer.contentsScale = self.window.backingScaleFactor ?: 2;
+        NSRect imageBounds = NSMakeRect(0, 0, 112, 112);
+        self.hubLayer.contents = (__bridge id)[center CGImageForProposedRect:&imageBounds context:nil hints:nil];
+    } else if (valid) {
         self.hubLayer.shadowColor=NSColor.blackColor.CGColor;
         self.hubLayer.shadowOpacity=0.55;
         self.hubLayer.shadowRadius=12;
@@ -1179,7 +1237,7 @@ static const CGFloat kCardImagePadding = 24.0;
     [super drawRect:dirtyRect];
     NSPoint center = self.anchorPoint;
     NSUInteger count = self.entries.count;
-    if (count == 0) {
+    if (count == 0 && !self.currentEntry) {
         NSDictionary *emptyStyle = @{
             NSFontAttributeName: [NSFont systemFontOfSize:11],
             NSForegroundColorAttributeName: [NSColor whiteColor]
@@ -1235,10 +1293,13 @@ static const CGFloat kCardImagePadding = 24.0;
 @end
 
 static RingPanel *g_panel;
+static RingPanel *g_snapshotPanel;
 static RingView *g_ringView;
 static SectorGlowView *g_glowView;
 static NSView *g_dimView;
+static CALayer *g_magnifiedBackdrop;
 static NSArray<RingEntry *> *g_windowEntries = @[];
+static RingEntry *g_currentRingEntry; // retained while the menu is open
 static _Atomic(int) g_windowEntryCount = 0;
 static CFMutableArrayRef g_devices = NULL;
 static _Atomic(bool) g_gestureActive = false;
@@ -1271,6 +1332,18 @@ static double g_pointerX = 0.0;
 static double g_pointerY = 0.0;
 static double g_trackpadAspect = 0.68;
 static NSInteger g_selectedIndex = -1;
+static _Atomic(uint64_t) g_touchStartedNanos=0;
+static _Atomic(bool) g_quickTapEligible=false;
+static double g_touchMaxTravel=0;
+static const NSInteger kQuickPreviousSelection=-2;
+// Istorija i snimak prethodnog prozora pripadaju glavnom redu.
+static NSMutableArray<NSString *> *g_recentWindowKeys;
+static NSString *g_quickTapWindowKey;
+static NSTimer *g_recentWindowTimer;
+static NSArray<RingEntry *> *g_ringPageEntries;
+static NSUInteger g_ringPage;
+static NSTextField *g_ringPageLabel;
+static _Atomic(int) g_pendingPageStep=0;
 static _Atomic(uint64_t) g_gestureGeneration = 0;
 static CGPoint g_cursorAtGestureStart = {0, 0};
 static CFMachPortRef g_scrollEventTap = NULL;
@@ -1413,6 +1486,11 @@ static BOOL claimSingleInstance(void) {
 static BOOL runChromeScript(NSString *source);
 static void setCommandShortcutMode(BOOL enabled);
 static void pollCommandShortcuts(uint64_t generation);
+static void applyShortcutSection(void);
+static BOOL shortcutSectionWanted(int trigger, BOOL commandHeld, BOOL fourFingersHeld);
+static BOOL fourFingersCancelOpenMenu(int trigger);
+static _Atomic(bool) g_fourFingerShortcutHeld = false;
+static _Atomic(uint64_t) g_fourFingerReleaseCandidateNanos = 0;
 static RingEntry *settingsEntryIfVisible(void);
 static void raiseSettingsWindow(void);
 static NSArray<RingEntry *> *g_standardRingEntries;
@@ -1536,6 +1614,8 @@ static void beginMouseGesture(CGEventRef event, int button) {
     if (atomic_load(&g_gestureActive) || atomic_load(&g_ringOverlayVisible)) return;
     atomic_store(&g_mouseGestureActive, true);
     atomic_store(&g_mouseGestureButton, button);
+    atomic_store(&g_fourFingerShortcutHeld, false);
+    atomic_store(&g_fourFingerReleaseCandidateNanos, 0);
     atomic_store(&g_gestureActive, true);
     atomic_store(&g_gestureEnding, false);
     hideSystemCursorForGesture();
@@ -1552,6 +1632,8 @@ static void beginMouseGesture(CGEventRef event, int button) {
 static void beginKeyboardGesture(CGEventRef event) {
     if (atomic_load(&g_gestureActive) || atomic_load(&g_ringOverlayVisible)) return;
     atomic_store(&g_keyboardGestureActive, true);
+    atomic_store(&g_fourFingerShortcutHeld, false);
+    atomic_store(&g_fourFingerReleaseCandidateNanos, 0);
     atomic_store(&g_gestureActive, true);
     atomic_store(&g_gestureEnding, false);
     hideSystemCursorForGesture();
@@ -1625,13 +1707,20 @@ static CGEventRef filterScrollDuringRing(CGEventTapProxy proxy, CGEventType type
         return event;
     }
     if (atomic_load(&g_gestureActive) && type==kCGEventFlagsChanged) {
-        BOOL command=(CGEventGetFlags(event)&kCGEventFlagMaskCommand)!=0;
         uint64_t generation=atomic_load(&g_gestureGeneration);
         dispatch_async(dispatch_get_main_queue(), ^{
             if (generation==atomic_load(&g_gestureGeneration) && atomic_load(&g_gestureActive))
-                setCommandShortcutMode(command);
+                applyShortcutSection();
         });
         return event;
+    }
+    if (atomic_load(&g_gestureActive) && (type==kCGEventKeyDown || type==kCGEventKeyUp)) {
+        int key=(int)CGEventGetIntegerValueField(event,kCGKeyboardEventKeycode);
+        if (key==123 || key==124) {
+            if (type==kCGEventKeyDown && !CGEventGetIntegerValueField(event,kCGKeyboardEventAutorepeat))
+                atomic_store(&g_pendingPageStep,key==123 ? -1 : 1);
+            return NULL;
+        }
     }
     if (atomic_load(&g_gestureActive) && type==kCGEventKeyDown &&
         CGEventGetIntegerValueField(event,kCGKeyboardEventKeycode)==kEscapeKeyCode) {
@@ -1922,10 +2011,31 @@ static void ensurePanel(NSScreen *screen) {
     g_panel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
                                  NSWindowCollectionBehaviorFullScreenAuxiliary |
                                  NSWindowCollectionBehaviorStationary;
-    // Backdrop (blur or plain dimming), the direction light, then the cards.
+    // A separate window lets the existing window-server blur act on the
+    // moving screenshot exactly as it acts on the real desktop.
     NSRect contentFrame = NSMakeRect(0, 0, NSWidth(screen.frame), NSHeight(screen.frame));
+    g_snapshotPanel = [[RingPanel alloc] initWithContentRect:screen.frame
+        styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+          backing:NSBackingStoreBuffered defer:NO];
+    g_snapshotPanel.opaque = NO;
+    g_snapshotPanel.backgroundColor = NSColor.clearColor;
+    g_snapshotPanel.hasShadow = NO;
+    g_snapshotPanel.level = g_panel.level;
+    g_snapshotPanel.hidesOnDeactivate = NO;
+    g_snapshotPanel.animationBehavior = NSWindowAnimationBehaviorNone;
+    g_snapshotPanel.ignoresMouseEvents = YES;
+    g_snapshotPanel.collectionBehavior = g_panel.collectionBehavior;
+    NSView *snapshotContent = [[NSView alloc] initWithFrame:contentFrame];
+    snapshotContent.wantsLayer = YES;
     NSView *content = [[NSView alloc] initWithFrame:contentFrame];
     content.wantsLayer = YES;
+    g_magnifiedBackdrop = [CALayer layer];
+    g_magnifiedBackdrop.frame = snapshotContent.bounds;
+    g_magnifiedBackdrop.contentsGravity = kCAGravityResizeAspectFill;
+    g_magnifiedBackdrop.hidden = YES;
+    g_magnifiedBackdrop.opacity = 0;
+    [snapshotContent.layer addSublayer:g_magnifiedBackdrop];
+    g_snapshotPanel.contentView = snapshotContent;
     g_dimView = [[NSView alloc] initWithFrame:contentFrame];
     g_dimView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     g_dimView.wantsLayer = YES;
@@ -1949,29 +2059,297 @@ static void setPanelBlur(int radius) {
     if (g_panel) CGSSetWindowBackgroundBlurRadius(CGSMainConnectionID(), g_panel.windowNumber, radius);
 }
 
+// An enlarged screenshot provides real magnification. Its extra margin allows
+// movement in either direction without exposing an edge of the captured image.
+static void moveMagnifiedBackdrop(NSPoint pointer) {
+    if (!g_magnifiedBackdrop || g_magnifiedBackdrop.hidden) return;
+    NSSize size = g_panel.contentView.bounds.size;
+    CGFloat zoom = 1.0 + atomic_load(&g_settingBackdropZoom) / 100.0;
+    CGFloat x = fmax(-1.0, fmin(1.0, pointer.x));
+    CGFloat y = fmax(-1.0, fmin(1.0, pointer.y));
+    CGFloat marginX = size.width * (zoom - 1.0) / 2.0;
+    CGFloat marginY = size.height * (zoom - 1.0) / 2.0;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    g_magnifiedBackdrop.bounds = CGRectMake(0, 0, size.width, size.height);
+    g_magnifiedBackdrop.position = CGPointMake(size.width / 2.0 - x * marginX,
+                                                size.height / 2.0 - y * marginY);
+    g_magnifiedBackdrop.transform = CATransform3DMakeScale(zoom, zoom, 1.0);
+    [CATransaction commit];
+}
+
+static void captureMagnifiedBackdrop(NSScreen *screen, uint64_t generation, int attempt) {
+    NSNumber *displayNumber = screen.deviceDescription[@"NSScreenNumber"];
+    if (!displayNumber || atomic_load(&g_settingBackdropZoom) == 0) return;
+    CGDirectDisplayID displayID = displayNumber.unsignedIntValue;
+    NSInteger captureWidth = (NSInteger)lround(NSWidth(screen.frame));
+    NSInteger captureHeight = (NSInteger)lround(NSHeight(screen.frame));
+    static dispatch_queue_t captureQueue;
+    if (!captureQueue) captureQueue = dispatch_queue_create("touchpad.ring.backdrop",
+        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+    dispatch_async(captureQueue, ^{
+        if (generation != atomic_load(&g_gestureGeneration)) return;
+        if (!CGPreflightScreenCaptureAccess()) return;
+        [SCShareableContent getShareableContentExcludingDesktopWindows:NO onScreenWindowsOnly:YES
+            completionHandler:^(SCShareableContent *content, NSError *error) {
+            if (generation != atomic_load(&g_gestureGeneration)) return;
+            if (error) {
+                diagnosticEvent(@"backdrop_failed", @{@"stage":@"list", @"error":error.localizedDescription ?: @"unknown"});
+                return;
+            }
+            SCDisplay *display = nil;
+            SCRunningApplication *ownApp = nil;
+            for (SCDisplay *candidate in content.displays)
+                if (candidate.displayID == displayID) { display = candidate; break; }
+            for (SCRunningApplication *candidate in content.applications)
+                if (candidate.processID == getpid()) { ownApp = candidate; break; }
+            if (!display || !ownApp) {
+                if (attempt < 2) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 40 * NSEC_PER_MSEC),
+                                   dispatch_get_main_queue(), ^{
+                        captureMagnifiedBackdrop(screen, generation, attempt + 1);
+                    });
+                } else {
+                    diagnosticEvent(@"backdrop_failed", @{@"stage":@"filter",
+                        @"display":@(display != nil), @"ownApp":@(ownApp != nil)});
+                }
+                return;
+            }
+            // Excluding this app prevents the visible menu from photographing itself.
+            SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display
+                excludingApplications:@[ownApp] exceptingWindows:@[]];
+            SCStreamConfiguration *configuration = [SCStreamConfiguration new];
+            configuration.width = captureWidth;
+            configuration.height = captureHeight;
+            [SCScreenshotManager captureImageWithFilter:filter configuration:configuration
+                completionHandler:^(CGImageRef captured, NSError *captureError) {
+                if (!captured || captureError) {
+                    if (attempt < 2) {
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 40 * NSEC_PER_MSEC),
+                                       dispatch_get_main_queue(), ^{
+                            captureMagnifiedBackdrop(screen, generation, attempt + 1);
+                        });
+                    } else {
+                        diagnosticEvent(@"backdrop_failed", @{@"stage":@"capture",
+                            @"error":captureError.localizedDescription ?: @"empty image"});
+                    }
+                    return;
+                }
+                CGImageRef retained = CGImageRetain(captured);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (generation == atomic_load(&g_gestureGeneration) &&
+                        atomic_load(&g_ringOverlayVisible) && atomic_load(&g_gestureActive)) {
+                        [g_snapshotPanel setFrame:screen.frame display:NO];
+                        [CATransaction begin];
+                        [CATransaction setDisableActions:YES];
+                        g_magnifiedBackdrop.contents = (__bridge id)retained;
+                        g_magnifiedBackdrop.hidden = NO;
+                        g_magnifiedBackdrop.opacity = 1;
+                        [CATransaction commit];
+                        moveMagnifiedBackdrop(g_ringView.lastPointer);
+                        CAMediaTimingFunction *easing = [CAMediaTimingFunction
+                            functionWithControlPoints:0.35 :0.0 :0.25 :1.0];
+                        CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
+                        fade.fromValue = @0;
+                        fade.toValue = @1;
+                        fade.duration = 0.45;
+                        fade.timingFunction = easing;
+                        [g_magnifiedBackdrop addAnimation:fade forKey:@"backdropFadeIn"];
+                        CABasicAnimation *zoom = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+                        zoom.fromValue = @1;
+                        zoom.toValue = @(1.0 + atomic_load(&g_settingBackdropZoom) / 100.0);
+                        zoom.duration = 0.9;
+                        zoom.timingFunction = easing;
+                        [g_magnifiedBackdrop addAnimation:zoom forKey:@"backdropZoomIn"];
+                        // Order the panel only after both animations exist, so
+                        // its first visible frame cannot flash at full opacity.
+                        [g_snapshotPanel orderWindow:NSWindowBelow relativeTo:g_panel.windowNumber];
+                        diagnosticEvent(@"backdrop_ready", nil);
+                    }
+                    CGImageRelease(retained);
+                });
+            }];
+        }];
+    });
+}
+
 static void pruneDeadWindowEntriesLive(void);
+static NSArray<RingEntry *> *reconcileChromeEntries(NSArray<RingEntry *> *entries, NSSet<NSString *> *openTabs);
+static void refreshChromeMembershipForRing(uint64_t generation);
+
+static NSString *recentWindowKey(RingEntry *entry) {
+    if (entry.isShortcut || entry.isSettings || !entry.application || entry.application.isTerminated ||
+        entry.windowID==kCGNullWindowID || (entry.isTab && !entry.isSelectedTab)) return nil;
+    return [NSString stringWithFormat:@"%d:%u",entry.application.processIdentifier,entry.windowID];
+}
+
+static void recordRecentWindow(NSString *key) {
+    if (!key.length) return;
+    if (!g_recentWindowKeys) g_recentWindowKeys=[NSMutableArray array];
+    [g_recentWindowKeys removeObject:key];
+    [g_recentWindowKeys insertObject:key atIndex:0];
+    if (g_recentWindowKeys.count>64) [g_recentWindowKeys removeLastObject];
+}
+
+static void updateRecentWindowHistory(void) {
+    if (atomic_load(&g_chromePrefetchActive)) return;
+    pid_t frontPID=NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;
+    if (frontPID==getpid()) return;
+    NSMutableDictionary<NSNumber *,NSString *> *keys=[NSMutableDictionary dictionary];
+    for (RingEntry *entry in g_windowEntries) {
+        NSString *key=recentWindowKey(entry);
+        if (key) keys[@(entry.windowID)]=key;
+    }
+    NSArray *windows=CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly|kCGWindowListExcludeDesktopElements,kCGNullWindowID));
+    // Početni redosled daje rezervu dok se ne zabeleži prva promena fokusa.
+    if (!g_recentWindowKeys.count) {
+        g_recentWindowKeys=[NSMutableArray array];
+        for (NSDictionary *info in windows) {
+            NSString *key=keys[info[(id)kCGWindowNumber]];
+            if (key && [info[(id)kCGWindowLayer] intValue]==0 && ![g_recentWindowKeys containsObject:key])
+                [g_recentWindowKeys addObject:key];
+        }
+    }
+    for (NSDictionary *info in windows) {
+        if ([info[(id)kCGWindowOwnerPID] intValue]!=frontPID || [info[(id)kCGWindowLayer] intValue]!=0) continue;
+        NSString *key=keys[info[(id)kCGWindowNumber]];
+        if (key) { recordRecentWindow(key); break; }
+    }
+}
+
+static NSString *previousRecentWindow(NSArray<RingEntry *> *entries) {
+    for (NSUInteger i=1;i<g_recentWindowKeys.count;i++) {
+        NSString *key=g_recentWindowKeys[i];
+        for (RingEntry *entry in entries) if ([recentWindowKey(entry) isEqualToString:key]) return key;
+    }
+    return nil;
+}
+
+static RingEntry *windowEntryForQuickSwitch(RingEntry *source) {
+    if (!source) return nil;
+    RingEntry *window=[RingEntry new];
+    window.application=source.application;
+    window.windowID=source.windowID;
+    window.windowTitle=source.windowTitle;
+    window.windowBounds=source.windowBounds;
+    window.accessibilityWindowObject=source.accessibilityWindowObject;
+    window.icon=source.application.icon;
+    // Vrati ceo prozor bez menjanja njegovog trenutnog Chrome/Finder taba.
+    return window;
+}
+
+static NSInteger previousWindowIndex(NSArray<RingEntry *> *entries,NSString *key) {
+    if (!key.length) return -1;
+    for (NSUInteger i=0;i<entries.count;i++) if ([recentWindowKey(entries[i]) isEqualToString:key]) return (NSInteger)i;
+    return -1;
+}
+
+static NSArray<RingEntry *> *ringEntriesOnPage(NSArray<RingEntry *> *entries,NSUInteger page) {
+    const NSUInteger limit=10;
+    if (entries.count<=limit) return entries;
+    NSUInteger pages=MAX((NSUInteger)1,(entries.count+limit-1)/limit);
+    NSUInteger start=MIN(page,pages-1)*limit;
+    return [entries subarrayWithRange:NSMakeRange(start,MIN(limit,entries.count-start))];
+}
+
+static void configureRingPage(NSArray<RingEntry *> *entries,NSUInteger page) {
+    g_ringPageEntries=entries;
+    NSUInteger pages=MAX((NSUInteger)1,(entries.count+9)/10);
+    g_ringPage=MIN(page,pages-1);
+    g_windowEntries=ringEntriesOnPage(entries,g_ringPage);
+    atomic_store(&g_windowEntryCount,(int)g_windowEntries.count);
+    if (g_panel) {
+        NSSize size=g_panel.contentView.bounds.size;
+        CGFloat footer=pages>1 ? 48 : 0;
+        g_ringView.frame=NSMakeRect(0,footer,size.width,size.height-footer);
+        g_ringView.anchorPoint=NSMakePoint(size.width/2,(size.height-footer)/2);
+        if (!g_ringPageLabel) {
+            g_ringPageLabel=[NSTextField labelWithString:@""];
+            g_ringPageLabel.alignment=NSTextAlignmentCenter;
+            g_ringPageLabel.textColor=NSColor.whiteColor;
+            g_ringPageLabel.font=[NSFont systemFontOfSize:14 weight:NSFontWeightMedium];
+            [g_panel.contentView addSubview:g_ringPageLabel];
+        }
+        g_ringPageLabel.hidden=pages<=1;
+        g_ringPageLabel.frame=NSMakeRect(size.width/2-240,14,480,22);
+        g_ringPageLabel.stringValue=[NSString stringWithFormat:@"←   Prethodna      %lu / %lu      Sledeća   →",(unsigned long)g_ringPage+1,(unsigned long)pages];
+    }
+}
+
+static void changeRingPage(NSInteger direction) {
+    if (!atomic_load(&g_gestureActive) || atomic_load(&g_gestureEnding) || !g_ringPageEntries.count) return;
+    NSInteger pages=(NSInteger)((g_ringPageEntries.count+9)/10);
+    NSInteger next=(NSInteger)g_ringPage+direction;
+    if (next<0 || next>=pages) return;
+    configureRingPage(g_ringPageEntries,(NSUInteger)next);
+    atomic_store(&g_quickTapEligible,false);
+    g_selectedIndex=-1; g_pointerX=g_pointerY=0;
+    os_unfair_lock_lock(&g_selectionLock);
+    g_pendingSelection=-1; g_pendingPointer=NSZeroPoint;
+    os_unfair_lock_unlock(&g_selectionLock);
+    g_ringView.entries=g_windowEntries;
+    g_ringView.layoutEntries=nil;
+    g_ringView.selectedIndex=-1;
+    [g_ringView updateCardLayersAnimated:NO refreshContents:YES];
+    [g_ringView updateHubAnimated:NO];
+    [g_ringView movePointerTo:NSZeroPoint];
+    [g_ringView setNeedsDisplay:YES];
+    diagnosticEvent(@"ring_page",@{@"page":@(g_ringPage+1),@"pages":@(pages)});
+}
+
+static RingEntry *frontWindowEntry(NSArray<RingEntry *> *entries) {
+    pid_t frontPID = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;
+    if (frontPID <= 0 || frontPID == getpid()) return nil;
+    NSArray *windows = CFBridgingRelease(CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
+    for (NSDictionary *info in windows) {
+        if ([info[(id)kCGWindowOwnerPID] intValue] != frontPID ||
+            [info[(id)kCGWindowLayer] intValue] != 0) continue;
+        CGWindowID windowID = [info[(id)kCGWindowNumber] unsignedIntValue];
+        for (RingEntry *entry in entries) {
+            if (entry.windowID == windowID && entry.application.processIdentifier == frontPID &&
+                !entry.isShortcut && !entry.isSettings && (!entry.isTab || entry.isSelectedTab))
+                return entry;
+        }
+    }
+    return nil;
+}
 
 static void showRing(uint64_t generation) {
     if (generation != atomic_load(&g_gestureGeneration) || !atomic_load(&g_gestureActive)) return;
     if (atomic_load(&g_ringShownGeneration) == generation) return;
+    updateRecentWindowHistory();
+    g_quickTapWindowKey=previousRecentWindow(g_windowEntries);
     NSScreen *screen = nil;
     (void)appKitPointFromQuartz(g_cursorAtGestureStart, &screen); // Cursor chooses the display only.
     ensurePanel(screen);
+    g_currentRingEntry = atomic_load(&g_settingCurrentWindowInCenter) ? frontWindowEntry(g_windowEntries) : nil;
+    if (g_currentRingEntry) {
+        NSMutableArray<RingEntry *> *otherEntries = [g_windowEntries mutableCopy];
+        [otherEntries removeObjectIdenticalTo:g_currentRingEntry];
+        g_windowEntries = otherEntries;
+    }
     g_windowEntries=entriesWithPersistentShortcuts(g_windowEntries);
     atomic_store(&g_windowEntryCount,(int)g_windowEntries.count);
     g_standardRingEntries=g_windowEntries;
     g_commandShortcutMode=NO;
-    CGFloat width = NSWidth(screen.frame), height = NSHeight(screen.frame);
+    atomic_store(&g_pendingPageStep,0);
+    configureRingPage(g_standardRingEntries,0);
+    CGFloat width = NSWidth(g_ringView.bounds), height = NSHeight(g_ringView.bounds);
     NSPoint anchor = NSMakePoint(width / 2.0, height / 2.0);
     g_ringView.entries = g_windowEntries;
+    g_ringView.currentEntry = g_currentRingEntry;
     g_ringView.selectedIndex = -1;
     g_ringView.anchorPoint = anchor;
     g_ringView.layoutEntries = nil;
     [g_ringView prepareCardLayout];
     [g_ringView resetSelectionVisuals];
     [g_ringView movePointerTo:NSZeroPoint];
-    // Blur and dimming appear at once with the cards, no fade.
+    [g_panel setFrame:screen.frame display:NO];
+    // The same window-server blur stays active before and after the screenshot
+    // panel fades in behind this one.
     int blurRadius = atomic_load(&g_settingBlurRadius);
+    BOOL captureBackdrop = atomic_load(&g_settingBackdropZoom) > 0 && CGPreflightScreenCaptureAccess();
     setPanelBlur(blurRadius);
     NSColor *backdrop = g_backdropColor ?: [NSColor colorWithSRGBRed:0.02 green:0.02 blue:0.02 alpha:1];
     [CATransaction begin];
@@ -1979,14 +2357,19 @@ static void showRing(uint64_t generation) {
     g_dimView.layer.backgroundColor =
         [backdrop colorWithAlphaComponent:atomic_load(&g_settingBackdropDimming) / 100.0].CGColor;
     [CATransaction commit];
-    for (RingEntry *entry in g_windowEntries) (void)resolvedThumbnail(entry);
     [g_ringView setNeedsDisplay:YES];
     // Avoid forcing a synchronous draw before the panel is ordered onscreen.
-    [g_panel setFrame:screen.frame display:NO];
     atomic_store(&g_ringOverlayVisible, true);
     [g_panel orderFrontRegardless];
     atomic_store(&g_ringShownGeneration, generation);
-    if (CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState)&kCGEventFlagMaskCommand)
+    if (captureBackdrop) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+            captureMagnifiedBackdrop(screen, generation, 0);
+        });
+    }
+    if (shortcutSectionWanted(atomic_load(&g_settingShortcutTrigger),
+                              (CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState)&kCGEventFlagMaskCommand)!=0,
+                              atomic_load(&g_fourFingerShortcutHeld)))
         setCommandShortcutMode(YES);
     pollCommandShortcuts(generation);
     diagnosticEvent(@"menu_open",@{@"entries":@(g_windowEntries.count),@"cmd":@(g_commandShortcutMode)});
@@ -1994,16 +2377,16 @@ static void showRing(uint64_t generation) {
 
     // The cached ring is already on screen. Fresh pictures of the visible
     // windows, above all the one being left, replace it as they arrive.
-    refreshThumbnailsNow(0, 1.0);
-    loadHiddenChromeTabs(generation);
+    refreshThumbnailsNow(0, 0.15);
 
-    // Lista ostaje stabilna tokom izbora; skener je osvežava po zatvaranju.
+
+    refreshChromeMembershipForRing(generation);
 
 }
 
 static AXUIElementRef findTabButton(AXUIElementRef parent, NSString *title, int depth);
-static BOOL setChromeActiveTabWithIndex(NSString *windowID, NSString *tabID, NSUInteger tabIndex1Based);
-static NSString *chromeActiveTab(NSString *windowID, NSString **urlOut);
+static BOOL setChromeActiveTabWithIndex(pid_t pid, NSString *windowID, NSString *tabID, NSUInteger tabIndex1Based);
+static NSString *chromeActiveTab(pid_t pid, NSString *windowID, NSString **urlOut);
 
 static void activateApplication(NSRunningApplication *application) {
 #pragma clang diagnostic push
@@ -2074,7 +2457,7 @@ static void raiseWindowForEntry(RingEntry *entry, uint64_t generation) {
     // the last used profile in front unless that window is made index 1.
     if (generation == atomic_load(&g_gestureGeneration) && entry.isTab &&
         entry.chromeWindowID.length) {
-        BOOL switched = setChromeActiveTabWithIndex(entry.chromeWindowID, entry.chromeTabID,
+        BOOL switched = setChromeActiveTabWithIndex(entry.application.processIdentifier, entry.chromeWindowID, entry.chromeTabID,
                                                     entry.tabIndex + 1);
         diagnosticEvent(@"chrome_activation",@{@"success":@(switched),@"entry":diagnosticEntry(entry)});
         if (switched) {
@@ -2084,7 +2467,7 @@ static void raiseWindowForEntry(RingEntry *entry, uint64_t generation) {
                     diagnosticEvent(@"chrome_verify_skipped",@{@"reason":@"new_gesture",@"requestedGeneration":@(generation)});
                     return;
                 }
-                NSString *actual=chromeActiveTab(entry.chromeWindowID,NULL);
+                NSString *actual=chromeActiveTab(entry.application.processIdentifier,entry.chromeWindowID,NULL);
                 diagnosticEvent(@"chrome_verify",@{@"expected":entry.chromeTabID ?: @"",@"actual":actual ?: @"",
                     @"window":entry.chromeWindowID,@"readable":@(actual!=nil),
                     @"matches":@(actual && [actual isEqualToString:entry.chromeTabID])});
@@ -2377,9 +2760,10 @@ static void setCommandShortcutMode(BOOL enabled) {
     NSArray *entries=enabled ? commandShortcutEntries() : g_standardRingEntries;
     if (enabled && !entries.count) return;
     g_commandShortcutMode=enabled;
+    if (enabled) atomic_store(&g_quickTapEligible,false);
     diagnosticEvent(@"cmd_mode",@{@"enabled":@(enabled),@"entries":@(entries.count)});
-    g_windowEntries=entries;
-    atomic_store(&g_windowEntryCount,(int)entries.count);
+    configureRingPage(entries,0);
+    entries=g_windowEntries;
     g_pointerX=g_pointerY=0;
     g_selectedIndex=-1;
     os_unfair_lock_lock(&g_selectionLock);
@@ -2396,11 +2780,51 @@ static void setCommandShortcutMode(BOOL enabled) {
 }
 
 // Rezervna provera Cmd-a radi i kada sistemski event tap nije dostupan.
+static BOOL shortcutSectionWanted(int trigger, BOOL commandHeld, BOOL fourFingersHeld) {
+    if (trigger==ShortcutTriggerCommand) return commandHeld;
+    if (trigger==ShortcutTriggerFourFingers) return fourFingersHeld;
+    if (trigger==ShortcutTriggerBoth) return commandHeld || fourFingersHeld;
+    return NO;
+}
+
+// Četiri prsta gase otvoren meni samo kada ne otvaraju poseban meni prečica.
+static BOOL fourFingersCancelOpenMenu(int trigger) {
+    return trigger!=ShortcutTriggerFourFingers && trigger!=ShortcutTriggerBoth;
+}
+
+static void releaseFourFingerShortcutHold(void) {
+    atomic_store(&g_fourFingerReleaseCandidateNanos, 0);
+    if (!atomic_exchange(&g_fourFingerShortcutHeld, false)) return;
+    uint64_t generation=atomic_load(&g_gestureGeneration);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (generation==atomic_load(&g_gestureGeneration) && atomic_load(&g_gestureActive))
+            applyShortcutSection();
+    });
+}
+
+static void applyShortcutSection(void) {
+    if (!atomic_load(&g_gestureActive) || atomic_load(&g_gestureEnding) || !g_standardRingEntries) return;
+    BOOL command=(CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState)&kCGEventFlagMaskCommand)!=0;
+    setCommandShortcutMode(shortcutSectionWanted(atomic_load(&g_settingShortcutTrigger), command,
+                                                 atomic_load(&g_fourFingerShortcutHeld)));
+}
+
 static void pollCommandShortcuts(uint64_t generation) {
     if (generation!=atomic_load(&g_gestureGeneration) ||
         !atomic_load(&g_gestureActive) || atomic_load(&g_gestureEnding)) return;
-    BOOL command=(CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState)&kCGEventFlagMaskCommand)!=0;
-    setCommandShortcutMode(command);
+    applyShortcutSection();
+    static uint64_t pageGeneration=0;
+    static BOOL wasLeft=NO,wasRight=NO;
+    BOOL left=CGEventSourceKeyState(kCGEventSourceStateHIDSystemState,123);
+    BOOL right=CGEventSourceKeyState(kCGEventSourceStateHIDSystemState,124);
+    if (pageGeneration!=generation) { pageGeneration=generation; wasLeft=wasRight=NO; }
+    int step=atomic_exchange(&g_pendingPageStep,0);
+    if (step) changeRingPage(step);
+    else if (!atomic_load(&g_scrollTapActive)) {
+        if (left && !wasLeft) changeRingPage(-1);
+        if (right && !wasRight) changeRingPage(1);
+    }
+    wasLeft=left; wasRight=right;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,30*NSEC_PER_MSEC),dispatch_get_main_queue(), ^{
         pollCommandShortcuts(generation);
     });
@@ -2410,6 +2834,7 @@ static void selectWindowImmediately(uint64_t generation, NSInteger selection, NS
     if (generation != atomic_load(&g_gestureGeneration) || !atomic_load(&g_gestureActive) || !g_panel) return;
     g_ringView.selectedIndex = selection;
     [g_ringView movePointerTo:pointer];
+    moveMagnifiedBackdrop(pointer);
 }
 
 // Touch frames arrive faster than the screen refreshes. Only the latest
@@ -2490,23 +2915,44 @@ static void finishGesture(uint64_t generation, NSInteger selection) {
     if (generation != atomic_load(&g_gestureGeneration)) return;
     // Hidden Chrome tabs shown for their pictures are put back, except in the
     // window of the card being picked.
-    RingEntry *picked = selection >= 0 && selection < (NSInteger)g_windowEntries.count
-        ? g_windowEntries[(NSUInteger)selection] : nil;
+    BOOL quickPrevious=selection==kQuickPreviousSelection;
+    if (quickPrevious) {
+        selection=previousWindowIndex(g_standardRingEntries ?: g_windowEntries,g_quickTapWindowKey);
+        diagnosticEvent(@"quick_previous_window",@{@"selection":@(selection),@"target":g_quickTapWindowKey ?: @""});
+    }
+    NSArray *pickEntries=quickPrevious ? (g_standardRingEntries ?: g_windowEntries) : g_windowEntries;
+    RingEntry *picked = selection >= 0 && selection < (NSInteger)pickEntries.count
+        ? pickEntries[(NSUInteger)selection] : nil;
+    if (quickPrevious) picked=windowEntryForQuickSwitch(picked);
     if (g_standardRingEntries) {
-        g_windowEntries=g_standardRingEntries;
+        NSMutableArray<RingEntry *> *restored = [g_standardRingEntries mutableCopy];
+        if (g_currentRingEntry && [restored indexOfObjectIdenticalTo:g_currentRingEntry] == NSNotFound)
+            [restored insertObject:g_currentRingEntry atIndex:0];
+        g_windowEntries=restored;
         atomic_store(&g_windowEntryCount,(int)g_windowEntries.count);
         g_standardRingEntries=nil;
         g_commandShortcutMode=NO;
+        atomic_store(&g_fourFingerShortcutHeld, false);
+        atomic_store(&g_fourFingerReleaseCandidateNanos, 0);
     }
     diagnosticEvent(@"menu_close",@{@"selection":@(selection),@"picked":diagnosticEntry(picked)});
     setRingPick(picked != nil, picked.isTab ? picked.chromeWindowID : nil);
     atomic_store(&g_gestureActive, false);
     atomic_store(&g_gestureEnding, false);
     if (g_panel) [g_panel orderOut:nil];
+    if (g_snapshotPanel) [g_snapshotPanel orderOut:nil];
+    // Release the captured screen image as soon as the menu closes.
+    [g_magnifiedBackdrop removeAnimationForKey:@"backdropFadeIn"];
+    [g_magnifiedBackdrop removeAnimationForKey:@"backdropZoomIn"];
+    g_magnifiedBackdrop.contents = nil;
+    g_magnifiedBackdrop.hidden = YES;
+    g_magnifiedBackdrop.opacity = 0;
     atomic_store(&g_ringOverlayVisible, false);
     showSystemCursorAfterGesture();
     restoreCursorAfterGesture();
     releaseDecodedThumbnails();
+    g_ringView.currentEntry = nil;
+    g_currentRingEntry = nil;
     // Changes that happened while the ring was open were not applied.
     scanWindowsNow();
     if (!picked) return;
@@ -2527,6 +2973,7 @@ static void finishGesture(uint64_t generation, NSInteger selection) {
     if (!entry.application || entry.application.isTerminated) {
         return;
     }
+    recordRecentWindow(recentWindowKey(entry));
     playRingSound(g_activateSound);
     // Tell the media rules right away, before Chrome even switches, so the
     // video starts without waiting for a tab check.
@@ -3050,34 +3497,16 @@ static NSArray<RingEntry *> *entriesWorthShowing(NSArray<RingEntry *> *entries) 
 
 // "windowID:tabID" of every open Chrome tab, or nil when that cannot be known
 // right now (Chrome not running, no Automation access, script error).
-static NSSet<NSString *> *liveChromeTabs(void) {
-    BOOL chromeRunning = [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.google.Chrome"].count > 0;
-    if (!chromeRunning || !ensureChromeAutomation(NO)) return nil;
-    static NSAppleScript *s_script;
-    if (!s_script) {
-        s_script = [[NSAppleScript alloc] initWithSource:
-            @"set output to \"\"\n"
-             "tell application \"Google Chrome\"\n"
-             "repeat with chromeWindow in windows\n"
-             "set windowID to (id of chromeWindow) as text\n"
-             "set tabIDs to id of every tab of chromeWindow\n"
-             "repeat with tabIndex from 1 to count of tabIDs\n"
-             "set output to output & windowID & \":\" & ((item tabIndex of tabIDs) as text) & linefeed\n"
-             "end repeat\n"
-             "end repeat\n"
-             "end tell\n"
-             "return output"];
-        [s_script compileAndReturnError:nil];
-    }
-    NSDictionary *error = nil;
-    NSAppleEventDescriptor *result = nil;
-    @synchronized ([NSAppleScript class]) {
-        result = [s_script executeAndReturnError:&error];
-    }
-    if (error || !result.stringValue.length) return nil;
-    NSMutableSet<NSString *> *tabs = [NSMutableSet set];
-    for (NSString *line in [result.stringValue componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
-        if (line.length) [tabs addObject:line];
+static NSArray<NSDictionary *> *fetchChromeTabRows(pid_t pid);
+static NSSet<NSString *> *liveChromeTabs(NSArray<RingEntry *> *entries) {
+    NSMutableSet<NSNumber *> *pids=[NSMutableSet set];
+    for (RingEntry *entry in entries) if (entry.chromeTabID.length)
+        [pids addObject:@(entry.application.processIdentifier)];
+    NSMutableSet<NSString *> *tabs=[NSMutableSet set];
+    for (NSNumber *pid in pids) {
+        NSArray *rows=fetchChromeTabRows(pid.intValue);
+        if (!rows) return nil;
+        for (NSDictionary *row in rows) [tabs addObject:[NSString stringWithFormat:@"%@:%@",row[@"windowID"],row[@"tabID"]]];
     }
     return tabs;
 }
@@ -3089,6 +3518,57 @@ static NSInteger chromeTabMembership(RingEntry *entry, NSSet<NSString *> *openTa
     return [openTabs containsObject:key] ? 1 : 0;
 }
 
+// Identitet je proces + prozor + tab. Dva taba istog linka ostaju odvojena.
+static NSArray<RingEntry *> *reconcileChromeEntries(NSArray<RingEntry *> *entries, NSSet<NSString *> *openTabs) {
+    NSMutableSet<NSString *> *seen=[NSMutableSet set];
+    NSMutableArray<RingEntry *> *result=[NSMutableArray arrayWithCapacity:entries.count];
+    for (RingEntry *entry in entries) {
+        if (entry.chromeWindowID.length && entry.chromeTabID.length) {
+            if (chromeTabMembership(entry,openTabs)==0) continue;
+            NSString *identity=tabThumbnailKey(entry);
+            if ([seen containsObject:identity]) continue;
+            [seen addObject:identity];
+        }
+        [result addObject:entry];
+    }
+    return result.count==entries.count ? entries : result;
+}
+
+static void refreshChromeMembershipForRing(uint64_t generation) {
+    if (!g_windowScanQueue) return;
+    BOOL hasTabs=NO;
+    for (RingEntry *entry in g_standardRingEntries) if (entry.chromeTabID.length) { hasTabs=YES; break; }
+    if (!hasTabs) return;
+    NSArray *snapshot=g_standardRingEntries;
+    // Samo čitanje ID-eva; nijedan tab se ne aktivira radi provere.
+    dispatch_async(g_windowScanQueue, ^{
+        NSSet<NSString *> *live=liveChromeTabs(snapshot);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (generation!=atomic_load(&g_gestureGeneration) ||
+                !atomic_load(&g_gestureActive) || atomic_load(&g_gestureEnding)) return;
+            NSArray *before=g_standardRingEntries;
+            NSArray *clean=reconcileChromeEntries(before,live);
+            NSMutableArray *identities=[NSMutableArray array];
+            for (RingEntry *entry in before) if (entry.chromeTabID.length)
+                [identities addObject:diagnosticEntry(entry)];
+            BOOL canRelayout=!g_commandShortcutMode && g_selectedIndex==-1 &&
+                hypot(g_pointerX,g_pointerY)<0.12;
+            diagnosticEvent(@"chrome_menu_inventory",@{@"known":@(live!=nil),
+                @"liveCount":@(live.count),@"removed":@(before.count-clean.count),
+                @"applied":@(canRelayout),@"cards":identities});
+            g_standardRingEntries=clean;
+            // Izabrana kartica ostaje na mestu do kraja gesta.
+            if (clean==before || !canRelayout) return;
+            configureRingPage(clean,g_ringPage);
+            g_ringView.entries=g_windowEntries;
+            g_ringView.layoutEntries=nil;
+            [g_ringView updateCardLayersAnimated:NO refreshContents:YES];
+            [g_ringView updateHubAnimated:NO];
+            [g_ringView setNeedsDisplay:YES];
+        });
+    });
+}
+
 static void pruneDeadWindowEntriesLive(void) {
     if (atomic_load(&g_gestureActive)) return;
     if (!g_windowEntries || !g_windowEntries.count) return;
@@ -3097,7 +3577,7 @@ static void pruneDeadWindowEntriesLive(void) {
     for (RingEntry *entry in g_windowEntries) {
         if (entry.chromeTabID.length) { hasChromeTabs = YES; break; }
     }
-    NSSet<NSString *> *openChromeTabs = hasChromeTabs ? liveChromeTabs() : nil;
+    NSSet<NSString *> *openChromeTabs = hasChromeTabs ? liveChromeTabs(g_windowEntries) : nil;
 
     CFArrayRef allWindows = CGWindowListCopyWindowInfo(kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
     BOOL canCheckWindowIDs = (allWindows != NULL);
@@ -3290,125 +3770,54 @@ static NSDictionary<NSNumber *, NSString *> *fetchFinderPaths(void) {
     return map;
 }
 
-static NSArray<NSDictionary *> *fetchChromeTabRows(void) {
-    static NSAppleScript *s_chromeScript = nil;
-    static NSArray<NSDictionary *> *s_lastRows = nil;
-    static NSTimeInterval s_lastSuccess = 0;
-    static NSTimeInterval s_retryAfter = 0;
-    static NSTimeInterval s_lastErrorLog = 0;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        NSString *src = @"set fieldSep to ASCII character 31\n"
-                         "set output to \"\"\n"
-                         "tell application \"Google Chrome\"\n"
-                         "  repeat with windowIndex from 1 to count of windows\n"
-                         "    try\n"
-                         "      set chromeWindow to window windowIndex\n"
-                         "      set windowID to (id of chromeWindow) as text\n"
-                         "      set {xPos, yPos, x2, y2} to bounds of chromeWindow\n"
-                         "      set winWidth to (x2 - xPos)\n"
-                         "      set winHeight to (y2 - yPos)\n"
-                         "      set activeIndex to active tab index of chromeWindow\n"
-                         "      set activeTitle to (title of active tab of chromeWindow) as text\n"
-                         "      set AppleScript's text item delimiters to {return, linefeed, fieldSep}\n"
-                         "      set titleParts to text items of activeTitle\n"
-                         "      set AppleScript's text item delimiters to \" \"\n"
-                         "      set activeTitle to titleParts as text\n"
-                         "      set AppleScript's text item delimiters to \"\"\n"
-                         "      set tabIDs to id of every tab of chromeWindow\n"
-                         "      repeat with tabIndex from 1 to count of tabIDs\n"
-                         "        try\n"
-                         "          set wantedTabID to item tabIndex of tabIDs\n"
-                         "          set chromeTab to first tab of chromeWindow whose id is wantedTabID\n"
-                         "          set tabID to (id of chromeTab) as text\n"
-                         "          set tabTitle to (title of chromeTab) as text\n"
-                         "          set tabURL to \"\"\n"
-                         "          try\n"
-                         "            set tabURL to (URL of chromeTab) as text\n"
-                         "          end try\n"
-                         "          set AppleScript's text item delimiters to {return, linefeed, fieldSep}\n"
-                         "          set titleParts to text items of tabTitle\n"
-                         "          set AppleScript's text item delimiters to \" \"\n"
-                         "          set tabTitle to titleParts as text\n"
-                         "          set AppleScript's text item delimiters to {return, linefeed, fieldSep}\n"
-                         "          set urlParts to text items of tabURL\n"
-                         "          set AppleScript's text item delimiters to \" \"\n"
-                         "          set tabURL to urlParts as text\n"
-                         "          set AppleScript's text item delimiters to \"\"\n"
-                         "          set output to output & (windowIndex as text) & fieldSep & windowID & fieldSep & (tabIndex as text) & fieldSep & tabID & fieldSep & (activeIndex as text) & fieldSep & (xPos as text) & fieldSep & (yPos as text) & fieldSep & (winWidth as text) & fieldSep & (winHeight as text) & fieldSep & activeTitle & fieldSep & tabTitle & fieldSep & tabURL & linefeed\n"
-                         "        on error\n"
-                         "          set AppleScript's text item delimiters to \"\"\n"
-                         "        end try\n"
-                         "      end repeat\n"
-                         "    on error\n"
-                         "      set AppleScript's text item delimiters to \"\"\n"
-                         "    end try\n"
-                         "  end repeat\n"
-                         "end tell\n"
-                         "return output";
-        s_chromeScript = [[NSAppleScript alloc] initWithSource:src];
-        [s_chromeScript compileAndReturnError:nil];
-    });
-    if (!s_chromeScript) return @[];
-    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
-    if (!ensureChromeAutomation(YES)) {
-        s_retryAfter = now + 5.0;
-        return now - s_lastSuccess < 3.0 ? s_lastRows ?: @[] : @[];
-    }
-    if (now < s_retryAfter) return now - s_lastSuccess < 3.0 ? s_lastRows ?: @[] : @[];
-
-    NSDictionary *error = nil;
-    NSAppleEventDescriptor *desc = nil;
-    @synchronized ([NSAppleScript class]) {
-        desc = [s_chromeScript executeAndReturnError:&error];
-    }
-    if (error) {
-        if (now - s_lastErrorLog > 30.0) {
-            NSString *message = error[NSAppleScriptErrorMessage] ?: error.description;
-            fprintf(stderr, "[Chrome tabs] AppleScript enumeration failed: %s\n",
-                    message.UTF8String ?: "unknown error");
-            s_lastErrorLog = now;
+// Upit je vezan za PID, jer Chrome za snimanje može imati isti bundle ID.
+static NSArray<NSDictionary *> *fetchChromeTabRows(pid_t pid) {
+    @synchronized ([SBApplication class]) {
+    if (!ensureChromeAutomation(YES)) return nil;
+    NSMutableArray<NSDictionary *> *rows=[NSMutableArray array];
+    @try {
+        SBApplication *chrome=[SBApplication applicationWithProcessIdentifier:pid];
+        if (!chrome) return nil;
+        chrome.sendMode=kAEWaitReply | kAENeverInteract;
+        chrome.timeout=60;
+        NSArray *windows=[chrome valueForKey:@"windows"];
+        NSUInteger windowIndex=0;
+        for (id window in windows) {
+            windowIndex++;
+            NSString *windowID=[[window valueForKey:@"id"] description];
+            id boundsValue=[window valueForKey:@"bounds"];
+            NSRect bounds=NSZeroRect;
+            if ([boundsValue isKindOfClass:NSValue.class]) bounds=[boundsValue rectValue];
+            NSUInteger activeIndex=[[window valueForKey:@"activeTabIndex"] unsignedIntegerValue];
+            NSString *windowTitle=[window valueForKey:@"name"] ?: @"";
+            NSArray *records=[[window valueForKey:@"tabs"] valueForKey:@"properties"];
+            NSUInteger index=0;
+            for (NSDictionary *record in records) {
+                index++;
+                NSString *tabID=[record[@"id"] description];
+                if (!windowID.length || !tabID.length) continue;
+                [rows addObject:@{@"windowIndex":@(windowIndex),@"windowID":windowID,
+                    @"tabIndex":@(index),@"tabID":tabID,@"activeIndex":@(activeIndex),
+                    @"bounds":[NSValue valueWithRect:bounds],@"windowTitle":windowTitle,
+                    @"title":record[@"title"] ?: @"Tab",@"URL":record[@"URL"] ?: @""}];
+            }
         }
-        // Chrome can briefly reject an Apple Event while a window is closing.
-        // Retry instead of permanently losing all Chrome tabs.
-        s_retryAfter = now + 2.0;
-        return now - s_lastSuccess < 3.0 ? s_lastRows ?: @[] : @[];
+        if (chrome.lastError) return nil;
+    } @catch (NSException *exception) {
+        diagnosticEvent(@"chrome_inventory_error",@{@"targetPID":@(pid),@"reason":exception.name ?: @"unknown"});
+        return nil;
     }
-    s_retryAfter = 0;
-    if (!desc.stringValue.length) {
-        s_lastRows = @[];
-        s_lastSuccess = now;
-        return @[];
-    }
-
-    NSMutableArray<NSDictionary *> *rows = [NSMutableArray array];
-    for (NSString *line in [desc.stringValue componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
-        if (!line.length) continue;
-        NSArray<NSString *> *fields = [line componentsSeparatedByString:@"\x1f"];
-        if (fields.count != 12) continue;
-        NSString *tabTitle = fields[10].length ? fields[10] : @"Tab";
-        CGRect bounds = CGRectMake(fields[5].doubleValue, fields[6].doubleValue,
-                                   fields[7].doubleValue, fields[8].doubleValue);
-        [rows addObject:@{
-            @"windowIndex": @(fields[0].integerValue),
-            @"windowID": fields[1],
-            @"tabIndex": @(fields[2].integerValue),
-            @"tabID": fields[3],
-            @"activeIndex": @(fields[4].integerValue),
-            @"bounds": [NSValue valueWithRect:NSRectFromCGRect(bounds)],
-            @"windowTitle": fields[9],
-            @"title": tabTitle,
-            @"URL": fields[11]
-        }];
-    }
-    if (rows.count) {
-        s_lastRows = [rows copy];
-        s_lastSuccess = now;
-    } else {
-        s_retryAfter = now + 2.0;
-        return now - s_lastSuccess < 3.0 ? s_lastRows ?: @[] : @[];
+    static NSMutableDictionary<NSNumber *,NSString *> *lastInventories;
+    if (!lastInventories) lastInventories=[NSMutableDictionary dictionary];
+    NSMutableArray<NSString *> *ids=[NSMutableArray arrayWithCapacity:rows.count];
+    for (NSDictionary *row in rows) [ids addObject:[NSString stringWithFormat:@"%@:%@",row[@"windowID"],row[@"tabID"]]];
+    NSString *inventory=[ids componentsJoinedByString:@","];
+    if (![inventory isEqualToString:lastInventories[@(pid)]]) {
+        diagnosticEvent(@"chrome_inventory",@{@"targetPID":@(pid),@"tabs":@(rows.count),@"ids":ids});
+        lastInventories[@(pid)]=inventory;
     }
     return rows;
+    }
 }
 
 static BOOL validChromeID(NSString *identifier) {
@@ -3484,45 +3893,32 @@ static BOOL runChromeScript(NSString *source) {
 
 // Video and audio in the tabs are handled by ring_media.m, which notices the
 // switch on its own.
-static BOOL setChromeActiveTabWithIndex(NSString *windowID, NSString *tabID, NSUInteger tabIndex1Based) {
-    diagnosticEvent(@"chrome_switch_requested",@{@"window":windowID ?: @"",@"tab":tabID ?: @"",@"index":@(tabIndex1Based)});
-    if (!validChromeID(windowID)) return NO;
-    BOOL haveTabID = validChromeID(tabID);
-    if (!haveTabID && tabIndex1Based == 0) return NO;
-    // Chrome exposes window and tab ids as text, not integers. Comparing a
-    // text id with an unquoted number never matches, so the previously
-    // selected tab (often YouTube) stayed in front for every card.
-    NSMutableString *source = [NSMutableString stringWithFormat:
-        @"tell application \"Google Chrome\"\n"
-         "try\n"
-         "set targetWindow to first window whose id is \"%@\"\n"
-         "set index of targetWindow to 1\n", windowID];
-    if (haveTabID) {
-        [source appendFormat:
-         @"repeat with tabIndex from 1 to count of tabs of targetWindow\n"
-          "if (id of tab tabIndex of targetWindow) as text is \"%@\" then\n"
-          "set active tab index of targetWindow to tabIndex\n"
-          "return \"ok\"\n"
-          "end if\n"
-          "end repeat\n"
-          "return \"tab_missing\"\n", tabID];
+static BOOL setChromeActiveTabWithIndex(pid_t pid, NSString *windowID, NSString *tabID, NSUInteger tabIndex1Based) {
+    @synchronized ([SBApplication class]) {
+    diagnosticEvent(@"chrome_switch_requested",@{@"targetPID":@(pid),@"window":windowID ?: @"",@"tab":tabID ?: @""});
+    if (!validChromeID(windowID) || !ensureChromeAutomation(NO)) return NO;
+    @try {
+        SBApplication *chrome=[SBApplication applicationWithProcessIdentifier:pid];
+        chrome.sendMode=kAEWaitReply | kAENeverInteract;
+        chrome.timeout=60;
+        SBElementArray *windows=[chrome valueForKey:@"windows"];
+        id window=[windows objectWithID:windowID];
+        NSArray *records=[[window valueForKey:@"tabs"] valueForKey:@"properties"];
+        NSUInteger selected=0;
+        if (validChromeID(tabID)) {
+            for (NSUInteger i=0;i<records.count;i++) if ([[records[i][@"id"] description] isEqualToString:tabID]) {
+                selected=i+1; break;
+            }
+        } else if (tabIndex1Based>0 && tabIndex1Based<=records.count) selected=tabIndex1Based;
+        if (!selected || chrome.lastError) return NO;
+        [window setValue:@1 forKey:@"index"];
+        [window setValue:@(selected) forKey:@"activeTabIndex"];
+        return chrome.lastError==nil;
+    } @catch (NSException *exception) {
+        diagnosticEvent(@"chrome_switch_error",@{@"targetPID":@(pid),@"reason":exception.name ?: @"unknown"});
+        return NO;
     }
-    if (!haveTabID && tabIndex1Based > 0) {
-        [source appendFormat:
-         @"set tabCount to count of tabs of targetWindow\n"
-          "if %@ <= tabCount then\n"
-          "set active tab index of targetWindow to %@\n"
-          "return \"ok\"\n"
-          "end if\n", @(tabIndex1Based), @(tabIndex1Based)];
     }
-    [source appendString:
-         @"return \"tab_missing\"\n"
-          "on error errorText number errorNumber\n"
-          "return \"script_error:\" & errorNumber\n"
-          "end try\n"
-          "end tell\n"
-          "return \"failed\""];
-    return runChromeScript(source);
 }
 
 // A second surface of an already listed window: no title and mostly inside
@@ -3599,7 +3995,11 @@ static NSArray<RingEntry *> *collectOpenWindows(void) {
         BOOL isFinder = [app.bundleIdentifier isEqualToString:@"com.apple.finder"];
         NSMutableSet<NSNumber *> *matchedWindowIDs = [NSMutableSet set];
         if ([app.bundleIdentifier isEqualToString:@"com.google.Chrome"]) {
-            NSArray<NSDictionary *> *chromeTabs = fetchChromeTabRows();
+            BOOL hasBrowserSurface=NO;
+            for (NSDictionary *info in windowInfos) if ([info[(id)kCGWindowOwnerPID] intValue]==app.processIdentifier &&
+                [info[(id)kCGWindowLayer] integerValue]==0) { hasBrowserSurface=YES; break; }
+            if (!hasBrowserSurface) continue;
+            NSArray<NSDictionary *> *chromeTabs = fetchChromeTabRows(app.processIdentifier);
             if (chromeTabs.count) {
                 // AppleScript is authoritative for Chrome's browser windows and
                 // tabs. Mark Chrome's on-screen window records as represented so
@@ -3861,6 +4261,8 @@ static NSArray<RingEntry *> *collectOpenWindows(void) {
         [entries addObject:entry];
     }
 
+    entries=[reconcileChromeEntries(entries,nil) mutableCopy];
+
     // Reconcile AX-enriched entries with CG-only window records after collecting
     // both sources. Distinct tabs in one browser window share a CG window ID and
     // bounds, so keep them when their tab indices differ.
@@ -3993,7 +4395,8 @@ static NSArray<RingEntry *> *collectOpenWindows(void) {
         for (RingEntry *entry in entries) {
             BOOL isChrome = [entry.application.bundleIdentifier isEqualToString:@"com.google.Chrome"];
             NSString *group = isChrome
-                ? [NSString stringWithFormat:@"%d:%u", entry.application.processIdentifier, entry.windowID]
+                ? [NSString stringWithFormat:@"%d:chrome:%@", entry.application.processIdentifier,
+                    entry.chromeWindowID.length ? entry.chromeWindowID : [NSString stringWithFormat:@"cg:%u",entry.windowID]]
                 : [NSString stringWithFormat:@"%d", entry.application.processIdentifier];
             RingEntry *current = cardByGroup[group];
             if (!current) {
@@ -4112,6 +4515,7 @@ static void releaseDecodedThumbnails(void) {
     for (RingEntry *entry in g_windowEntries) {
         entry.thumbnail = nil;
     }
+    g_currentRingEntry.thumbnail = nil;
 }
 
 static CGRect currentWindowBounds(CGWindowID windowID) {
@@ -4202,24 +4606,22 @@ static void noteChromeSelectionChanges(NSArray<RingEntry *> *entries) {
 
 // Chrome's active tab and its page, read at capture time. The periodic scan can
 // be two seconds old, and a screenshot stored under the wrong tab stays there.
-static NSString *chromeActiveTab(NSString *windowID, NSString **urlOut) {
+static NSString *chromeActiveTab(pid_t pid, NSString *windowID, NSString **urlOut) {
+    @synchronized ([SBApplication class]) {
     if (!validChromeID(windowID) || !ensureChromeAutomation(NO)) return nil;
-    NSString *source = [NSString stringWithFormat:
-        @"tell application \"Google Chrome\"\n"
-         "set targetTab to active tab of (first window whose id is \"%@\")\n"
-         "return ((id of targetTab) as text) & (ASCII character 31) & ((URL of targetTab) as text)\n"
-         "end tell", windowID];
-    NSAppleScript *script = [[NSAppleScript alloc] initWithSource:source];
-    NSDictionary *error = nil;
-    NSAppleEventDescriptor *result = nil;
-    @synchronized ([NSAppleScript class]) {
-        result = [script executeAndReturnError:&error];
+    @try {
+        SBApplication *chrome=[SBApplication applicationWithProcessIdentifier:pid];
+        chrome.sendMode=kAEWaitReply | kAENeverInteract;
+        chrome.timeout=60;
+        SBElementArray *windows=[chrome valueForKey:@"windows"];
+        id window=[windows objectWithID:windowID];
+        NSDictionary *record=[[window valueForKey:@"activeTab"] valueForKey:@"properties"];
+        NSString *tabID=[record[@"id"] description];
+        if (chrome.lastError || !validChromeID(tabID)) return nil;
+        if (urlOut) *urlOut=record[@"URL"];
+        return tabID;
+    } @catch (NSException *exception) { return nil; }
     }
-    if (error) return nil;
-    NSArray<NSString *> *parts = [result.stringValue componentsSeparatedByString:@"\x1f"];
-    if (parts.count < 2 || !validChromeID(parts[0])) return nil;
-    if (urlOut) *urlOut = parts[1];
-    return parts[0];
 }
 
 // Identitet mora ostati isti tokom čekanja na iscrtavanje i samog snimanja.
@@ -4232,17 +4634,17 @@ static BOOL sameChromeCapturePage(NSString *beforeID, NSString *beforeURL,
 static CGImageRef captureVerifiedChromeWindow(SCWindow *window, NSString *chromeWindowID,
                                               NSString **tabOut, NSString **urlOut) {
     NSString *beforeURL = nil;
-    NSString *beforeID = chromeActiveTab(chromeWindowID, &beforeURL);
+    NSString *beforeID = chromeActiveTab(window.owningApplication.processID,chromeWindowID, &beforeURL);
     if (!beforeID.length || !beforeURL.length) return NULL;
     // Chrome može promeniti aktivni ID pre nego što prikaže novu stranicu.
     usleep(180000);
     NSString *settledURL = nil;
-    NSString *settledID = chromeActiveTab(chromeWindowID, &settledURL);
+    NSString *settledID = chromeActiveTab(window.owningApplication.processID,chromeWindowID, &settledURL);
     if (!sameChromeCapturePage(beforeID,beforeURL,settledID,settledURL)) return NULL;
     CGImageRef image = captureWindowImage(window);
     if (!image) return NULL;
     NSString *afterURL = nil;
-    NSString *afterID = chromeActiveTab(chromeWindowID, &afterURL);
+    NSString *afterID = chromeActiveTab(window.owningApplication.processID,chromeWindowID, &afterURL);
     if (!sameChromeCapturePage(beforeID,beforeURL,afterID,afterURL)) {
         CGImageRelease(image);
         return NULL;
@@ -4306,12 +4708,14 @@ static NSMutableSet<NSNumber *> *capturableOnScreenWindowIDs(void) {
 static void refreshThumbnailsNow(pid_t onlyPID, NSTimeInterval minAge) {
     if (!g_thumbnailPreviewsEnabled || !g_liveCaptureQueue || !CGPreflightScreenCaptureAccess()) return;
     NSMutableSet<NSNumber *> *onScreenIDs = capturableOnScreenWindowIDs();
+    NSArray<RingEntry *> *visibleEntries = g_currentRingEntry
+        ? [g_windowEntries arrayByAddingObject:g_currentRingEntry] : g_windowEntries;
 
     pid_t frontPID = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
     NSMutableDictionary<NSNumber *, RingEntry *> *entryByWindow = [NSMutableDictionary dictionary];
     NSMutableArray<NSNumber *> *windowOrder = [NSMutableArray array];
-    for (RingEntry *entry in g_windowEntries) {
+    for (RingEntry *entry in visibleEntries) {
         NSNumber *windowKey = @(entry.windowID);
         if (entry.windowID == kCGNullWindowID || ![onScreenIDs containsObject:windowKey]) continue;
         if (onlyPID > 0 && entry.application.processIdentifier != onlyPID) continue;
@@ -4407,7 +4811,7 @@ static void refreshThumbnailsNow(pid_t onlyPID, NSTimeInterval minAge) {
                         g_thumbnailCache[windowKey] = data;
                         g_windowLastCaptured[windowKey] = stamp;
                     }
-                    for (RingEntry *entry in g_windowEntries) {
+                    for (RingEntry *entry in visibleEntries) {
                         if (entry.windowID != windowKey.unsignedIntValue) continue;
                         BOOL matches = tabKey ? (entry.isTab && [tabThumbnailKey(entry) isEqualToString:tabKey])
                                               : !entry.isTab;
@@ -4465,279 +4869,9 @@ static BOOL ringPickMade(NSString **chromeWindowOut) {
     return made;
 }
 
-// Puts one tab in front inside its window, without raising the window or Chrome.
-static BOOL showChromeTabQuietly(NSString *windowID, NSString *tabID) {
-    diagnosticEvent(@"chrome_background_switch",@{@"window":windowID ?: @"",@"tab":tabID ?: @""});
-    if (!validChromeID(windowID) || !validChromeID(tabID)) return NO;
-    return runChromeScript([NSString stringWithFormat:
-        @"tell application \"Google Chrome\"\n"
-         "try\n"
-         "set targetWindow to first window whose id is \"%@\"\n"
-         "repeat with tabIndex from 1 to count of tabs of targetWindow\n"
-         "if (id of tab tabIndex of targetWindow) as text is \"%@\" then\n"
-         "set active tab index of targetWindow to tabIndex\n"
-         "return \"ok\"\n"
-         "end if\n"
-         "end repeat\n"
-         "end try\n"
-         "end tell\n"
-         "return \"failed\"", windowID, tabID]);
-}
-
-// Moves a Chrome window above the other apps' windows. Chrome stays in the
-// background; only the order of the windows changes.
-static BOOL raiseChromeWindowQuietly(NSString *windowID) {
-    if (!validChromeID(windowID)) return NO;
-    return runChromeScript([NSString stringWithFormat:
-        @"tell application \"Google Chrome\"\n"
-         "try\n"
-         "set index of (first window whose id is \"%@\") to 1\n"
-         "return \"ok\"\n"
-         "end try\n"
-         "end tell\n"
-         "return \"failed\"", windowID]);
-}
-
-static BOOL chromeTabIsLoading(NSString *windowID, NSString *tabID) {
-    if (!validChromeID(windowID) || !validChromeID(tabID)) return NO;
-    NSAppleScript *script = [[NSAppleScript alloc] initWithSource:[NSString stringWithFormat:
-        @"tell application \"Google Chrome\"\n"
-         "return (loading of (first tab of (first window whose id is \"%@\") whose id is \"%@\")) as text\n"
-         "end tell", windowID, tabID]];
-    NSDictionary *error = nil;
-    NSAppleEventDescriptor *result = nil;
-    @synchronized ([NSAppleScript class]) {
-        result = [script executeAndReturnError:&error];
-    }
-    return !error && [result.stringValue isEqualToString:@"true"];
-}
-
-static BOOL ringStillOpen(uint64_t generation) {
-    return generation == atomic_load(&g_gestureGeneration) && atomic_load(&g_gestureActive);
-}
-
-// Chrome stops painting a window that other windows cover completely, and a
-// capture would show the tab that was there before.
-static BOOL windowFullyCovered(CGWindowID windowID) {
-    CFArrayRef windows = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenAboveWindow | kCGWindowListExcludeDesktopElements,
-                                                    windowID);
-    if (!windows) return NO;
-    CGRect bounds = currentWindowBounds(windowID);
-    BOOL covered = NO;
-    for (NSDictionary *info in (__bridge NSArray *)windows) {
-        if ([info[(id)kCGWindowLayer] intValue] != 0 || [info[(id)kCGWindowOwnerPID] intValue] == getpid()) continue;
-        if ([info[(id)kCGWindowAlpha] doubleValue] < 1.0) continue;
-        CGRect above = CGRectNull;
-        if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)info[(id)kCGWindowBounds], &above)) continue;
-        if (!CGRectIsNull(bounds) && CGRectContainsRect(above, bounds)) { covered = YES; break; }
-    }
-    CFRelease(windows);
-    return covered;
-}
-
-// Chrome tabs without a picture in windows on this desktop, on the main
-// queue. The tab under the fingers comes first.
-static NSArray<RingEntry *> *hiddenTabsToLoad(NSSet<NSString *> *tried) {
-    NSArray<RingEntry *> *entries = g_ringView.entries;
-    NSMutableSet<NSNumber *> *onScreenIDs = capturableOnScreenWindowIDs();
-    NSInteger selected = g_ringView.selectedIndex;
-    NSMutableArray<RingEntry *> *tabs = [NSMutableArray array];
-    for (NSInteger i = 0; i < (NSInteger)entries.count; i++) {
-        RingEntry *entry = entries[(NSUInteger)i];
-        if (!entry.isTab || entry.isSelectedTab || entry.thumbnailData.length ||
-            !validChromeID(entry.chromeWindowID) || !validChromeID(entry.chromeTabID) ||
-            ![onScreenIDs containsObject:@(entry.windowID)]) continue;
-        NSString *key = tabThumbnailKey(entry);
-        if ([tried containsObject:key]) continue;
-        @synchronized ([NSMutableDictionary class]) {
-            if (g_tabThumbnailCache[key]) continue;
-        }
-        if (i == selected) [tabs insertObject:entry atIndex:0];
-        else [tabs addObject:entry];
-    }
-    return tabs;
-}
-
-static void storeLoadedTabPicture(NSString *tabKey, CGWindowID windowID, NSString *pageURL, NSData *data) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @synchronized ([NSMutableDictionary class]) {
-            g_tabThumbnailCache[tabKey] = data;
-            g_tabLastCaptured[tabKey] = @(NSProcessInfo.processInfo.systemUptime);
-            if (pageURL) g_tabCachedURL[tabKey] = chromePageIdentity(pageURL) ?: @"";
-            for (RingEntry *entry in g_windowEntries) {
-                if (entry.windowID == windowID && entry.isTab && [tabThumbnailKey(entry) isEqualToString:tabKey] &&
-                    [chromePageIdentity(entry.tabURL) isEqualToString:chromePageIdentity(pageURL)]) {
-                    applyThumbnailDataToEntry(entry, data);
-                }
-            }
-        }
-        if (g_ringView && atomic_load(&g_ringOverlayVisible)) [g_ringView setNeedsDisplay:YES];
-    });
-}
-
-static SCWindow *shareableWindow(CGWindowID windowID) {
-    dispatch_semaphore_t listed = dispatch_semaphore_create(0);
-    __block SCWindow *window = nil;
-    [SCShareableContent getShareableContentExcludingDesktopWindows:YES onScreenWindowsOnly:YES
-                                                completionHandler:^(SCShareableContent *content, NSError *error) {
-        (void)error;
-        for (SCWindow *candidate in content.windows) {
-            if (candidate.windowID == windowID) { window = candidate; break; }
-        }
-        dispatch_semaphore_signal(listed);
-    }];
-    if (dispatch_semaphore_wait(listed, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1000 * NSEC_PER_MSEC))) != 0) return nil;
-    return window;
-}
-
 static void loadHiddenChromeTabs(uint64_t generation) {
-    if (!g_thumbnailPreviewsEnabled || !g_liveCaptureQueue || !CGPreflightScreenCaptureAccess() ||
-        !ensureChromeAutomation(NO)) return;
-    NSArray<RingEntry *> *firstTargets = hiddenTabsToLoad([NSSet set]);
-    if (!firstTargets.count) return;
-    if (atomic_exchange(&g_hiddenTabLoaderRunning, true)) return;
-    setRingPick(NO, nil);
-    if (!g_chromePrefetchQueue) {
-        g_chromePrefetchQueue = dispatch_queue_create("touchpad.ring.chrome-prefetch", DISPATCH_QUEUE_SERIAL);
-    }
-    // The window in front now, raised again if a Chrome window had to come up.
-    pid_t frontPID = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;
-    CGWindowID frontWindow = kCGNullWindowID;
-    CFArrayRef onScreen = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-                                                     kCGNullWindowID);
-    if (onScreen) {
-        for (NSDictionary *info in (__bridge NSArray *)onScreen) {
-            if ([info[(id)kCGWindowLayer] intValue] == 0 && [info[(id)kCGWindowOwnerPID] intValue] == frontPID) {
-                frontWindow = [info[(id)kCGWindowNumber] unsignedIntValue];
-                break;
-            }
-        }
-        CFRelease(onScreen);
-    }
-
-    dispatch_async(g_chromePrefetchQueue, ^{
-        NSMutableDictionary<NSString *, NSString *> *originalTabs = [NSMutableDictionary dictionary];
-        NSMutableDictionary<NSString *, NSData *> *lastPicture = [NSMutableDictionary dictionary];
-        NSMutableSet<NSString *> *raisedWindows = [NSMutableSet set];
-        NSMutableSet<NSString *> *tried = [NSMutableSet set];
-        RingMediaIgnoreTabChanges(30.0);
-
-        // 1. Start loading every tab at once. Steps run on the live capture
-        //    queue, so a capture from the ring's opening never sees a tab half
-        //    painted.
-        dispatch_sync(g_liveCaptureQueue, ^{
-            for (RingEntry *entry in firstTargets) {
-                if (!originalTabs[entry.chromeWindowID]) {
-                    NSString *originalTab = chromeActiveTab(entry.chromeWindowID, NULL);
-                    if (!originalTab) continue;
-                    originalTabs[entry.chromeWindowID] = originalTab;
-                }
-                @synchronized ([NSAppleScript class]) {
-                    if (!ringStillOpen(generation)) return;
-                    showChromeTabQuietly(entry.chromeWindowID, entry.chromeTabID);
-                }
-            }
-            for (NSString *chromeWindowID in originalTabs) {
-                @synchronized ([NSAppleScript class]) {
-                    if (!ringStillOpen(generation)) return;
-                    showChromeTabQuietly(chromeWindowID, originalTabs[chromeWindowID]);
-                }
-            }
-        });
-
-        // 2. Capture them one by one.
-        while (ringStillOpen(generation)) {
-            @autoreleasepool {
-                __block RingEntry *target = nil;
-                dispatch_sync(dispatch_get_main_queue(), ^{ target = hiddenTabsToLoad(tried).firstObject; });
-                if (!target) break;
-                NSString *chromeWindowID = target.chromeWindowID, *tabID = target.chromeTabID;
-                NSString *tabKey = tabThumbnailKey(target);
-                CGWindowID windowID = target.windowID;
-                [tried addObject:tabKey];
-
-                dispatch_sync(g_liveCaptureQueue, ^{
-                    if (!ringStillOpen(generation)) return;
-                    if (windowFullyCovered(windowID) && ![raisedWindows containsObject:chromeWindowID]) {
-                        if (!raiseChromeWindowQuietly(chromeWindowID)) return;
-                        [raisedWindows addObject:chromeWindowID];
-                        usleep(150000);   // Chrome paints the window again
-                    }
-                    if (windowFullyCovered(windowID)) return;
-                    SCWindow *window = shareableWindow(windowID);
-                    if (!window) return;
-                    if (!originalTabs[chromeWindowID]) {
-                        NSString *originalTab = chromeActiveTab(chromeWindowID, NULL);
-                        if (!originalTab) return;
-                        originalTabs[chromeWindowID] = originalTab;
-                    }
-                    if (!lastPicture[chromeWindowID]) {
-                        // The window as it is now, to tell a repainted tab from an unchanged window.
-                        CGImageRef before = captureWindowImage(window);
-                        NSData *beforeData = encodedThumbnailFromCGImage(before);
-                        if (before) CGImageRelease(before);
-                        if (beforeData) lastPicture[chromeWindowID] = beforeData;
-                    }
-                    // Under the Apple Event lock: once the ring has closed, the
-                    // pick may already have switched this window, and wins.
-                    BOOL switched = NO;
-                    @synchronized ([NSAppleScript class]) {
-                        switched = ringStillOpen(generation) && showChromeTabQuietly(chromeWindowID, tabID);
-                    }
-                    if (!switched) return;
-
-                    // Pages started loading in step 1; most are ready by now.
-                    NSTimeInterval started = NSProcessInfo.processInfo.systemUptime;
-                    BOOL loading = YES;
-                    while (ringStillOpen(generation) && NSProcessInfo.processInfo.systemUptime - started < 2.0) {
-                        usleep(60000);
-                        loading = chromeTabIsLoading(chromeWindowID, tabID);
-                        if (!loading) break;
-                    }
-                    // A page still loading would be stored blank; it is tried
-                    // again the next time the ring opens.
-                    if (loading || !ringStillOpen(generation)) return;
-                    usleep(100000);   // a few frames for the page to paint
-                    NSString *pageURL = nil;
-                    if (![chromeActiveTab(chromeWindowID, &pageURL) isEqualToString:tabID]) return;
-                    NSString *capturedID = nil;
-                    CGImageRef image = captureVerifiedChromeWindow(window, chromeWindowID, &capturedID, &pageURL);
-                    if (![capturedID isEqualToString:tabID]) { if (image) CGImageRelease(image); return; }
-                    NSData *data = encodedThumbnailFromCGImage(image);
-                    if (image) CGImageRelease(image);
-                    if (!ringStillOpen(generation)) return;
-                    // Media that started only because the tab was opened here stops again.
-                    RingMediaQuietLoadedTab(chromeWindowID, tabID);
-                    if (!data || [data isEqualToData:lastPicture[chromeWindowID]]) return;
-                    lastPicture[chromeWindowID] = data;
-                    storeLoadedTabPicture(tabKey, windowID, pageURL, data);
-                    NSLog(@"[Chrome thumbnails] loaded hidden tab %@", tabKey);
-                });
-            }
-        }
-
-        // Put back the tab each window showed, unless the user just picked a
-        // card in that window: the ring switches to it, and the pick wins.
-        // The Apple Event lock orders this against the pick's own switch.
-        for (NSString *chromeWindowID in originalTabs) {
-            @synchronized ([NSAppleScript class]) {
-                NSString *pickedWindow = nil;
-                ringPickMade(&pickedWindow);
-                if ([pickedWindow isEqualToString:chromeWindowID]) continue;
-                NSString *originalTab = originalTabs[chromeWindowID];
-                if (![chromeActiveTab(chromeWindowID, NULL) isEqualToString:originalTab]) {
-                    showChromeTabQuietly(chromeWindowID, originalTab);
-                }
-            }
-        }
-        // A raised Chrome window goes back behind the window that was in
-        // front, unless a card was picked: then that card's window comes up.
-        if (raisedWindows.count && frontWindow != kCGNullWindowID && !ringPickMade(NULL)) {
-            focusWindowExactly(frontPID, frontWindow);
-        }
-        RingMediaIgnoreTabChanges(0.4);
-        atomic_store(&g_hiddenTabLoaderRunning, false);
-    });
+    // Skriveni tabovi čuvaju poslednji snimak; nikada ih ne aktiviraj radi slike.
+    (void)generation;
 }
 
 static void releaseTabThumbnailRequest(RingEntry *entry) {
@@ -5056,7 +5190,7 @@ static void schedulePendingThumbnailCapture(NSArray<RingEntry *> *entries) {
     if (!g_thumbnailPlanningQueue) {
         g_thumbnailPlanningQueue = dispatch_queue_create("touchpad.ring.thumbnail-planning", DISPATCH_QUEUE_SERIAL);
     }
-    refreshThumbnailsNow(0, 3.0);
+    refreshThumbnailsNow(0, 0.6);
     NSArray<RingEntry *> *entrySnapshot = [entries copy];
     dispatch_async(g_thumbnailPlanningQueue, ^{
         if (atomic_load(&g_gestureActive)) return;
@@ -5266,10 +5400,19 @@ static BOOL suppressTouchFrameAfterFourFingers(int activeCount, BOOL *waitingFor
 
 static _Atomic(bool) g_touchReopenBlocked=false;
 
+static BOOL isQuickThreeFingerTap(uint64_t started,uint64_t now,double travel,BOOL eligible) {
+    return eligible && started>0 && now>=started && now-started<500000000ULL && travel<0.12;
+}
+
 // Nova tri prsta počinju nov izbor i kada preostali prsti nisu podignuti.
 static void beginTouchGesture(MTDeviceRef device, double x, double y) {
     atomic_store(&g_gestureActive, true);
     atomic_store(&g_gestureEnding, false);
+    atomic_store(&g_fourFingerShortcutHeld, false);
+    atomic_store(&g_fourFingerReleaseCandidateNanos, 0);
+    atomic_store(&g_touchStartedNanos,(uint64_t)(NSProcessInfo.processInfo.systemUptime*1000000000.0));
+    atomic_store(&g_quickTapEligible,true);
+    g_touchMaxTravel=0;
     hideSystemCursorForGesture();
     g_previousX = x;
     g_previousY = y;
@@ -5326,6 +5469,7 @@ static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouche
         if (previousCount!=activeCount) diagnosticEvent(@"touch_count",@{@"previous":@(previousCount),@"current":@(activeCount)});
         BOOL hadThreeFingers = threeFingersLastFrame;
         threeFingersLastFrame = activeCount == 3;
+        BOOL touchCountChanged = previousCount != activeCount;
 
         if (activeCount >= 3) {
             uint64_t nowNanos = (uint64_t)(NSProcessInfo.processInfo.systemUptime * 1000000000.0);
@@ -5336,23 +5480,50 @@ static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouche
         }
 
         BOOL gestureActive = atomic_load(&g_gestureActive);
-        BOOL suppressed = suppressTouchFrameAfterFourFingers(activeCount, &suppressUntilFourFingerLift);
-        atomic_store(&g_touchReopenBlocked,suppressUntilFourFingerLift);
-        if (activeCount >= 4) {
-            if (previousCount<4) diagnosticEvent(@"four_finger_cancel",nil);
-            if (gestureActive) {
-                // Invalidate any pending normal lift completion so it cannot
-                // activate the previously selected entry after a four-touch.
-                uint64_t generation = atomic_fetch_add(&g_gestureGeneration, 1) + 1;
-                atomic_store(&g_gestureEnding, true);
-                atomic_store(&g_gestureActive, false);
-                dispatch_async(dispatch_get_main_queue(), ^{ finishGesture(generation, -1); });
+        int shortcutTrigger=atomic_load(&g_settingShortcutTrigger);
+        BOOL fourOpensSection=!fourFingersCancelOpenMenu(shortcutTrigger) && gestureActive;
+        if (!fourOpensSection) {
+            BOOL suppressed = suppressTouchFrameAfterFourFingers(activeCount, &suppressUntilFourFingerLift);
+            atomic_store(&g_touchReopenBlocked,suppressUntilFourFingerLift);
+            if (activeCount >= 4) {
+                atomic_store(&g_quickTapEligible,false);
+                if (previousCount<4) diagnosticEvent(@"four_finger_cancel",nil);
+                if (gestureActive) {
+                    // Invalidate any pending normal lift completion so it cannot
+                    // activate the previously selected entry after a four-touch.
+                    uint64_t generation = atomic_fetch_add(&g_gestureGeneration, 1) + 1;
+                    atomic_store(&g_gestureEnding, true);
+                    atomic_store(&g_gestureActive, false);
+                    atomic_store(&g_fourFingerShortcutHeld, false);
+                    atomic_store(&g_fourFingerReleaseCandidateNanos, 0);
+                    dispatch_async(dispatch_get_main_queue(), ^{ finishGesture(generation, -1); });
+                }
+                return 0;
             }
-            return 0;
-        }
-
-        if (suppressed) {
-            return 0;
+            if (suppressed) return 0;
+        } else if (activeCount >= 4) {
+            atomic_store(&g_quickTapEligible,false);
+            atomic_store(&g_fourFingerReleaseCandidateNanos, 0);
+            if (!atomic_exchange(&g_fourFingerShortcutHeld, true)) {
+                diagnosticEvent(@"four_finger_shortcuts",nil);
+                uint64_t generation=atomic_load(&g_gestureGeneration);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (generation==atomic_load(&g_gestureGeneration) && atomic_load(&g_gestureActive))
+                        applyShortcutSection();
+                });
+            }
+        } else if (atomic_load(&g_fourFingerShortcutHeld) && activeCount==3) {
+            // Kratka pauza: podizanje svih prstiju prolazi kroz tri, pa meni prečica ostaje.
+            uint64_t nowNanos=(uint64_t)(NSProcessInfo.processInfo.systemUptime*1000000000.0);
+            uint64_t candidate=atomic_load(&g_fourFingerReleaseCandidateNanos);
+            if (candidate==0) atomic_store(&g_fourFingerReleaseCandidateNanos, nowNanos);
+            else if (nowNanos-candidate>=70000000ULL) releaseFourFingerShortcutHold();
+        } else if (activeCount<3 && atomic_load(&g_fourFingerShortcutHeld) &&
+                   (atomic_load(&g_mouseGestureActive) || atomic_load(&g_keyboardGestureActive))) {
+            // Miš i tastatura ne puštaju izbor skidanjem prstiju, ali četvrti prst više nije pritisnut.
+            releaseFourFingerShortcutHold();
+        } else {
+            atomic_store(&g_fourFingerReleaseCandidateNanos, 0);
         }
 
         // Dodir trackpada ne završava meni otvoren mišem ili tastaturom.
@@ -5374,18 +5545,27 @@ static int ringTouchCallback(MTDeviceRef device, MTTouch *touches, int numTouche
                 !atomic_load(&g_keyboardGestureActive)) {
                 uint64_t generation=atomic_load(&g_gestureGeneration);
                 NSInteger selection=selectionForLift();
-                diagnosticEvent(@"touch_release",@{@"selection":@(selection)});
+                uint64_t now=(uint64_t)(NSProcessInfo.processInfo.systemUptime*1000000000.0);
+                BOOL quick=!atomic_load(&g_settingCurrentWindowInCenter) &&
+                    isQuickThreeFingerTap(atomic_load(&g_touchStartedNanos),now,g_touchMaxTravel,
+                    atomic_exchange(&g_quickTapEligible,false) && selection==-1 &&
+                    !atomic_load(&g_fourFingerShortcutHeld) &&
+                    !(CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState)&kCGEventFlagMaskCommand));
+                if (quick) selection=kQuickPreviousSelection;
+                diagnosticEvent(@"touch_release",@{@"selection":@(selection),@"quickTap":@(quick)});
                 atomic_store(&g_gestureEnding,true);
                 dispatch_async(dispatch_get_main_queue(), ^{ finishGesture(generation,selection); });
                 return 0;
             }
 
-            if (activeCount == 3) {
-                double x = sumX / 3.0, y = sumY / 3.0;
-                if (hadThreeFingers) {
+            if (activeCount >= 3) {
+                double x = sumX / activeCount, y = sumY / activeCount;
+                // Novi ili podignuti prst pomera centar dodira, a to nije pokret ka kartici.
+                if (previousCount>=3 && !touchCountChanged) {
                     moveRingPointer(x - g_previousX, (y - g_previousY) * g_trackpadAspect,
                                     atomic_load(&g_windowEntryCount));
                 }
+                g_touchMaxTravel=MAX(g_touchMaxTravel,hypot(g_pointerX,g_pointerY));
                 // After a finger is lifted and put back, its new spot is not motion.
                 g_previousX = x;
                 g_previousY = y;
@@ -5628,22 +5808,28 @@ static void loadSettings(void) {
     Boolean persistentValid=false;
     CFIndex persistentMask=CFPreferencesGetAppIntegerValue(CFSTR("PersistentShortcuts"),kSettingsID,&persistentValid);
     atomic_store(&g_persistentShortcutMask,persistentValid ? (unsigned)persistentMask&63 : 0);
+    Boolean triggerValid=false;
+    CFIndex shortcutTrigger=CFPreferencesGetAppIntegerValue(CFSTR("ShortcutTrigger"),kSettingsID,&triggerValid);
+    atomic_store(&g_settingShortcutTrigger,
+                 triggerValid && shortcutTrigger>=ShortcutTriggerNone && shortcutTrigger<=ShortcutTriggerBoth
+                     ? (int)shortcutTrigger : ShortcutTriggerCommand);
     Boolean valid = false;
     CFIndex titles = CFPreferencesGetAppIntegerValue(CFSTR("CardTitles"), kSettingsID, &valid);
     atomic_store(&g_settingCardTitles, valid && titles >= CardTitlesAll && titles <= CardTitlesNone
-                                           ? (int)titles : CardTitlesAll);
+                                           ? (int)titles : CardTitlesNone);
     // AutoPauseMedia replaces PauseVideoOnTabSwitch and keeps its old value.
     g_mediaOptions.pauseWhenLeaving = settingBool(CFSTR("AutoPauseMedia"),
-                                                  settingBool(CFSTR("PauseVideoOnTabSwitch"), YES));
-    g_mediaOptions.resumeWhenReturning = settingBool(CFSTR("AutoResumeMedia"), YES);
+                                                  settingBool(CFSTR("PauseVideoOnTabSwitch"), NO));
+    g_mediaOptions.resumeWhenReturning = settingBool(CFSTR("AutoResumeMedia"), NO);
     g_mediaOptions.resumeManuallyPaused = settingBool(CFSTR("MediaResumeManuallyPaused"), NO);
     g_mediaOptions.followAllTabChanges = settingBool(CFSTR("MediaFollowAllTabChanges"), YES);
     g_mediaOptions.onlyWhenNextTabHasVideo = settingBool(CFSTR("MediaOnlyWhenNextTabHasVideo"), NO);
     g_mediaOptions.rewindAfterLongPause = settingBool(CFSTR("MediaRewindAfterLongPause"), YES);
-    atomic_store(&g_settingFinderTabsOneCard, settingBool(CFSTR("FinderTabsAsOneCard"), YES));
+    atomic_store(&g_settingFinderTabsOneCard, settingBool(CFSTR("FinderTabsAsOneCard"), NO));
     Boolean groupingValid = false;
     CFIndex grouping = CFPreferencesGetAppIntegerValue(CFSTR("CardGrouping"), kSettingsID, &groupingValid);
     atomic_store(&g_settingCardGrouping, groupingValid && grouping == CardGroupingApps ? CardGroupingApps : CardGroupingWindows);
+    atomic_store(&g_settingCurrentWindowInCenter, settingBool(CFSTR("CurrentWindowInCenter"), NO));
     atomic_store(&g_settingSoundEffects, settingBool(CFSTR("SoundEffects"), NO));
     atomic_store(&g_settingMouseHoldToSelect, settingBool(CFSTR("MouseHoldToSelect"), YES));
     atomic_store(&g_settingShowSiteIcons, settingBool(CFSTR("ShowSiteIcons"), YES));
@@ -5655,11 +5841,11 @@ static void loadSettings(void) {
     Boolean highlightValid = false;
     CFIndex highlight = CFPreferencesGetAppIntegerValue(CFSTR("HighlightColor"), kSettingsID, &highlightValid);
     atomic_store(&g_settingHighlightColor, highlightValid && highlight >= HighlightSystem && highlight <= HighlightWhite
-                                               ? (int)highlight : HighlightWhite);
-    atomic_store(&g_settingShowLight, settingBool(CFSTR("ShowLight"), NO));
+                                             ? (int)highlight : HighlightSystem);
+    atomic_store(&g_settingShowLight, settingBool(CFSTR("ShowLight"), YES));
     Boolean dimmingValid = false;
     CFIndex dimming = CFPreferencesGetAppIntegerValue(CFSTR("BackdropDimming"), kSettingsID, &dimmingValid);
-    atomic_store(&g_settingBackdropDimming, dimmingValid ? (int)MIN(MAX(dimming, 0), 90) : 38);
+    atomic_store(&g_settingBackdropDimming, dimmingValid ? (int)MIN(MAX(dimming, 0), 90) : 50);
     NSArray *backdrop = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("BackdropColor"), kSettingsID));
     if ([backdrop isKindOfClass:[NSArray class]] && backdrop.count == 3) {
         g_backdropColor = [NSColor colorWithSRGBRed:[backdrop[0] doubleValue] green:[backdrop[1] doubleValue]
@@ -5667,7 +5853,10 @@ static void loadSettings(void) {
     }
     Boolean blurValid = false;
     CFIndex blurRadius = CFPreferencesGetAppIntegerValue(CFSTR("BlurRadius"), kSettingsID, &blurValid);
-    atomic_store(&g_settingBlurRadius, blurValid ? (int)MIN(MAX(blurRadius, 0), 40) : 15);
+    atomic_store(&g_settingBlurRadius, blurValid ? (int)MIN(MAX(blurRadius, 0), 40) : 20);
+    Boolean zoomValid = false;
+    CFIndex zoom = CFPreferencesGetAppIntegerValue(CFSTR("BackdropZoom"), kSettingsID, &zoomValid);
+    atomic_store(&g_settingBackdropZoom, zoomValid ? (int)MIN(MAX(zoom, 0), 25) : 5);
     Boolean mouseButtonValid = false;
     CFIndex mouseButton = CFPreferencesGetAppIntegerValue(CFSTR("MouseActivationButton"), kSettingsID,
                                                           &mouseButtonValid);
@@ -5812,6 +6001,7 @@ static NSString *lastOutputLine(NSString *output) {
 @property(nonatomic, strong) SettingsWindow *window;
 @property(nonatomic, strong) NSTextField *javaScriptHint;
 @property(nonatomic, strong) NSTextField *blurLabel;
+@property(nonatomic, strong) NSTextField *zoomLabel;
 @property(nonatomic, strong) NSTextField *dimmingLabel;
 @property(nonatomic, strong) NSTextField *gestureWarning;
 @property(nonatomic, strong) NSTextField *mouseActivationLabel;
@@ -5976,6 +6166,10 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
     NSButton *appIcons = [NSButton checkboxWithTitle:@"Ikonice aplikacija na karticama"
                                               target:self action:@selector(appIconsChanged:)];
     appIcons.state = atomic_load(&g_settingShowAppIcons) ? NSControlStateValueOn : NSControlStateValueOff;
+    NSButton *currentCenter = [NSButton checkboxWithTitle:@"Trenutni prozor ili tab u centru"
+                                                   target:self action:@selector(currentWindowInCenterChanged:)];
+    currentCenter.state = atomic_load(&g_settingCurrentWindowInCenter)
+        ? NSControlStateValueOn : NSControlStateValueOff;
 
     NSTextField *pointerLabel = [self noteWithText:@"Pokazivač"];
     NSSegmentedControl *pointer = [NSSegmentedControl segmentedControlWithLabels:@[@"Strelica", @"Krug", @"Nevidljiv"]
@@ -6074,6 +6268,13 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
     blur.controlSize = NSControlSizeSmall;
     [blur.widthAnchor constraintEqualToConstant:kSettingsColumnWidth].active = YES;
     [blur.heightAnchor constraintEqualToConstant:24].active = YES;
+    self.zoomLabel = [self noteWithText:@""];
+    [self updateZoomLabel];
+    NSSlider *zoom = [NSSlider sliderWithValue:atomic_load(&g_settingBackdropZoom) minValue:0 maxValue:25
+                                        target:self action:@selector(backdropZoomChanged:)];
+    zoom.controlSize = NSControlSizeSmall;
+    [zoom.widthAnchor constraintEqualToConstant:kSettingsColumnWidth].active = YES;
+    [zoom.heightAnchor constraintEqualToConstant:24].active = YES;
 
     NSButton *hideIcon = [NSButton checkboxWithTitle:@"Sakrij ikonicu iz gornje trake"
                                               target:self action:@selector(hideIconChanged:)];
@@ -6099,12 +6300,13 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
     NSTextField *lookTitle = [self sectionTitle:@"Izgled menija"];
     NSTextField *menuBarTitle = [self sectionTitle:@"Gornja traka"];
 
-    NSStackView *cardsColumn = [self settingsColumn:@[cardsTitle, grouping, titlesLabel, titles, siteIcons, appIcons,
+    NSStackView *cardsColumn = [self settingsColumn:@[cardsTitle, grouping, currentCenter, titlesLabel, titles, siteIcons, appIcons,
                                                       finderTabs, lookTitle, pointerLabel, pointer, highlightLabel, highlight,
                                                       light, self.dimmingLabel, backdropRow,
-                                                      self.blurLabel, blur, sounds]];
+                                                      self.blurLabel, blur, self.zoomLabel, zoom, sounds]];
     [cardsColumn setCustomSpacing:kSettingsTitleGap afterView:cardsTitle];
     [cardsColumn setCustomSpacing:14 afterView:grouping];
+    [cardsColumn setCustomSpacing:14 afterView:currentCenter];
     [cardsColumn setCustomSpacing:6 afterView:titlesLabel];
     [cardsColumn setCustomSpacing:14 afterView:titles];
     [cardsColumn setCustomSpacing:kSettingsSectionGap afterView:finderTabs];
@@ -6118,14 +6320,27 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
     [cardsColumn setCustomSpacing:14 afterView:backdropRow];
     [cardsColumn setCustomSpacing:6 afterView:self.blurLabel];
     [cardsColumn setCustomSpacing:14 afterView:blur];
+    [cardsColumn setCustomSpacing:6 afterView:self.zoomLabel];
+    [cardsColumn setCustomSpacing:14 afterView:blur];
 
     NSTextField *shortcutsTitle=[self sectionTitle:@"Prečice"];
+    NSTextField *triggerLabel=[self noteWithText:@"Poseban meni"];
+    NSSegmentedControl *trigger=[NSSegmentedControl segmentedControlWithLabels:@[@"Nema", @"Cmd", @"4 prsta", @"Oba"]
+                                                                   trackingMode:NSSegmentSwitchTrackingSelectOne
+                                                                         target:self
+                                                                         action:@selector(shortcutTriggerChanged:)];
+    trigger.controlSize=NSControlSizeSmall;
+    trigger.font=[NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+    int triggerMode=atomic_load(&g_settingShortcutTrigger);
+    if (triggerMode<ShortcutTriggerNone || triggerMode>ShortcutTriggerBoth) triggerMode=ShortcutTriggerCommand;
+    trigger.selectedSegment=triggerMode;
+    [trigger.widthAnchor constraintEqualToConstant:kSettingsColumnWidth].active=YES;
     NSMutableArray *shortcutRows=[NSMutableArray array];
     NSArray *shortcutNames=@[@"Downloads",@"Desktop",@"Documents",@"Novi Chrome tab",@"Novi YouTube tab",@"Spusti sve prozore"];
     for (NSUInteger i=0;i<shortcutNames.count;i++) {
         NSTextField *name=[NSTextField labelWithString:shortcutNames[i]];
         [name.widthAnchor constraintEqualToConstant:145].active=YES;
-        NSButton *cmd=[NSButton checkboxWithTitle:@"Cmd" target:self action:@selector(shortcutOptionChanged:)];
+        NSButton *cmd=[NSButton checkboxWithTitle:@"Meni" target:self action:@selector(shortcutOptionChanged:)];
         cmd.tag=i;
         cmd.state=(atomic_load(&g_shortcutMask)&(1u<<i)) ? NSControlStateValueOn : NSControlStateValueOff;
         NSButton *always=[NSButton checkboxWithTitle:@"Stalno" target:self action:@selector(shortcutOptionChanged:)];
@@ -6136,17 +6351,20 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
         row.spacing=10;
         [shortcutRows addObject:row];
     }
-    NSTextField *shortcutNote=[self noteWithText:@"Cmd: prikaži dok držiš taster. Stalno: prikaži među aplikacijama i bez Cmd-a. Spusti sve prozore spušta prozore u Dock; ostale prečice otvaraju tab ili folder."];
+    NSTextField *shortcutNote=[self noteWithText:@"Nema: poseban meni se ne otvara, a četiri prsta i dalje poništavaju izbor. Cmd: drži taster dok je meni otvoren. 4 prsta: dodaj četvrti prst; podizanje tog prsta vraća prozore. Oba: rade i Cmd i četvrti prst. Meni bira šta ulazi u poseban meni. Stalno prikazuje prečicu među aplikacijama i bez njega. Spusti sve prozore spušta prozore u Dock; ostale prečice otvaraju tab ili folder."];
     NSStackView *mouseColumn = [self settingsColumn:@[mouseTitle, self.mouseActivationLabel, mouseButtons, holdToSelect,
                                                       self.mouseLearnStatus, mouseNote, menuBarTitle, hideIcon, hideNote,
-                                                      startAtLogin, shortcutsTitle, shortcutRows[0], shortcutRows[1],
-                                                      shortcutRows[2], shortcutRows[3], shortcutRows[4], shortcutRows[5], shortcutNote]];
+                                                      startAtLogin, shortcutsTitle, triggerLabel, trigger,
+                                                      shortcutRows[0], shortcutRows[1], shortcutRows[2], shortcutRows[3],
+                                                      shortcutRows[4], shortcutRows[5], shortcutNote]];
     [mouseColumn setCustomSpacing:kSettingsTitleGap afterView:mouseTitle];
     [mouseColumn setCustomSpacing:kSettingsSectionGap afterView:mouseNote];
     [mouseColumn setCustomSpacing:kSettingsTitleGap afterView:menuBarTitle];
     [mouseColumn setCustomSpacing:6 afterView:hideIcon];
     [mouseColumn setCustomSpacing:kSettingsSectionGap afterView:startAtLogin];
     [mouseColumn setCustomSpacing:kSettingsTitleGap afterView:shortcutsTitle];
+    [mouseColumn setCustomSpacing:6 afterView:triggerLabel];
+    [mouseColumn setCustomSpacing:8 afterView:trigger];
 
     NSMutableArray<NSView *> *mediaColumnRows = [NSMutableArray arrayWithObject:mediaTitle];
     [mediaColumnRows addObjectsFromArray:mediaRows];
@@ -6360,6 +6578,12 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
     scanWindowsNow();   // the next ring already shows the new cards
 }
 
+- (void)currentWindowInCenterChanged:(NSButton *)button {
+    BOOL enabled = button.state == NSControlStateValueOn;
+    atomic_store(&g_settingCurrentWindowInCenter, enabled);
+    storeSetting(CFSTR("CurrentWindowInCenter"), enabled ? kCFBooleanTrue : kCFBooleanFalse);
+}
+
 - (void)pointerStyleChanged:(NSSegmentedControl *)control {
     int style = (int)MIN(MAX(control.selectedSegment, PointerStyleArrow), PointerStyleHidden);
     atomic_store(&g_settingPointerStyle, style);
@@ -6473,8 +6697,33 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
     [self updateBlurLabel];
 }
 
+- (void)updateZoomLabel {
+    int zoom = atomic_load(&g_settingBackdropZoom);
+    self.zoomLabel.stringValue = zoom > 0
+        ? [NSString stringWithFormat:@"Uvećanje pozadine: %d%%", zoom]
+        : @"Uvećanje pozadine: isključeno";
+}
+
+- (void)backdropZoomChanged:(NSSlider *)slider {
+    int zoom = (int)lround(slider.doubleValue);
+    atomic_store(&g_settingBackdropZoom, zoom);
+    CFNumberRef value = CFNumberCreate(NULL, kCFNumberIntType, &zoom);
+    storeSetting(CFSTR("BackdropZoom"), value);
+    CFRelease(value);
+    [self updateZoomLabel];
+}
+
 - (void)openDiagnosticLogs:(id)sender {
     [NSWorkspace.sharedWorkspace openURL:[NSURL fileURLWithPath:diagnosticDirectory()]];
+}
+
+- (void)shortcutTriggerChanged:(NSSegmentedControl *)control {
+    int mode=(int)MIN(MAX(control.selectedSegment, ShortcutTriggerNone), ShortcutTriggerBoth);
+    atomic_store(&g_settingShortcutTrigger, mode);
+    CFNumberRef value=CFNumberCreate(NULL, kCFNumberIntType, &mode);
+    storeSetting(CFSTR("ShortcutTrigger"), value);
+    CFRelease(value);
+    if (atomic_load(&g_gestureActive)) applyShortcutSection();
 }
 
 - (void)shortcutOptionChanged:(NSButton *)button {
@@ -6659,6 +6908,23 @@ int main(int argc, const char *argv[]) {
         printf("Place three fingers and move toward a direction to select. Lift to activate the selected window.\n");
         printf("Press Ctrl-C to stop. Three-finger drag should be disabled for a clean test.\n");
         fflush(stdout);
+        updateRecentWindowHistory();
+        g_recentWindowTimer=[NSTimer scheduledTimerWithTimeInterval:0.1 repeats:YES block:^(NSTimer *timer) {
+            if (!atomic_load(&g_gestureActive) && !atomic_load(&g_gestureEnding)) updateRecentWindowHistory();
+        }];
+        // Build the hidden panel at startup so the first three-finger gesture
+        // does not pay for creating its window and layer tree.
+        ensurePanel(NSScreen.mainScreen);
+        // Prime ScreenCaptureKit before the first gesture; the first content
+        // inventory is much slower than later requests on this Mac.
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            if (!CGPreflightScreenCaptureAccess()) return;
+            [SCShareableContent getShareableContentExcludingDesktopWindows:NO onScreenWindowsOnly:YES
+                completionHandler:^(SCShareableContent *content, NSError *error) {
+                    (void)content;
+                    (void)error;
+                }];
+        });
         startMultitouchDevices();
         if (!g_devices || CFArrayGetCount(g_devices) == 0) {
             fprintf(stderr, "[ERROR] No Multitouch devices found.\n");
@@ -6689,8 +6955,8 @@ int main(int argc, const char *argv[]) {
         g_windowScanQueue = dispatch_queue_create("touchpad.ring.window-scan", DISPATCH_QUEUE_SERIAL);
         g_scanTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_windowScanQueue);
         dispatch_source_set_timer(g_scanTimer,
-                                  dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                                  (uint64_t)(2.0 * NSEC_PER_SEC),
+                                  dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                                  (uint64_t)(0.5 * NSEC_PER_SEC),
                                   (uint64_t)(100 * NSEC_PER_MSEC));
         dispatch_source_set_event_handler(g_scanTimer, ^{ scanWindowsNow(); });
         startWindowChangeWatch();

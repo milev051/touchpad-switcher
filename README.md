@@ -279,24 +279,12 @@ Chrome tabovi ostaju uvek.
 Za Chrome se slika čuva zasebno za svaki tab. U trenutku snimanja Touchpad
 Switcher pita Chrome koji je tab aktivan, da snimak ne završi na pogrešnom
 tabu. Chrome crta samo tab koji je napred, pa tab koji nikad nije bio vidljiv
-nema sliku. Dok je meni otvoren, zamućenje sakriva prozore iza njega, pa se
-takvi tabovi učitaju i snime tu:
-
-1. svaki tab bez slike se na trenutak prebaci napred, pa Chrome počne da
-   učitava sve odjednom, u pozadini;
-2. zatim se jedan po jedan ponovo prebaci napred, snimi kad se stranica
-   učita, i vrati se tab koji je bio pre.
-
-Prvo ide tab na kome su prsti. Ako se izabere kartica iz istog prozora,
-ostaje izabrani tab. Chrome ne crta prozor koji je ceo pokriven drugim
-prozorom, pa se takav prozor za snimak podigne iza zamućenja (Chrome ostaje u
-pozadini), a posle se vrati prozor koji je bio napred, osim ako je izabrana
-kartica. Stranica koja se nije učitala za 2 s dobije sliku pri sledećem
-otvaranju menija. Video koji je krenuo samo zato što je tab otvoren se
-zaustavi, i narednih 15 s dok je tab u pozadini; muzika koja je već svirala
-se ne dira (za to treba **Allow JavaScript from Apple Events**). Dok tab ne
-dobije sliku, kartica ima naslov i domen (YouTube poster se više ne koristi). YouTube snimak ostaje dok je
-isti video, i kad se promeni vreme ili pozicija u listi.
+nema sliku. Skriveni tabovi se ne aktiviraju radi snimanja. Ako tab još nema snimak,
+prikazuje se ikonica sajta i naslov prema podešavanju. Kada ga korisnik
+otvori, snimak se sačuva za sledeći pregled. Meni ne menja aktivni tab ni
+redosled Chrome prozora radi thumbnaila, pa snimanje ne pokreće playback.
+YouTube snimak ostaje dok je isti video, i kad se promeni vreme ili
+pozicija u listi.
 
 ### Meni u gornjoj traci
 
@@ -305,11 +293,13 @@ Ikonica šake u gornjoj traci otvara panel sa podešavanjima:
 | podešavanje | šta radi | podrazumevano |
 |---|---|---|
 | Kartice | prozori i tabovi, ili samo aplikacije (jedna kartica po aplikaciji, Chrome po prozoru, jer su prozori obično različiti profili) | prozori i tabovi |
-| Naslovi, pokazivač, zvuci, zamućenje | izgled menija | svi naslovi, nevidljiv pokazivač, bez zvuka, zamućenje 15 |
-| Boja pokazivača i svetla | boja sistema (akcentna boja iz System Settings > Appearance) ili belo | belo |
-| Svetlo u smeru prstiju | svetlo iza kartica koje pokazuje smer prstiju | isključeno |
-| Pozadina iza kartica | boja preko (zamućenog) ekrana i njena jačina, 0 do 90% | skoro crna, 38% |
-| Finder tabovi jednog prozora kao jedna kartica | tabovi jednog Finder prozora daju jednu karticu | uključeno |
+| Naslovi, pokazivač, zvuci, zamućenje | izgled menija | bez naslova, nevidljiv pokazivač, bez zvuka, zamućenje 20 |
+| Boja pokazivača i svetla | boja sistema (akcentna boja iz System Settings > Appearance) ili belo | boja sistema |
+| Svetlo u smeru prstiju | svetlo iza kartica koje pokazuje smer prstiju | uključeno |
+| Pozadina iza kartica | boja preko ekrana i njena jačina, 0 do 90% | skoro crna, 50% |
+| Uvećanje pozadine | snimak ekrana iza postojećeg blura blago se uvećava i pomera suprotno pokretu | 5% |
+| Trenutni prozor ili tab u centru | zamenjuje X snimkom aktivnog prozora i izdvaja ga iz kruga | isključeno |
+| Finder tabovi jednog prozora kao jedna kartica | tabovi jednog Finder prozora daju jednu karticu | isključeno |
 | Ikonice sajtova na Chrome karticama | ikonica sajta u donjem levom uglu (Chrome ikonica kad sajt nema svoju); preuzima se sa samog sajta, bez drugih servisa (`ring_favicons.m`) | uključeno |
 | Ikonice aplikacija na karticama | ikonica aplikacije u donjem levom uglu ostalih kartica | uključeno |
 | Sakrij ikonicu iz gornje trake | uklanja ikonicu | isključeno |
@@ -324,8 +314,8 @@ prečica) ili se Chrome napusti, pokreće se JavaScript u tabu:
 
 | opcija | šta radi | podrazumevano |
 |---|---|---|
-| Zaustavi video kad napustiš tab ili Chrome | pauzira video i zvuk u tabu koji nije više na ekranu | uključeno |
-| Pokreni ga ponovo kad se vratiš | nastavlja samo ono što je aplikacija sama zaustavila | uključeno |
+| Zaustavi video kad napustiš tab ili Chrome | pauzira video i zvuk u tabu koji nije više na ekranu | isključeno |
+| Pokreni ga ponovo kad se vratiš | nastavlja samo ono što je aplikacija sama zaustavila | isključeno |
 | Pokreni i video koji si sam pauzirao | pri povratku na tab pokreće i video koji je korisnik ručno zaustavio | isključeno |
 | Važi i za klik na tab i prečice | bez ove opcije pravila važe samo za prelazak preko menija | uključeno |
 | Zaustavi samo ako novi tab ima video | stari video svira dalje dok ne pređeš na tab sa već pokrenutim videom, a izlazak iz Chrome-a ga ne zaustavlja | isključeno |
@@ -414,21 +404,26 @@ Podešavanja imaju ujednačene razmake i odvojene redove za boju, jačinu
 pozadine i zamućenje. Broj instalirane verzije stoji u dugmetu za proveru
 ažuriranja; poruka da je verzija najnovija ne prikazuje se zasebno.
 
-U sredini kružnog menija prikazuje se X i poruka „Otpusti za izlazak“.
+U sredini kružnog menija podrazumevano se prikazuje X i poruka „Otpusti za izlazak“.
 Poništavanje ima širu zonu i odvojenu granicu za ponovni izbor.
-Dok držiš Cmd, prikazuju se uključene prečice za Downloads, Desktop,
-Documents i novi Chrome tab. Opcije se biraju u odeljku „Prečice uz Cmd“.
-Otpusti tri prsta dok je Cmd i dalje pritisnut da otvoriš izabranu prečicu;
-puštanje Cmd vraća meni na prozore i tabove.
+Poseban meni prečica bira se u Podešavanjima > Prečice: nema ga, otvara se
+dok držiš Cmd, dok je dodat četvrti prst, ili na oba načina. Podrazumevano
+je Cmd. U njemu su prečice označene sa Meni (Downloads, Desktop, Documents,
+novi Chrome tab i ostale uključene). Otpusti prste dok je Cmd i dalje
+pritisnut, ili dok je četvrti prst još na tabli, da otvoriš izabranu prečicu.
+Puštanje Cmd-a, odnosno podizanje četvrtog prsta, vraća prozore i tabove.
+Dok poseban meni koristi četiri prsta, taj pokret više ne poništava izbor.
 Otvorena podešavanja imaju svoju karticu i ostaju otvorena pri promeni
 fokusa. Zatvaraju se preko X, Esc ili Cmd+W. Aplikacija ima zasebnu ikonicu
 sa karticama i tri prsta, generisanu pomoću `tools/generate_app_icon.m`.
 
 ### Stalne prečice i novi YouTube tab
 
-U Podešavanjima > Prečice svaka stavka ima nezavisne opcije **Cmd** i
-**Stalno**. Stalno prikazuje prečicu među aplikacijama bez držanja Cmd-a;
-Cmd prikazuje je u posebnom meniju dok je taster pritisnut. Dostupni su
+U Podešavanjima > Prečice svaka stavka ima nezavisne opcije **Meni** i
+**Stalno**. Iznad njih bira se kako se poseban meni otvara: Nema, Cmd,
+4 prsta ili Oba. Stalno prikazuje prečicu među aplikacijama i kad posebnog
+menija nema. Meni prikazuje je u posebnom meniju dok je izabrani prekidač
+aktivan. Dostupni su
 Downloads, Desktop, Documents, novi Chrome tab i novi YouTube tab.
 Chrome i YouTube svaki put otvaraju nov tab u Chrome-u. Izbor se pamti
 posle ponovnog pokretanja aplikacije. Stalne prečice su podrazumevano
@@ -497,7 +492,7 @@ broj pronađenih prozora i grešku čitanja aplikacije, a `minimize_all_done` uk
 pomoćne prozore aplikacije ne dozvoljavaju minimizovanje; greška se beleži
 umesto prijavljivanja uspeha.
 
-U Podešavanjima > Prečice možeš izabrati Cmd i/ili Stalno. Podešavanje
+U Podešavanjima > Prečice možeš izabrati Meni i/ili Stalno. Podešavanje
 prethodne akcije ostaje sačuvano. **Desktop** i dalje otvara folder.
 
 Ažuriranje se preuzima iz GitHub Releases preko dugmeta u podešavanjima;
@@ -510,3 +505,54 @@ prikazanog položaja. Strelica se okreće kraćim putem preko granice uglova,
 a sitno podrhtavanje u centru ne menja pravac. Izbor kartice koristi
 neizmenjene koordinate prstiju, pa zaglađivanje ne usporava aktivaciju.
 Otvaranje menija i prelazak na Cmd prečice odmah resetuju pokazivač.
+
+### Brzo prebacivanje sa tri prsta
+
+Tap sa tri prsta kraći od 0,5 sekundi vraća prethodno korišćeni prozor.
+Uzastopni tapovi prebacuju između poslednja dva prozora. Prati se prozor,
+uključujući više prozora iste aplikacije. Zatvoreni prozori i prečice se
+ne biraju. Dok istorija još nije zabeležena, koristi se redosled vidljivih
+prozora od napred ka nazad.
+
+Povlačenje ka kartici zadržava običan izbor čak i kada traje kraće od
+0,5 sekundi. Poseban meni prečica i poništavanje sa četiri prsta ne pokreću
+brzo prebacivanje. Ako nema prethodnog prozora, tap samo zatvara meni.
+
+### Više tabova i brže osvežavanje (1.0.6)
+
+Meni prikazuje najviše 10 kartica na jednoj stranici. Leva i desna
+strelica na tastaturi menjaju stranicu dok je meni otvoren. Dole se vidi
+broj trenutne i ukupan broj stranica. Cmd prečice imaju zaseban pregled,
+a brzi tap i dalje vraća prethodni prozor i kada je na drugoj stranici.
+
+Inventar se proverava na 0,5 sekundi, uz dodatnu proveru promene naslova
+prozora. Chrome vraća ID-eve, naslove i adrese tabova u grupama. Snimci
+vidljivih tabova osvežavaju se najranije posle 0,6 sekundi, a pri otvaranju
+menija posle 0,15 sekundi od prethodnog snimka. Ovo su intervali zahteva,
+bez garancije vremena odgovora macOS-a i Chrome-a. U režimu „Samo
+aplikacije” Chrome zadržava po jednu karticu za svaki prozor i njen aktivni
+tab. Zatvoreni i novootvoreni tabovi ažuriraju se posle uspešnog čitanja
+inventara; tokom izbora stranica ostaje stabilna.
+
+Chrome inventar, izbor taba i provera snimka vezani su za PID konkretne
+instance, pa Chrome bez prozora pokrenut za snimanje ne dodaje svoje tabove
+u meni. ID, naslov i URL čitaju se zajedno. Pri otvaranju menija dodatno
+se proveravaju živi ID-evi: zatvorene i ponovljene kartice uklanjaju se dok
+je pokazivač u sredini; započeti izbor ostaje stabilan. Dva stvarna taba
+istog linka ostaju odvojena. Događaji `chrome_inventory` i
+`chrome_menu_inventory` beleže ID-eve i broj uklonjenih kartica, bez adresa.
+
+### Uvećana pozadina i centar menija (1.0.6)
+
+Kad je uvećanje uključeno i aplikacija ima dozvolu za snimanje ekrana, meni
+se odmah otvara sa sistemskim zamućenjem. Snimak ekrana se učitava u
+zasebnom prozoru iza menija, gde ga zamućenje obrađuje jednom. Snimak se
+postepeno pojavljuje, pa se tokom 0,9 sekundi blago uvećava. Pomeranje
+prstiju ili miša pomera pozadinu u suprotnom smeru. Malo uvećanje čuva
+ivice ekrana tokom paralakse. Klizač za uvećanje ide od 0 do 25%; na nuli
+ostaje samo sistemsko zamućenje.
+
+Opcija „Trenutni prozor ili tab u centru” prikazuje njegov thumbnail umesto
+X-a, a tu karticu uklanja iz kruga. Puštanje prstiju u sredini ostaje na
+istom prozoru. Kada je opcija isključena, u centru je X. Ako trenutni
+prozor ne može da se prepozna, X ostaje dostupan.
