@@ -719,6 +719,74 @@ static void verifyDiagnosticLogging(void) {
     printf("Dijagnostika: paralelni zapisi, JSON i rotacija prolaze. Putanja: %s\n",tempPath);
 }
 
+static NSUInteger testSystemConflicts;
+static NSUInteger testSystemConflictReader(void) { return testSystemConflicts; }
+
+static void verifySystemGestureGate(NSString *renderPath) {
+    NSDictionary *offDock = @{@"showMissionControlGestureEnabled":@NO, @"showAppExposeGestureEnabled":@NO};
+    assert(conflictsForTrackpadPreferences(@{}, @{}, @{}) == 0);
+    assert(conflictsForTrackpadPreferences(@{@"TrackpadThreeFingerDrag":@YES}, @{}, @{}) == SystemGestureDrag);
+    assert(conflictsForTrackpadPreferences(@{@"TrackpadThreeFingerHorizSwipeGesture":@2}, @{}, @{}) == SystemGestureSpaces);
+    assert(conflictsForTrackpadPreferences(@{@"TrackpadThreeFingerHorizSwipeGesture":@1}, @{}, @{}) == SystemGesturePages);
+    assert(conflictsForTrackpadPreferences(@{@"TrackpadThreeFingerVertSwipeGesture":@2}, @{}, @{}) == SystemGestureExpose);
+    assert(conflictsForTrackpadPreferences(@{@"TrackpadThreeFingerVertSwipeGesture":@2}, offDock, @{}) == 0);
+    assert(conflictsForTrackpadPreferences(@{@"TrackpadThreeFingerVertSwipeGesture":@2},
+        @{@"showMissionControlGestureEnabled":@NO, @"showAppExposeGestureEnabled":@YES}, @{}) == SystemGestureExpose);
+    assert(conflictsForTrackpadPreferences(@{}, @{},
+        @{@"com.apple.trackpad.threeFingerHorizSwipeGesture":@2}) == SystemGestureSpaces);
+    assert(conflictsForTrackpadPreferences(@{@"TrackpadThreeFingerHorizSwipeGesture":@0}, @{},
+        @{@"com.apple.trackpad.threeFingerHorizSwipeGesture":@2}) == 0);
+    assert(conflictsForTrackpadPreferences(@{@"TrackpadThreeFingerHorizSwipeGesture":@0,
+        @"TrackpadThreeFingerVertSwipeGesture":@0, @"TrackpadFourFingerHorizSwipeGesture":@2,
+        @"TrackpadFourFingerVertSwipeGesture":@2}, @{}, @{}) == 0);
+
+    g_systemGestureConflictReader = testSystemConflictReader;
+    testSystemConflicts = SystemGestureDrag | SystemGestureSpaces | SystemGestureExpose | SystemGesturePages;
+    atomic_store(&g_systemGestureConflicts, testSystemConflicts);
+    MTTouch contacts[3] = {0};
+    for (int i=0; i<3; i++) contacts[i].state=MTTouchStateTouching;
+    ringTouchCallback(NULL, contacts, 3, 0, 0);
+    assert(!atomic_load(&g_gestureActive) && !atomic_load(&g_ringOverlayVisible));
+    assert(!atomic_load(&g_systemCursorHidden) && !atomic_load(&g_scrollSuppressionActive));
+    beginTouchGesture(NULL, 0.5, 0.5);
+    assert(!atomic_load(&g_gestureActive));
+
+    g_windowScanQueue=dispatch_queue_create("touchpad.test.scan",DISPATCH_QUEUE_SERIAL);
+    atomic_store(&g_isScanning,true);
+    CGEventRef cursor=CGEventCreate(NULL);
+    g_cursorAtGestureStart=CGEventGetLocation(cursor);
+    CFRelease(cursor);
+    atomic_store(&g_gestureActive,true);
+    atomic_store(&g_mouseGestureActive,true);
+    uint64_t generation=atomic_fetch_add(&g_gestureGeneration,1)+1;
+    showRing(generation);
+    assert(!atomic_load(&g_gestureActive) && !atomic_load(&g_mouseGestureActive));
+    assert(!atomic_load(&g_gestureEnding) && !atomic_load(&g_ringOverlayVisible));
+    assert(atomic_load(&g_gestureGeneration)!=generation);
+    finishGesture(generation,0); // A queued lift from before the block is invalid.
+    assert(!atomic_load(&g_gestureActive));
+
+    g_settingsMenu=[SettingsMenu new];
+    [g_settingsMenu presentGestureConflict:nil];
+    assert(g_settingsMenu.gestureConflictWindow.isVisible);
+    if (renderPath) {
+        NSView *content=g_settingsMenu.gestureConflictWindow.contentView;
+        [content layoutSubtreeIfNeeded];
+        NSBitmapImageRep *bitmap=[content bitmapImageRepForCachingDisplayInRect:content.bounds];
+        [content cacheDisplayInRect:content.bounds toBitmapImageRep:bitmap];
+        assert([[bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}]
+            writeToFile:renderPath atomically:YES]);
+    }
+    if ([NSProcessInfo.processInfo.arguments containsObject:@"--preview-system-gestures"]) return;
+    [g_settingsMenu dismissGestureConflict:nil];
+    assert(threeFingerSystemGesturesOn()); // Dismissing the notice cannot bypass setup.
+    testSystemConflicts=0;
+    refreshSystemGestureConflicts();
+    assert(!threeFingerSystemGesturesOn() && !g_settingsMenu.gestureConflictWindow.isVisible);
+    g_systemGestureConflictReader=currentSystemGestureConflicts;
+    printf("Sistemski gestovi: konflikt blokira dodir i miš, stari izbor se odbacuje, odlaganje ne otključava, promena podešavanja otključava meni.\n");
+}
+
 int main(int argc,const char *argv[]) {
     @autoreleasepool {
         [NSApplication sharedApplication];
@@ -728,6 +796,11 @@ int main(int argc,const char *argv[]) {
             NSUInteger i=[args indexOfObject:flag];
             return i!=NSNotFound && i+1<args.count ? args[i+1] : nil;
         };
+        if ([args containsObject:@"--verify-system-gestures"] || [args containsObject:@"--preview-system-gestures"]) {
+            verifySystemGestureGate(argument(@"--render-gesture-warning"));
+            if ([args containsObject:@"--preview-system-gestures"]) [NSApp run];
+            return 0;
+        }
         if ([args containsObject:@"--no-titles"]) atomic_store(&g_settingCardTitles,CardTitlesNone);
         CGFloat width=argument(@"--width") ? argument(@"--width").doubleValue : 1100;
         CGFloat height=argument(@"--height") ? argument(@"--height").doubleValue : width/1.6;

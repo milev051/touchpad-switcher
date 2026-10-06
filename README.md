@@ -179,15 +179,27 @@ klik na `Ažuriraj.command` ili `make update`. Dozvole, trackpad i Chrome:
 
 Zaseban prototip prikazuje otvorene prozore oko centra ekrana kada detektuje tri
 prsta, bez obzira na položaj kursora. Svaka kartica ima naslov prozora ili taba
-preko sličice, ako je tako izabrano u meniju. Izgradi i pokreni ga ovako:
+preko sličice, ako je tako izabrano u meniju. Aplikacija bez otvorenih prozora
+ili tabova nema karticu ni ikonicu u krugu, čak i ako je proces i dalje pokrenut.
+Minimizovani prozori i prozori na drugim radnim površinama ostaju u meniju.
+Izgradi i pokreni ga ovako:
 
 ```bash
 make touchpad_ring_test
 ./touchpad_ring_test
 ```
 
-Za čist test isključi macOS troprstno prevlačenje, da sistem istovremeno ne
-pokušava da vuče prozor. U **System Settings → Accessibility → Pointer Control
+Touchpad Switcher proverava sistemske gestove pri pokretanju, jednom u sekundi
+i neposredno pre otvaranja menija. Ako macOS koristi tri prsta za Mission
+Control, App Exposé, prelazak između ekrana, listanje stranica ili prevlačenje,
+kružni meni ostaje zaključan. Obaveštenje ima dugmad koja otvaraju odgovarajuća
+macOS podešavanja. „Kasnije” zatvara obaveštenje, ali ne uklanja blokadu.
+Čim se konflikt ukloni, meni se automatski otključava bez restarta aplikacije.
+Podešavanja se proveravaju zasebno za ugrađeni i Bluetooth trackpad.
+
+U **System Settings → Trackpad → More Gestures** isključi konfliktne pokrete
+ili izaberi četiri prsta za Mission Control, App Exposé i prelazak između ekrana,
+a dva prsta za listanje stranica. U **System Settings → Accessibility → Pointer Control
 → Trackpad Options** isključi **Use trackpad for dragging** ili izaberi stil
 prevlačenja koji nije **Three Finger Drag**. Apple navodi da su nazivi stavki
 nešto različiti među verzijama macOS-a. Dok je meni otvoren, test dodatno
@@ -270,10 +282,11 @@ Recording. Čuvaju se u memoriji dok su prozori otvoreni. Novi snimak nastaje:
    prozor koji se napušta, pa se kartice osvežavaju dok je meni otvoren,
 3. na svake 3 s za aktivnu aplikaciju i na 12 s za ostale vidljive prozore.
 
-Snimaju se samo prozori sa trenutnog desktopa. Prozor sa drugog desktopa ili
-minimizovan zadržava poslednji snimak. Ako snimka nema, kartica se ne prikazuje,
-jer bi imala samo ikonicu aplikacije i obično ništa ne bi otvorila (npr.
-Terminalov pomoćni prozor). Vraća se čim prozor dođe na ekran i dobije sliku.
+Snimaju se samo prozori sa trenutnog desktopa. Prozor sa drugog desktopa ostaje
+u meniju i bez snimka, jer izbor prelazi na taj desktop. Minimizovan prozor
+zadržava poslednji snimak. Ako snimka nema, kartica se ne prikazuje, jer bi
+imala samo ikonicu aplikacije i obično ništa ne bi otvorila (npr. Terminalov
+pomoćni prozor). Vraća se čim prozor dođe na ekran i dobije sliku.
 Chrome tabovi ostaju uvek.
 
 Za Chrome se slika čuva zasebno za svaki tab. U trenutku snimanja Touchpad
@@ -331,7 +344,10 @@ nije pokriven: macOS ne daje opšti način da se to uradi.
 
 Izabrani prozor se dovodi napred tačno po ID-ju, preko istog sistemskog poziva
 koji koristi AltTab. Tako se prelazi i na prozor u drugom Space-u ili u full
-screen-u, i bez Accessibility dozvole.
+screen-u, i bez Accessibility dozvole. Kad je prozor na drugom desktopu,
+aplikacija se ne aktivira pre toga: to bi prvo otvorilo njen prozor na ovom
+desktopu, a drugi prelaz bi se izgubio tokom animacije. Posle uspešnog prelaza
+ne šalje se ni AX raise, jer on ostaje na starom desktopu i vraća fokus.
 
 Sakrivena ikonica se vraća kad se aplikacija ponovo otvori dok već radi (npr.
 iz Spotlight-a ili `/Applications`). Podešavanja se čuvaju pod
@@ -547,9 +563,10 @@ istog linka ostaju odvojena. Događaji `chrome_inventory` i
 Kad je uvećanje uključeno i aplikacija ima dozvolu za snimanje ekrana, meni
 se odmah otvara sa sistemskim zamućenjem. Snimak ekrana se učitava u
 zasebnom prozoru iza menija, gde ga zamućenje obrađuje jednom. Snimak se
-postepeno pojavljuje, pa se tokom 0,9 sekundi blago uvećava. Pomeranje
+postepeno pojavljuje tokom jedne sekunde već u podešenom uvećanju, bez animacije zuma. Pomeranje
 prstiju ili miša pomera pozadinu u suprotnom smeru. Malo uvećanje čuva
-ivice ekrana tokom paralakse. Klizač za uvećanje ide od 0 do 25%; na nuli
+ivice ekrana tokom paralakse, uz rezervu na ivicama i pri naglom pokretu.
+Klizač za uvećanje ide od 0 do 25%; na nuli
 ostaje samo sistemsko zamućenje.
 
 Opcija „Trenutni prozor ili tab u centru” prikazuje njegov thumbnail umesto
