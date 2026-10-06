@@ -30,9 +30,11 @@ run-python:
 list-apps: $(TARGET)
 	./$(TARGET) --list-apps
 
-RING_SOURCES = touchpad_ring_test.m ring_media.m ring_favicons.m ring_update.m
+RING_MODULES = ring_media.m ring_favicons.m ring_update.m ring_zoom.m ring_test_recording.m
+RING_HEADERS = $(RING_MODULES:.m=.h)
+RING_SOURCES = touchpad_ring_test.m $(RING_MODULES)
 
-touchpad_ring_test: $(RING_SOURCES) ring_media.h ring_favicons.h ring_update.h
+touchpad_ring_test: $(RING_SOURCES) $(RING_HEADERS)
 	@mkdir -p "$(RING_APP)/Contents/MacOS"
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(RING_SOURCES) -o $@
 	@cp "$@" "$(RING_APP_EXECUTABLE)"
@@ -61,7 +63,7 @@ update:
 	open -n "/Applications/$(RING_APP)"
 
 # Zip for someone else's Mac: one binary for Apple Silicon and Intel.
-dist: $(RING_SOURCES) ring_media.h ring_favicons.h ring_update.h
+dist: $(RING_SOURCES) $(RING_HEADERS)
 	@mkdir -p "$(RING_APP)/Contents/MacOS" dist
 	$(CC) $(CFLAGS) -arch arm64 -arch x86_64 $(FRAMEWORKS) $(RING_SOURCES) -o "$(RING_APP_EXECUTABLE)"
 	codesign --force --deep --sign - --identifier "$(RING_APP_IDENTIFIER)" \
@@ -79,8 +81,8 @@ clean:
 layout-preview: layout-preview-bundle
 	open -n "/tmp/Touchpad Layout Preview.app"
 
-/tmp/touchpad-layout-preview: tools/ring_layout_preview.m $(RING_SOURCES) ring_media.h ring_favicons.h ring_update.h
-	$(CC) $(CFLAGS) $(FRAMEWORKS) tools/ring_layout_preview.m ring_media.m ring_favicons.m ring_update.m -o $@
+/tmp/touchpad-layout-preview: tools/ring_layout_preview.m $(RING_SOURCES) $(RING_HEADERS)
+	$(CC) $(CFLAGS) $(FRAMEWORKS) tools/ring_layout_preview.m $(RING_MODULES) -o $@
 
 .PHONY: layout-preview-bundle
 layout-preview-bundle: /tmp/touchpad-layout-preview tools/layout_preview_Info.plist

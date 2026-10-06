@@ -10,8 +10,9 @@
 #import "ring_media.h"
 #import "ring_favicons.h"
 #import "ring_update.h"
+#import "ring_zoom.h"
+#import "ring_test_recording.h"
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
-#import <objc/runtime.h>
 #include <math.h>
 #include <float.h>
 #include <os/lock.h>
@@ -76,6 +77,8 @@ typedef int CGSConnectionID;
 extern CGSConnectionID CGSMainConnectionID(void);
 extern CGError CGSSetWindowBackgroundBlurRadius(CGSConnectionID connection, NSInteger windowNumber, int radius);
 
+#pragma mark - Card model
+
 @interface RingEntry : NSObject
 @property(nonatomic, strong) NSRunningApplication *application;
 @property(nonatomic, copy) NSString *windowTitle;
@@ -124,7 +127,7 @@ static void loadHiddenChromeTabs(uint64_t generation);
 static void setRingPick(BOOL made, NSString *chromeWindowID);
 static void scanWindowsNow(void);
 static void noteChromeSelectionChanges(NSArray<RingEntry *> *entries);
-static void requestSharpCapture(RingEntry *entry);
+static void prepareZoomPicture(RingEntry *entry);
 typedef NS_OPTIONS(NSUInteger, SystemGestureConflict) {
     SystemGestureDrag = 1 << 0,
     SystemGestureSpaces = 1 << 1,
@@ -135,6 +138,8 @@ static _Atomic(NSUInteger) g_systemGestureConflicts = 0;
 static void refreshSystemGestureConflicts(void);
 static void requestGestureConflictNotice(void);
 static void cancelGestureForSystemConflict(void);
+
+#pragma mark - Ring view and card layout
 
 @interface RingView : NSView
 @property(nonatomic, copy) NSArray<RingEntry *> *entries;
@@ -198,6 +203,7 @@ typedef enum {
 static _Atomic(int) g_settingShortcutTrigger = ShortcutTriggerCommand;
 static _Atomic(bool) g_settingHideMenuIcon = false;
 static _Atomic(bool) g_settingSoundEffects = false;
+static _Atomic(bool) g_settingPickZoom = true;   // picked card grows into its window
 // Mouse activation by holding the button and releasing it on a card. Off: one
 // click opens the ring and a second click (or a left click) picks the card.
 static _Atomic(bool) g_settingMouseHoldToSelect = true;
@@ -1161,9 +1167,9 @@ static CGRect cardThumbnailRect(CGRect layerBounds, NSRect rect, NSImage *thumbn
     if (selectedIndex >= 0 && selectedIndex < (NSInteger)self.entries.count) {
         [self updateGlow];
         playRingSound(g_selectSound);
-        requestSharpCapture(self.entries[selectedIndex]);
+        prepareZoomPicture(self.entries[selectedIndex]);
     } else {
-        requestSharpCapture(nil);
+        prepareZoomPicture(nil);
         [(SectorGlowView *)self.glowView hideAnimated:YES];
     }
 }
@@ -1319,6 +1325,8 @@ static CGRect cardThumbnailRect(CGRect layerBounds, NSRect rect, NSImage *thumbn
 }
 
 @end
+
+#pragma mark - Menu panel and shared state
 
 @interface RingPanel : NSPanel
 @end
@@ -1541,6 +1549,8 @@ static NSString *g_diagnosticPath;
 static NSUInteger g_diagnosticBytes=0;
 static NSUInteger g_diagnosticLimit=4*1024*1024;
 
+#pragma mark - Diagnostics
+
 static NSString *diagnosticDirectory(void) {
     return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs/TouchpadSwitcher"];
 }
@@ -1620,6 +1630,8 @@ enum {
 static const CGEventType kGestureEventType = (CGEventType)29;   // NSEventTypeGesture
 static const CGKeyCode kEscapeKeyCode = 53;
 static NSString *const kMouseButtonLearnedNotification = @"TouchpadSwitcherMouseButtonLearned";
+
+#pragma mark - Mouse and keyboard activation
 
 static void persistMouseActivationSetting(int value) {
     atomic_store(&g_settingMouseButton, value);
@@ -2089,6 +2101,8 @@ static void ensurePanel(NSScreen *screen) {
     g_panel.contentView = content;
 }
 
+#pragma mark - Showing the menu
+
 // The window server blurs what is behind the panel on the GPU, so the blur
 // costs no drawing in this process.
 static void setPanelBlur(int radius) {
@@ -2512,6 +2526,8 @@ static NSSet<NSNumber *> *activeSpaceIDs(void) {
     return spaceIDs;
 }
 
+#pragma mark - Raising the picked window
+
 // A minimized window stays on its desktop, so its space id still matches.
 // Only a window whose desktop is not visible needs the Space switch path.
 static BOOL windowIsOnAnotherSpace(CGWindowID windowID, uint64_t fallbackSpaceID) {
@@ -2766,6 +2782,8 @@ static AXError minimizeWindow(AXUIElementRef window,WindowAttributeReader read,W
     return writeResult!=kAXErrorSuccess ? writeResult : (result==kAXErrorSuccess ? kAXErrorCannotComplete : result);
 }
 
+#pragma mark - Minimize all windows
+
 // Status dozvole dopuni stvarnim AX zahtevom, bez menjanja sistemskih dozvola.
 static BOOL windowAccessAllowsMinimizing(BOOL trusted,AXError probe) {
     return trusted || probe==kAXErrorSuccess;
@@ -2938,6 +2956,8 @@ static void setCommandShortcutMode(BOOL enabled) {
     [g_ringView setNeedsDisplay:YES];
 }
 
+#pragma mark - Shortcut section and selection
+
 // Rezervna provera Cmd-a radi i kada sistemski event tap nije dostupan.
 static BOOL shortcutSectionWanted(int trigger, BOOL commandHeld, BOOL fourFingersHeld) {
     if (trigger==ShortcutTriggerCommand) return commandHeld;
@@ -3049,39 +3069,7 @@ static void restoreCursorAfterGesture(void) {
     CGAssociateMouseAndMouseCursorPosition(true);
 }
 
-// Current frame of a window on this desktop, in Cocoa screen coordinates.
-// Zero for a minimized, hidden or unknown window.
-static NSRect visibleWindowFrame(CGWindowID windowID) {
-    if (windowID == kCGNullWindowID || !NSScreen.screens.count) return NSZeroRect;
-    CFArrayRef ids = CFArrayCreate(NULL, (const void **)(uintptr_t[]){windowID}, 1, NULL);
-    NSArray *info = CFBridgingRelease(CGWindowListCreateDescriptionFromArray(ids));
-    CFRelease(ids);
-    NSDictionary *window = info.firstObject;
-    if (![window[(id)kCGWindowIsOnscreen] boolValue]) return NSZeroRect;
-    CGRect bounds = CGRectZero;
-    if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)window[(id)kCGWindowBounds], &bounds))
-        return NSZeroRect;
-    CGFloat primaryHeight = NSHeight(NSScreen.screens.firstObject.frame);
-    return NSMakeRect(bounds.origin.x, primaryHeight - CGRectGetMaxY(bounds), bounds.size.width, bounds.size.height);
-}
-
-static NSPanel *g_pickZoomPanel;
-static CALayer *g_pickZoomContainer;
-static CALayer *g_pickZoomShadow;
-static CALayer *g_pickZoomLayer;
-static uint64_t g_pickZoomRun;
-
-// Sharp picture of the selected card for the zoom, so it does not end on a
-// stretched thumbnail: the window captured live while the menu is open, or
-// the larger copy kept with the card's thumbnail (a tab not shown in its
-// window cannot be captured live). Main thread only.
-static CGImageRef g_sharpCaptureImage;
-static RingEntry *g_sharpCaptureEntry;
-static BOOL g_sharpCaptureIsLive;
-static uint64_t g_sharpCaptureRequest;
-static const size_t kSharpCaptureMaxPixelWidth = 3200;
-static CGImageRef copyDecodedImageFromData(NSData *data);
-static NSData *zoomImageDataForThumbnail(NSData *thumbnail);
+#pragma mark - Pick zoom (ring_zoom.m)
 
 // The window's own picture shows this card only when the card is the window
 // itself or the tab already shown in it.
@@ -3090,335 +3078,53 @@ static BOOL entryMatchesWindowPicture(RingEntry *entry) {
            entry.windowID != kCGNullWindowID && (!entry.isTab || entry.isSelectedTab);
 }
 
-static void releaseSharpCapture(void) {
-    g_sharpCaptureRequest++;
-    if (g_sharpCaptureImage) CGImageRelease(g_sharpCaptureImage);
-    g_sharpCaptureImage = NULL;
-    g_sharpCaptureEntry = nil;
-    g_sharpCaptureIsLive = NO;
-}
-
-// Takes ownership of the image.
-static void storeSharpCapture(uint64_t request, RingEntry *entry, CGImageRef image, BOOL live) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        BOOL current = request == g_sharpCaptureRequest && atomic_load(&g_ringOverlayVisible);
-        // A live picture is newer than the stored copy and is not replaced by it.
-        if (!current || (!live && g_sharpCaptureIsLive && g_sharpCaptureEntry == entry)) {
-            CGImageRelease(image);
-            return;
-        }
-        if (g_sharpCaptureImage) CGImageRelease(g_sharpCaptureImage);
-        g_sharpCaptureImage = image;
-        g_sharpCaptureEntry = entry;
-        g_sharpCaptureIsLive = live;
-    });
-}
-
-static void captureLiveSharpPicture(uint64_t request, RingEntry *entry) {
-    CGWindowID windowID = entry.windowID;
-    BOOL isTab = entry.isTab;
-    pid_t pid = entry.application.processIdentifier;
-    NSString *chromeWindowID = [entry.chromeWindowID copy];
-    NSString *chromeTabID = [entry.chromeTabID copy];
-    CGFloat scale = g_panel.backingScaleFactor ?: 2.0;
-    [SCShareableContent getShareableContentExcludingDesktopWindows:YES onScreenWindowsOnly:YES
-                                                completionHandler:^(SCShareableContent *content, NSError *error) {
-        SCWindow *window = nil;
-        for (SCWindow *candidate in content.windows) {
-            if (candidate.windowID == windowID) { window = candidate; break; }
-        }
-        if (!window || window.frame.size.width < 1 || window.frame.size.height < 1) return;
-        SCStreamConfiguration *configuration = [SCStreamConfiguration new];
-        size_t width = (size_t)MIN(lround(window.frame.size.width * scale), (long)kSharpCaptureMaxPixelWidth);
-        configuration.width = width;
-        configuration.height = (size_t)lround(width * window.frame.size.height / window.frame.size.width);
-        configuration.showsCursor = NO;
-        configuration.ignoreShadowsSingleWindow = YES;
-        configuration.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
-        [SCScreenshotManager captureImageWithFilter:[[SCContentFilter alloc] initWithDesktopIndependentWindow:window]
-                                      configuration:configuration
-                                  completionHandler:^(CGImageRef image, NSError *captureError) {
-            if (!image) return;
-            // Loading hidden Chrome tabs switches tabs in covered windows;
-            // a picture of another tab must not stand in for this one.
-            if (isTab && (atomic_load(&g_chromePrefetchActive) ||
-                          ![chromeActiveTab(pid, chromeWindowID, NULL) isEqualToString:chromeTabID])) return;
-            storeSharpCapture(request, entry, CGImageRetain(image), YES);
-        }];
-    }];
-}
-
-// Waits a moment so sweeping across the cards does not prepare each of them.
-static void requestSharpCapture(RingEntry *entry) {
-    uint64_t request = ++g_sharpCaptureRequest;
-    if (!entry || entry == g_sharpCaptureEntry) return;
-    NSData *stored = zoomImageDataForThumbnail(entry.thumbnailData);
+// Prepares a sharp picture of the card the fingers rest on: the larger copy
+// kept with its thumbnail and, when the window shows this card, a live one.
+static void prepareZoomPicture(RingEntry *entry) {
+    if (!entry || !RingZoomAllowed(atomic_load(&g_settingPickZoom))) { RingZoomCancelPicture(); return; }
     BOOL live = entryMatchesWindowPicture(entry);
-    if (!stored && !live) return;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-        if (request != g_sharpCaptureRequest || !atomic_load(&g_ringOverlayVisible)) return;
-        // The stored copy is ready at once; the live picture replaces it.
-        if (stored) {
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                CGImageRef image = copyDecodedImageFromData(stored);
-                if (image) storeSharpCapture(request, entry, image, NO);
-            });
-        }
-        if (live && CGPreflightScreenCaptureAccess()) captureLiveSharpPicture(request, entry);
-    });
-}
-
-// Whether the window is the frontmost ordinary window on screen, not counting
-// this app's own panels.
-static BOOL windowIsFrontmost(CGWindowID windowID) {
-    NSArray *windows = CFBridgingRelease(CGWindowListCopyWindowInfo(
-        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
-    pid_t ownPID = NSProcessInfo.processInfo.processIdentifier;
-    for (NSDictionary *window in windows) {
-        if ([window[(id)kCGWindowLayer] intValue] != 0) continue;
-        if ([window[(id)kCGWindowOwnerPID] intValue] == ownPID) continue;
-        return [window[(id)kCGWindowNumber] unsignedIntValue] == windowID;
+    BOOL (^stillValid)(void) = nil;
+    if (live && entry.isTab) {
+        // Loading hidden Chrome tabs switches tabs in covered windows; a
+        // picture of another tab must not stand in for this one.
+        pid_t pid = entry.application.processIdentifier;
+        NSString *chromeWindowID = [entry.chromeWindowID copy];
+        NSString *chromeTabID = [entry.chromeTabID copy];
+        stillValid = ^BOOL {
+            return !atomic_load(&g_chromePrefetchActive) &&
+                   [chromeActiveTab(pid, chromeWindowID, NULL) isEqualToString:chromeTabID];
+        };
     }
-    return NO;
+    RingZoomPreparePicture(entry, RingZoomLargeImageForThumbnail(entry.thumbnailData),
+                           live ? entry.windowID : kCGNullWindowID, g_panel.backingScaleFactor ?: 2.0, stillValid);
 }
 
-static void fadePickZoom(uint64_t run) {
-    if (run != g_pickZoomRun) return;
-    CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
-    fade.fromValue = @1.0;
-    fade.toValue = @0.0;
-    fade.duration = 0.14;
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    g_pickZoomContainer.opacity = 0.0;
-    [CATransaction commit];
-    [g_pickZoomContainer addAnimation:fade forKey:@"fade"];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 160 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-        if (run != g_pickZoomRun) return;
-        [g_pickZoomPanel orderOut:nil];
-        [g_pickZoomContainer removeAllAnimations];
-        g_pickZoomLayer.contents = nil;
-    });
-}
-
-// The picture stays until the picked window is really in front, so the
-// window that was there before never shows through it. A Chrome tab also
-// waits until Chrome shows it and has drawn it. A slow app gives up after
-// a second.
-static void fadePickZoomWhenWindowIsFront(uint64_t run, RingEntry *entry, BOOL waitForTab,
-                                          CFTimeInterval deadline) {
-    if (run != g_pickZoomRun) return;
-    if (!windowIsFrontmost(entry.windowID) && CACurrentMediaTime() < deadline) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-            fadePickZoomWhenWindowIsFront(run, entry, waitForTab, deadline);
-        });
-        return;
+// Starts the zoom for a picked window card. Must run before the menu and its
+// pictures go away. Returns whether it plays.
+static BOOL zoomPickedCard(RingEntry *picked) {
+    if (!picked || picked.isShortcut || picked.isSettings || !picked.application) return NO;
+    if (!RingZoomAllowed(atomic_load(&g_settingPickZoom))) return NO;
+    if (windowIsOnAnotherSpace(picked.windowID, picked.spaceID)) return NO;
+    NSRect from = [g_ringView thumbnailScreenRectForEntry:picked];
+    NSRect to = RingZoomVisibleWindowFrame(picked.windowID);
+    if (NSIsEmptyRect(from) || NSIsEmptyRect(to)) return NO;
+    CGImageRef image = RingZoomCopyPicture(picked);
+    if (!image) image = RingZoomCopyDecodedImage(
+        [resolvedThumbnail(picked) CGImageForProposedRect:NULL context:nil hints:nil]);
+    // A tab that is not shown yet: wait until Chrome switches to it.
+    BOOL (^tabShown)(void) = nil;
+    if (picked.isTab && !picked.isSelectedTab && picked.chromeTabID.length) {
+        pid_t pid = picked.application.processIdentifier;
+        NSString *chromeWindowID = [picked.chromeWindowID copy];
+        NSString *chromeTabID = [picked.chromeTabID copy];
+        tabShown = ^BOOL { return [chromeActiveTab(pid, chromeWindowID, NULL) isEqualToString:chromeTabID]; };
     }
-    if (!waitForTab || !entry.chromeTabID.length) { fadePickZoom(run); return; }
-    pid_t pid = entry.application.processIdentifier;
-    NSString *chromeWindowID = [entry.chromeWindowID copy];
-    NSString *chromeTabID = [entry.chromeTabID copy];
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        BOOL shown = NO;
-        while (!shown && CACurrentMediaTime() < deadline) {
-            shown = [chromeActiveTab(pid, chromeWindowID, NULL) isEqualToString:chromeTabID];
-            if (!shown) usleep(20000);
-        }
-        // One more moment for Chrome to paint the tab it just switched to.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (shown ? 90 : 0) * NSEC_PER_MSEC),
-                       dispatch_get_main_queue(), ^{ fadePickZoom(run); });
-    });
-}
-
-// A JPEG is otherwise decoded on the first frame of the zoom, which makes
-// it stutter at the start.
-static CGImageRef copyDecodedCGImage(CGImageRef source) {
-    if (!source) return NULL;
-    size_t width = CGImageGetWidth(source), height = CGImageGetHeight(source);
-    CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    CGContextRef context = CGBitmapContextCreate(NULL, width, height, 8, 0, space,
-        kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Host);
-    CGColorSpaceRelease(space);
-    if (!context) return NULL;
-    CGContextDrawImage(context, CGRectMake(0, 0, width, height), source);
-    CGImageRef decoded = CGBitmapContextCreateImage(context);
-    CGContextRelease(context);
-    return decoded;
-}
-
-static CGImageRef copyDecodedImage(NSImage *thumbnail) {
-    return copyDecodedCGImage([thumbnail CGImageForProposedRect:NULL context:nil hints:nil]);
-}
-
-static CGImageRef copyDecodedImageFromData(NSData *data) {
-    if (!data.length) return NULL;
-    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
-    if (!source) return NULL;
-    CGImageRef image = CGImageSourceCreateImageAtIndex(source, 0, NULL);
-    CFRelease(source);
-    CGImageRef decoded = copyDecodedCGImage(image);
+    BOOL started = RingZoomStart(image, from, to, picked.windowID, tabShown);
     if (image) CGImageRelease(image);
-    return decoded;
+    return started;
 }
 
-static CGPathRef copyZoomShadowPath(CGSize size, CGFloat radius) {
-    return CGPathCreateWithRoundedRect(CGRectMake(0, 0, size.width, size.height), radius, radius, NULL);
-}
-
-// The picked card's picture grows from its place in the menu to the window's
-// real frame with a window-like shadow, then fades out over the window raised
-// behind it.
-static BOOL zoomPickedCardToWindow(CGImageRef image, NSRect from, NSRect to,
-                                   RingEntry *entry, BOOL waitForTab) {
-    if (!image || NSIsEmptyRect(from) || NSIsEmptyRect(to)) return NO;
-    // Room around the window for its shadow.
-    NSRect frame = NSInsetRect(NSUnionRect(from, to), -60, -60);
-    if (!g_pickZoomPanel) {
-        g_pickZoomPanel = [[RingPanel alloc] initWithContentRect:frame
-            styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
-              backing:NSBackingStoreBuffered defer:NO];
-        g_pickZoomPanel.opaque = NO;
-        g_pickZoomPanel.backgroundColor = NSColor.clearColor;
-        g_pickZoomPanel.hasShadow = NO;
-        g_pickZoomPanel.level = NSPopUpMenuWindowLevel + 1;
-        g_pickZoomPanel.hidesOnDeactivate = NO;
-        g_pickZoomPanel.animationBehavior = NSWindowAnimationBehaviorNone;
-        g_pickZoomPanel.ignoresMouseEvents = YES;
-        g_pickZoomPanel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
-                                             NSWindowCollectionBehaviorFullScreenAuxiliary |
-                                             NSWindowCollectionBehaviorStationary;
-        NSView *content = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, NSWidth(frame), NSHeight(frame))];
-        content.wantsLayer = YES;
-        g_pickZoomPanel.contentView = content;
-        g_pickZoomContainer = [CALayer layer];
-        [content.layer addSublayer:g_pickZoomContainer];
-        g_pickZoomShadow = [CALayer layer];
-        g_pickZoomShadow.shadowColor = NSColor.blackColor.CGColor;
-        g_pickZoomShadow.shadowOpacity = 0.38;
-        g_pickZoomShadow.shadowRadius = 22.0;
-        g_pickZoomShadow.shadowOffset = CGSizeMake(0, -10);
-        [g_pickZoomContainer addSublayer:g_pickZoomShadow];
-        g_pickZoomLayer = [CALayer layer];
-        g_pickZoomLayer.contentsGravity = kCAGravityResize;
-        g_pickZoomLayer.masksToBounds = YES;
-        [g_pickZoomContainer addSublayer:g_pickZoomLayer];
-    }
-    uint64_t run = ++g_pickZoomRun;
-    [g_pickZoomPanel setFrame:frame display:NO];
-    CGRect start = NSRectToCGRect(NSOffsetRect(from, -NSMinX(frame), -NSMinY(frame)));
-    CGRect end = NSRectToCGRect(NSOffsetRect(to, -NSMinX(frame), -NSMinY(frame)));
-    const CGFloat startRadius = 8.0, endRadius = 10.0;
-    [g_pickZoomContainer removeAllAnimations];
-    [g_pickZoomShadow removeAllAnimations];
-    [g_pickZoomLayer removeAllAnimations];
-    CGPathRef startPath = copyZoomShadowPath(start.size, startRadius);
-    CGPathRef endPath = copyZoomShadowPath(end.size, endRadius);
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    g_pickZoomContainer.frame = CGRectMake(0, 0, NSWidth(frame), NSHeight(frame));
-    g_pickZoomContainer.opacity = 1.0;
-    g_pickZoomLayer.contents = (__bridge id)image;
-    g_pickZoomLayer.contentsScale = g_pickZoomPanel.backingScaleFactor ?: 2.0;
-    g_pickZoomLayer.frame = end;
-    g_pickZoomLayer.cornerRadius = endRadius;
-    g_pickZoomShadow.frame = end;
-    g_pickZoomShadow.shadowPath = endPath;
-    [CATransaction commit];
-    [g_pickZoomPanel orderFrontRegardless];
-
-    CAMediaTimingFunction *ease = [CAMediaTimingFunction functionWithControlPoints:0.2 :0.8 :0.25 :1.0];
-    CFTimeInterval growDuration = 0.26;
-    NSValue *startPosition = [NSValue valueWithPoint:NSMakePoint(CGRectGetMidX(start), CGRectGetMidY(start))];
-    NSValue *startSize = [NSValue valueWithSize:NSSizeFromCGSize(start.size)];
-    CABasicAnimation *position = [CABasicAnimation animationWithKeyPath:@"position"];
-    position.fromValue = startPosition;
-    CABasicAnimation *size = [CABasicAnimation animationWithKeyPath:@"bounds.size"];
-    size.fromValue = startSize;
-    CABasicAnimation *corner = [CABasicAnimation animationWithKeyPath:@"cornerRadius"];
-    corner.fromValue = @(startRadius);
-    CAAnimationGroup *grow = [CAAnimationGroup animation];
-    grow.animations = @[position, size, corner];
-    grow.duration = growDuration;
-    grow.timingFunction = ease;
-    [g_pickZoomLayer addAnimation:grow forKey:@"grow"];
-    CABasicAnimation *shadowPath = [CABasicAnimation animationWithKeyPath:@"shadowPath"];
-    shadowPath.fromValue = (__bridge id)startPath;
-    CAAnimationGroup *growShadow = [CAAnimationGroup animation];
-    growShadow.animations = @[[position copy], [size copy], shadowPath];
-    growShadow.duration = growDuration;
-    growShadow.timingFunction = ease;
-    [g_pickZoomShadow addAnimation:growShadow forKey:@"grow"];
-    CGPathRelease(startPath);
-    CGPathRelease(endPath);
-    // Start drawing now: the menu closes and the app activates right after
-    // this on the main thread, which would otherwise hold the first frame.
-    [CATransaction flush];
-    CFTimeInterval deadline = CACurrentMediaTime() + growDuration + 1.2;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(growDuration * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        fadePickZoomWhenWindowIsFront(run, entry, waitForTab, deadline);
-    });
-    return YES;
-}
-
-// Test hook: records the main display to a movie for a few seconds, to look
-// at an animation frame by frame.
-@interface TestRecordingDelegate : NSObject <SCRecordingOutputDelegate, SCStreamDelegate>
-@end
-@implementation TestRecordingDelegate
-- (void)recordingOutputDidFinishRecording:(SCRecordingOutput *)recordingOutput API_AVAILABLE(macos(15.0)) {
-    diagnosticEvent(@"test_record_done", @{});
-}
-- (void)recordingOutput:(SCRecordingOutput *)recordingOutput didFailWithError:(NSError *)error API_AVAILABLE(macos(15.0)) {
-    diagnosticEvent(@"test_record_failed", @{@"error":error.localizedDescription ?: @""});
-}
-@end
-static SCStream *g_testStream;
-static TestRecordingDelegate *g_testRecordingDelegate;
-
-static void runTestRecording(NSString *path, double seconds) {
-    if (@available(macOS 15.0, *)) {
-        if (g_testStream) return;
-        [SCShareableContent getShareableContentExcludingDesktopWindows:NO onScreenWindowsOnly:YES
-                                                    completionHandler:^(SCShareableContent *content, NSError *error) {
-            SCDisplay *display = nil;
-            for (SCDisplay *candidate in content.displays) {
-                if (candidate.displayID == CGMainDisplayID()) { display = candidate; break; }
-            }
-            if (!display) { diagnosticEvent(@"test_record_failed", @{@"error":error.localizedDescription ?: @"no display"}); return; }
-            dispatch_async(dispatch_get_main_queue(), ^{
-                SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
-                SCStreamConfiguration *configuration = [SCStreamConfiguration new];
-                configuration.width = display.width;
-                configuration.height = display.height;
-                configuration.minimumFrameInterval = (CMTime){.value = 1, .timescale = 60, .flags = kCMTimeFlags_Valid};
-                configuration.showsCursor = NO;
-                g_testRecordingDelegate = [TestRecordingDelegate new];
-                g_testStream = [[SCStream alloc] initWithFilter:filter configuration:configuration
-                                                       delegate:g_testRecordingDelegate];
-                SCRecordingOutputConfiguration *output = [SCRecordingOutputConfiguration new];
-                output.outputURL = [NSURL fileURLWithPath:path];
-                SCRecordingOutput *recording = [[SCRecordingOutput alloc] initWithConfiguration:output
-                                                                                       delegate:g_testRecordingDelegate];
-                NSError *addError = nil;
-                if (![g_testStream addRecordingOutput:recording error:&addError]) {
-                    diagnosticEvent(@"test_record_failed", @{@"error":addError.localizedDescription ?: @""});
-                    g_testStream = nil;
-                    return;
-                }
-                [g_testStream startCaptureWithCompletionHandler:^(NSError *startError) {
-                    diagnosticEvent(@"test_record_started", @{@"error":startError.localizedDescription ?: @""});
-                }];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    [g_testStream stopCaptureWithCompletionHandler:^(NSError *stopError) {
-                        dispatch_async(dispatch_get_main_queue(), ^{ g_testStream = nil; });
-                    }];
-                });
-            });
-        }];
-    }
-}
+#pragma mark - Test hooks
 
 // Test hook, on only with `defaults write com.milev.touchpad-switcher
 // TestHooks -bool YES`: opens the menu, picks the first card whose title
@@ -3460,6 +3166,8 @@ static void runTestPick(NSString *title, double holdSeconds) {
         });
     });
 }
+
+#pragma mark - Closing the menu and activating the pick
 
 static void finishGesture(uint64_t generation, NSInteger selection) {
     if (generation != atomic_load(&g_gestureGeneration)) {
@@ -3511,20 +3219,8 @@ static void finishGesture(uint64_t generation, NSInteger selection) {
     atomic_store(&g_gestureActive, false);
     atomic_store(&g_gestureEnding, false);
     // Read the card's place before the menu and its pictures go away.
-    BOOL zooming = NO;
-    if (picked && !picked.isShortcut && !picked.isSettings && picked.application &&
-        !windowIsOnAnotherSpace(picked.windowID, picked.spaceID)) {
-        NSRect from = [g_ringView thumbnailScreenRectForEntry:picked];
-        NSRect to = visibleWindowFrame(picked.windowID);
-        if (!NSIsEmptyRect(from) && !NSIsEmptyRect(to)) {
-            CGImageRef image = g_sharpCaptureImage && g_sharpCaptureEntry == picked
-                ? CGImageRetain(g_sharpCaptureImage) : copyDecodedImage(resolvedThumbnail(picked));
-            zooming = zoomPickedCardToWindow(image, from, to, picked,
-                                             picked.isTab && !picked.isSelectedTab);
-            if (image) CGImageRelease(image);
-        }
-    }
-    releaseSharpCapture();
+    BOOL zooming = zoomPickedCard(picked);
+    RingZoomForgetPicture();
     void (^hideMenu)(void) = ^{
         if (g_panel) [g_panel orderOut:nil];
         if (g_snapshotPanel) [g_snapshotPanel orderOut:nil];
@@ -3618,6 +3314,8 @@ static void finishGesture(uint64_t generation, NSInteger selection) {
         });
     });
 }
+
+#pragma mark - Card titles and Chrome tabs
 
 static NSString *axStringAttribute(AXUIElementRef element, CFStringRef attribute) {
     CFTypeRef value = NULL;
@@ -3898,6 +3596,8 @@ static BOOL axWindowBounds(AXUIElementRef window, CGRect *boundsOut) {
     if (hasPosition && hasSize && boundsOut) *boundsOut = CGRectMake(position.x, position.y, size.width, size.height);
     return hasPosition && hasSize;
 }
+
+#pragma mark - Window scan
 
 // Window titles are shortened differently by the app and by the window server
 // ("runs..." against "run…."), so a shared beginning also counts as a match.
@@ -5068,6 +4768,8 @@ static NSArray<RingEntry *> *collectOpenWindows(void) {
     return entries;
 }
 
+#pragma mark - Thumbnails
+
 // Failed windows (for example minimized/off-Space windows) are retried with
 // exponential backoff. All callers mutate these dictionaries on the main queue.
 static BOOL thumbnailCaptureIsCoolingDown(NSNumber *windowKey) {
@@ -5103,7 +4805,6 @@ static const size_t kThumbnailPixelHeight = 384;
 // The window is captured this many times larger than its card picture; the
 // larger copy is kept with the thumbnail for the zoom to the window.
 static const size_t kZoomImageScale = 3;
-static char kZoomImageKey;
 
 static void configureThumbnailSize(SCStreamConfiguration *configuration, SCWindow *window) {
     CGFloat width = window.frame.size.width, height = window.frame.size.height;
@@ -5157,12 +4858,8 @@ static NSData *encodedThumbnailFromCGImage(CGImageRef image) {
     if (small) CGImageRelease(small);
     if (!thumbnail) return nil;
     NSData *zoomImage = encodedJPEGFromCGImage(image, 0.8);
-    if (zoomImage) objc_setAssociatedObject(thumbnail, &kZoomImageKey, zoomImage, OBJC_ASSOCIATION_RETAIN);
+    RingZoomAttachLargeImage(thumbnail, zoomImage);
     return thumbnail;
-}
-
-static NSData *zoomImageDataForThumbnail(NSData *thumbnail) {
-    return thumbnail ? objc_getAssociatedObject(thumbnail, &kZoomImageKey) : nil;
 }
 
 static NSImage *thumbnailImageFromData(NSData *data) {
@@ -6000,6 +5697,8 @@ static void pruneThumbnailCaches(NSArray<RingEntry *> *entries) {
     }
 }
 
+#pragma mark - Trackpad gestures
+
 // Finger travel moves the pointer at one constant speed, like a plain cursor.
 // Only the direction selects, so no acceleration is needed. dx and dy are in
 // trackpad widths, so both axes move alike.
@@ -6307,6 +6006,8 @@ static void invalidateThumbnailCaptureTimes(void) {
 
 @interface TouchpadWakeObserver : NSObject
 @end
+#pragma mark - System notifications
+
 @implementation TouchpadWakeObserver
 - (void)didWake:(NSNotification *)notification {
     (void)notification;
@@ -6423,6 +6124,8 @@ static void startWindowChangeWatch(void) {
     dispatch_resume(g_windowChangeTimer);
 }
 
+#pragma mark - Settings storage
+
 static BOOL settingBool(CFStringRef key, BOOL fallback) {
     Boolean valid = false;
     Boolean value = CFPreferencesGetAppBooleanValue(key, kSettingsID, &valid);
@@ -6520,6 +6223,7 @@ static void loadSettings(void) {
     atomic_store(&g_settingCardGrouping, groupingValid && grouping == CardGroupingApps ? CardGroupingApps : CardGroupingWindows);
     atomic_store(&g_settingCurrentWindowInCenter, settingBool(CFSTR("CurrentWindowInCenter"), NO));
     atomic_store(&g_settingSoundEffects, settingBool(CFSTR("SoundEffects"), NO));
+    atomic_store(&g_settingPickZoom, settingBool(CFSTR("PickZoom"), YES));
     atomic_store(&g_settingMouseHoldToSelect, settingBool(CFSTR("MouseHoldToSelect"), YES));
     atomic_store(&g_settingShowSiteIcons, settingBool(CFSTR("ShowSiteIcons"), YES));
     atomic_store(&g_settingShowAppIcons, settingBool(CFSTR("ShowAppIcons"), YES));
@@ -6696,6 +6400,8 @@ static NSString *lastOutputLine(NSString *output) {
     }
     return @"nepoznata greška";
 }
+
+#pragma mark - Settings window
 
 // Podešavanja se zatvaraju preko X, Esc ili Cmd+W, a ostaju otvorena
 // kada druga aplikacija dobije fokus.
@@ -7094,6 +6800,10 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
                                             target:self action:@selector(soundEffectsChanged:)];
     sounds.state = atomic_load(&g_settingSoundEffects) ? NSControlStateValueOn : NSControlStateValueOff;
 
+    NSButton *pickZoom = [NSButton checkboxWithTitle:@"Izabrana kartica se uveća do prozora"
+                                              target:self action:@selector(pickZoomChanged:)];
+    pickZoom.state = atomic_load(&g_settingPickZoom) ? NSControlStateValueOn : NSControlStateValueOff;
+
     self.blurLabel = [self noteWithText:@""];
     [self updateBlurLabel];
     NSSlider *blur = [NSSlider sliderWithValue:atomic_load(&g_settingBlurRadius) minValue:0 maxValue:40
@@ -7136,7 +6846,7 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
     NSStackView *cardsColumn = [self settingsColumn:@[cardsTitle, grouping, currentCenter, titlesLabel, titles, siteIcons, appIcons,
                                                       finderTabs, lookTitle, pointerLabel, pointer, highlightLabel, highlight,
                                                       light, self.dimmingLabel, backdropRow,
-                                                      self.blurLabel, blur, self.zoomLabel, zoom, sounds]];
+                                                      self.blurLabel, blur, self.zoomLabel, zoom, pickZoom, sounds]];
     [cardsColumn setCustomSpacing:kSettingsTitleGap afterView:cardsTitle];
     [cardsColumn setCustomSpacing:14 afterView:grouping];
     [cardsColumn setCustomSpacing:14 afterView:currentCenter];
@@ -7510,6 +7220,12 @@ static const CGFloat kSettingsTitleGap = 12;    // after a section title
     storeSetting(CFSTR("MouseHoldToSelect"), on ? kCFBooleanTrue : kCFBooleanFalse);
 }
 
+- (void)pickZoomChanged:(NSButton *)button {
+    BOOL on = button.state == NSControlStateValueOn;
+    atomic_store(&g_settingPickZoom, on);
+    storeSetting(CFSTR("PickZoom"), on ? kCFBooleanTrue : kCFBooleanFalse);
+}
+
 - (void)soundEffectsChanged:(NSButton *)button {
     BOOL on = button.state == NSControlStateValueOn;
     atomic_store(&g_settingSoundEffects, on);
@@ -7631,6 +7347,8 @@ static void raiseSettingsWindow(void) {
 }
 
 
+#pragma mark - System gesture conflicts
+
 static void cancelGestureForSystemConflict(void) {
     if (!atomic_load(&g_gestureActive) && !atomic_load(&g_gestureEnding)) return;
     // Invalidate pending lifts so a blocked gesture cannot activate a card.
@@ -7692,6 +7410,8 @@ static void handleSignal(int signalNumber) {
     }
     exit(0);
 }
+
+#pragma mark - Startup
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
@@ -7848,7 +7568,9 @@ int main(int argc, const char *argv[]) {
                 NSString *path = note.userInfo[@"path"];
                 if (![path isKindOfClass:NSString.class] || !path.length) return;
                 double seconds = [note.userInfo[@"seconds"] doubleValue];
-                runTestRecording(path, seconds > 0 ? MIN(seconds, 10) : 3);
+                RingTestRecordScreen(path, seconds > 0 ? MIN(seconds, 10) : 3, ^(NSString *status) {
+                    diagnosticEvent(@"test_record", @{@"status":status ?: @""});
+                });
             }];
         }
         g_windowScanQueue = dispatch_queue_create("touchpad.ring.window-scan", DISPATCH_QUEUE_SERIAL);

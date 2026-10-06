@@ -573,3 +573,59 @@ Opcija „Trenutni prozor ili tab u centru” prikazuje njegov thumbnail umesto
 X-a, a tu karticu uklanja iz kruga. Puštanje prstiju u sredini ostaje na
 istom prozoru. Kada je opcija isključena, u centru je X. Ako trenutni
 prozor ne može da se prepozna, X ostaje dostupan.
+
+### Zum izabrane kartice do prozora
+
+Kad se prsti puste na kartici prozora, slika te kartice za oko četvrt
+sekunde naraste od svog mesta u meniju do pravog položaja i veličine prozora,
+sa senkom kao kod macOS prozora. Meni za to vreme postepeno nestaje. Slika
+ostaje dok izabrani prozor zaista ne bude napred, a za Chrome tab dok Chrome
+ne prikaže taj tab, pa se prethodni prozor ne vidi kroz nju. Posle najviše
+1,2 s slika nestaje u svakom slučaju.
+
+Slika je oštra: dok prsti stoje na kartici, posle desetinke sekunde se
+priprema veća kopija sačuvana uz thumbnail (snimci su 1920 px, kartice
+dobijaju umanjenu verziju od 640 px). Kad prozor već prikazuje tu karticu,
+snima se i uživo u punoj rezoluciji ekrana.
+
+Zuma nema za prečice, podešavanja, minimizovane i sakrivene prozore, prozore
+na drugom desktopu i kad je u macOS-u uključeno **Accessibility → Display →
+Reduce motion**. Isključuje se u podešavanjima: „Izabrana kartica se uveća
+do prozora”. Kod je u `ring_zoom.m`.
+
+### Automatski test izbora i snimanje animacije
+
+Za proveru animacija bez trackpada postoji test koji je uključen samo uz:
+
+```bash
+defaults write com.milev.touchpad-switcher TestHooks -bool YES
+```
+
+Posle restarta aplikacija prima dve distribuirane notifikacije:
+`com.milev.touchpad-switcher.test-pick` (`title`: deo naslova kartice,
+`hold`: sekunde zadržavanja) otvara meni, bira prvu karticu sa tim naslovom
+i pušta je; `com.milev.touchpad-switcher.test-record` (`path`, `seconds`)
+snima glavni ekran u `.mov` preko dozvole za snimanje ekrana same aplikacije
+(`ring_test_recording.m`). Primer iz Terminala:
+
+```bash
+osascript -l JavaScript -e "ObjC.import('Foundation'); var c=\$.NSDistributedNotificationCenter.defaultCenter;
+c.postNotificationNameObjectUserInfoDeliverImmediately('com.milev.touchpad-switcher.test-record', \$(), \$({path:'/tmp/t.mov', seconds:3}), true);
+delay(0.6);
+c.postNotificationNameObjectUserInfoDeliverImmediately('com.milev.touchpad-switcher.test-pick', \$(), \$({title:'WhatsApp', hold:0.5}), true);"
+ffmpeg -i /tmp/t.mov -vsync 0 /tmp/frame_%04d.png
+```
+
+Događaj `test_pick` u dnevniku navodi nazive svih kartica. Posle testa:
+`defaults delete com.milev.touchpad-switcher TestHooks`.
+
+### Organizacija koda
+
+Glavni fajl `touchpad_ring_test.m` je podeljen oznakama `#pragma mark`
+(model kartice, prikaz kruga, otvaranje i zatvaranje menija, skeniranje
+prozora, thumbnailovi, gestovi, podešavanja, pokretanje), koje se vide u
+listi simbola editora. Zasebni moduli sa sopstvenim zaglavljem:
+`ring_media.m` (video u Chrome-u), `ring_favicons.m` (ikonice sajtova),
+`ring_update.m` (nova izdanja), `ring_zoom.m` (zum izabrane kartice) i
+`ring_test_recording.m` (snimanje ekrana za testove). Novi modul se dodaje u
+`RING_MODULES` u `Makefile`-u.
