@@ -3105,7 +3105,11 @@ static BOOL zoomPickedCard(RingEntry *picked) {
     if (!picked || picked.isShortcut || picked.isSettings || !picked.application) return NO;
     if (!RingZoomAllowed(atomic_load(&g_settingPickZoom))) return NO;
     if (windowIsOnAnotherSpace(picked.windowID, picked.spaceID)) return NO;
-    if (RingZoomWindowIsFrontmostOnDisplay(picked.windowID)) {
+    if (picked.isTab && picked.isSelectedTab) {
+        diagnosticEvent(@"zoom_skipped",@{@"reason":@"same_tab",@"entry":diagnosticEntry(picked)});
+        return NO;
+    }
+    if (!picked.isTab && RingZoomWindowIsFrontmostOnDisplay(picked.windowID)) {
         diagnosticEvent(@"zoom_skipped",@{@"reason":@"already_frontmost",@"entry":diagnosticEntry(picked)});
         return NO;
     }
@@ -3125,6 +3129,7 @@ static BOOL zoomPickedCard(RingEntry *picked) {
     }
     BOOL started = RingZoomStart(image, from, to, picked.windowID, tabShown);
     if (image) CGImageRelease(image);
+    if (started) diagnosticEvent(@"zoom_started",@{@"entry":diagnosticEntry(picked)});
     return started;
 }
 
