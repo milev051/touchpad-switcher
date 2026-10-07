@@ -317,6 +317,8 @@ static NSArray<NSValue *> *adaptiveCardLayout(NSArray<RingEntry *> *entries, NSS
                                              CGFloat *outX, CGFloat *outY) {
     NSUInteger count = entries.count;
     if (!count) { *outX = *outY = 0; return @[]; }
+    // Large displays can fit bigger thumbnails with slightly tighter spacing.
+    CGFloat minimumCardGap = screen.width >= 1600 && screen.height >= 900 ? 16.0 : 24.0;
     NSSize *units = calloc(count, sizeof(NSSize));
     NSSize *sizes = calloc(count, sizeof(NSSize));
     NSPoint *directions = calloc(count, sizeof(NSPoint));
@@ -356,7 +358,7 @@ static NSArray<NSValue *> *adaptiveCardLayout(NSArray<RingEntry *> *entries, NSS
                     clear = rectangleGap(a, sizes[i], NSZeroPoint, NSMakeSize(kHubRadius * 2, kHubRadius * 2)) >= 30;
                     for (NSUInteger j = i + 1; j < count && clear; j++) {
                         NSPoint b = NSMakePoint(directions[j].x * radius, directions[j].y * radius * ratio);
-                        clear = zoomReservedPairGap(a, sizes[i], b, sizes[j]) >= 24;
+                        clear = zoomReservedPairGap(a, sizes[i], b, sizes[j]) >= minimumCardGap;
                     }
                 }
                 if (clear) upperRadius = radius;
@@ -368,7 +370,7 @@ static NSArray<NSValue *> *adaptiveCardLayout(NSArray<RingEntry *> *entries, NSS
                 fits = rectangleGap(a, sizes[i], NSZeroPoint, NSMakeSize(kHubRadius * 2, kHubRadius * 2)) >= 29.99;
                 for (NSUInteger j = i + 1; j < count && fits; j++) {
                     NSPoint b = NSMakePoint(directions[j].x * upperRadius, directions[j].y * upperRadius * ratio);
-                    fits = zoomReservedPairGap(a, sizes[i], b, sizes[j]) >= 23.99;
+                    fits = zoomReservedPairGap(a, sizes[i], b, sizes[j]) >= minimumCardGap - 0.01;
                 }
             }
             if (fits) { low = candidate; acceptedRadius = upperRadius; }
@@ -400,7 +402,8 @@ static NSArray<NSValue *> *adaptiveCardLayout(NSArray<RingEntry *> *entries, NSS
                 CGFloat gapX = MAX(0, fabs(dx) - halfX), gapY = MAX(0, fabs(dy) - halfY);
                 CGFloat distance = hypot(gapX, gapY);
                 BOOL neighbors = j == i + 1 || (i == 0 && j == count - 1);
-                CGFloat force = neighbors ? (distance - 24) * 0.10 : MIN(0, distance - 24) * 0.20;
+                CGFloat force = neighbors ? (distance - minimumCardGap) * 0.10
+                                          : MIN(0, distance - minimumCardGap) * 0.20;
                 CGFloat nx, ny;
                 if (distance > 0.001) {
                     nx = copysign(gapX / distance, dx); ny = copysign(gapY / distance, dy);
@@ -408,7 +411,7 @@ static NSArray<NSValue *> *adaptiveCardLayout(NSArray<RingEntry *> *entries, NSS
                     BOOL horizontal = halfX - fabs(dx) < halfY - fabs(dy);
                     nx = horizontal ? (dx >= 0 ? 1 : -1) : 0;
                     ny = horizontal ? 0 : (dy >= 0 ? 1 : -1);
-                    force = -(24 + MIN(halfX - fabs(dx), halfY - fabs(dy))) * 0.20;
+                    force = -(minimumCardGap + MIN(halfX - fabs(dx), halfY - fabs(dy))) * 0.20;
                 }
                 adjustments[i].x += nx * force; adjustments[i].y += ny * force;
                 adjustments[j].x -= nx * force; adjustments[j].y -= ny * force;
@@ -451,7 +454,7 @@ static NSArray<NSValue *> *adaptiveCardLayout(NSArray<RingEntry *> *entries, NSS
         }
         for (NSUInteger j = i+1; j < count && compactFits; j++) {
             NSSize other = NSMakeSize(sizes[j].width*kSelectedCardScale, sizes[j].height*kSelectedCardScale);
-            compactFits = zoomReservedPairGap(positions[i],scaled,positions[j],other) >= 24;
+            compactFits = zoomReservedPairGap(positions[i],scaled,positions[j],other) >= minimumCardGap;
         }
     }
     if (!compactFits) for (NSUInteger i = 0; i < count; i++) {
