@@ -8,6 +8,10 @@
 // Zero for a minimized, hidden or unknown window.
 NSRect RingZoomVisibleWindowFrame(CGWindowID windowID);
 
+// After activation, move the cursor to the picked window only when it is on a
+// different physical display. The cursor stays put if the user moved it.
+void RingZoomFollowWindowOnOtherDisplay(CGWindowID windowID, CGPoint gestureStart);
+
 // Starts the zoom from `from` to `to` (screen coordinates) with the image,
 // which the zoom retains. The picture fades once the window is the frontmost
 // one and, when given, `contentShown` returns YES; it is asked on a

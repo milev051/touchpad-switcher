@@ -57,32 +57,101 @@ NSData *RingZoomLargeImageForThumbnail(NSData *thumbnail) {
 
 #pragma mark - Windows
 
-NSRect RingZoomVisibleWindowFrame(CGWindowID windowID) {
-    if (windowID == kCGNullWindowID || !NSScreen.screens.count) return NSZeroRect;
+static NSDictionary *copyWindowInfo(CGWindowID windowID) {
+    if (windowID == kCGNullWindowID) return nil;
     CFArrayRef ids = CFArrayCreate(NULL, (const void **)(uintptr_t[]){windowID}, 1, NULL);
     NSArray *info = CFBridgingRelease(CGWindowListCreateDescriptionFromArray(ids));
     CFRelease(ids);
-    NSDictionary *window = info.firstObject;
-    if (![window[(id)kCGWindowIsOnscreen] boolValue]) return NSZeroRect;
-    CGRect bounds = CGRectZero;
-    if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)window[(id)kCGWindowBounds], &bounds))
-        return NSZeroRect;
-    CGFloat primaryHeight = NSHeight(NSScreen.screens.firstObject.frame);
-    return NSMakeRect(bounds.origin.x, primaryHeight - CGRectGetMaxY(bounds), bounds.size.width, bounds.size.height);
+    return info.firstObject;
 }
 
-// Whether the window is the frontmost ordinary window on screen, not counting
-// this app's own panels.
+static BOOL windowBounds(NSDictionary *info, CGRect *bounds) {
+    if (!info || !bounds) return NO;
+    return CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)info[(id)kCGWindowBounds], bounds);
+}
+
+// Quartz display bounds and AppKit screen frames use different vertical
+// origins. Pick the display with the largest overlap for windows spanning
+// multiple displays, then convert through that display's own geometry.
+static NSScreen *screenForQuartzBounds(CGRect bounds, CGRect *displayBoundsOut) {
+    NSScreen *best = nil;
+    CGRect bestBounds = CGRectZero;
+    CGFloat bestArea = 0;
+    for (NSScreen *screen in NSScreen.screens) {
+        NSNumber *number = screen.deviceDescription[@"NSScreenNumber"];
+        if (!number) continue;
+        CGRect displayBounds = CGDisplayBounds(number.unsignedIntValue);
+        CGRect overlap = CGRectIntersection(bounds, displayBounds);
+        CGFloat area = CGRectIsNull(overlap) ? 0 : CGRectGetWidth(overlap) * CGRectGetHeight(overlap);
+        if (area > bestArea) {
+            best = screen;
+            bestBounds = displayBounds;
+            bestArea = area;
+        }
+    }
+    if (best && displayBoundsOut) *displayBoundsOut = bestBounds;
+    return best;
+}
+
 static BOOL windowIsFrontmost(CGWindowID windowID) {
+    NSDictionary *target = copyWindowInfo(windowID);
+    CGRect targetBounds = CGRectZero, displayBounds = CGRectZero;
+    if (!windowBounds(target, &targetBounds) || !screenForQuartzBounds(targetBounds, &displayBounds)) return NO;
     NSArray *windows = CFBridgingRelease(CGWindowListCopyWindowInfo(
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
     pid_t ownPID = NSProcessInfo.processInfo.processIdentifier;
     for (NSDictionary *window in windows) {
         if ([window[(id)kCGWindowLayer] intValue] != 0) continue;
         if ([window[(id)kCGWindowOwnerPID] intValue] == ownPID) continue;
+        CGRect bounds = CGRectZero;
+        if (!windowBounds(window, &bounds) || !CGRectIntersectsRect(bounds, displayBounds)) continue;
         return [window[(id)kCGWindowNumber] unsignedIntValue] == windowID;
     }
     return NO;
+}
+
+NSRect RingZoomVisibleWindowFrame(CGWindowID windowID) {
+    if (!NSScreen.screens.count) return NSZeroRect;
+    NSDictionary *window = copyWindowInfo(windowID);
+    if (![window[(id)kCGWindowIsOnscreen] boolValue]) return NSZeroRect;
+    CGRect bounds = CGRectZero;
+    CGRect displayBounds = CGRectZero;
+    NSScreen *screen = windowBounds(window, &bounds) ? screenForQuartzBounds(bounds, &displayBounds) : nil;
+    if (!screen) return NSZeroRect;
+    return NSMakeRect(NSMinX(screen.frame) + CGRectGetMinX(bounds) - CGRectGetMinX(displayBounds),
+                      NSMinY(screen.frame) + CGRectGetMaxY(displayBounds) - CGRectGetMaxY(bounds),
+                      CGRectGetWidth(bounds), CGRectGetHeight(bounds));
+}
+
+static void followWindowIfReady(CGWindowID windowID, CGPoint gestureStart, CFTimeInterval deadline) {
+    CGEventRef event = CGEventCreate(NULL);
+    CGPoint cursor = event ? CGEventGetLocation(event) : gestureStart;
+    if (event) CFRelease(event);
+    // Respect real mouse movement after the gesture instead of fighting it.
+    if (hypot(cursor.x - gestureStart.x, cursor.y - gestureStart.y) > 4.0) return;
+    NSDictionary *window = copyWindowInfo(windowID);
+    CGRect bounds = CGRectZero;
+    if (!windowBounds(window, &bounds) || ![window[(id)kCGWindowIsOnscreen] boolValue]) return;
+    CGPoint center = CGPointMake(CGRectGetMidX(bounds), CGRectGetMidY(bounds));
+    CGDirectDisplayID targetDisplay = 0, startDisplay = 0;
+    uint32_t count = 0;
+    if (CGGetDisplaysWithPoint(center, 1, &targetDisplay, &count) != kCGErrorSuccess || count == 0) return;
+    if (CGGetDisplaysWithPoint(gestureStart, 1, &startDisplay, &count) != kCGErrorSuccess || count == 0 ||
+        targetDisplay == startDisplay) return;
+    if (windowIsFrontmost(windowID)) {
+        CGWarpMouseCursorPosition(center);
+        return;
+    }
+    if (CACurrentMediaTime() >= deadline) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        followWindowIfReady(windowID, gestureStart, deadline);
+    });
+}
+
+void RingZoomFollowWindowOnOtherDisplay(CGWindowID windowID, CGPoint gestureStart) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        followWindowIfReady(windowID, gestureStart, CACurrentMediaTime() + 1.6);
+    });
 }
 
 BOOL RingZoomAllowed(BOOL settingOn) {

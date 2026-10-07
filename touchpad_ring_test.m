@@ -3293,10 +3293,12 @@ static void finishGesture(uint64_t generation, NSInteger selection) {
         entry.windowID != kCGNullWindowID;
     NSString *chromeTabKey = captureChromeAfterRaise ? [tabThumbnailKey(entry) copy] : nil;
     CGWindowID chromeWindowID = entry.windowID;
+    CGPoint gestureStart = g_cursorAtGestureStart;
     // The window being left was captured when the ring opened, so raising the
     // selection does not wait for a screenshot.
     dispatch_async(g_windowActivationQueue, ^{
         raiseWindowForEntry(entry, generation);
+        RingZoomFollowWindowOnOtherDisplay(entry.windowID, gestureStart);
         if (!chromeTabKey.length) return;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 700 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
