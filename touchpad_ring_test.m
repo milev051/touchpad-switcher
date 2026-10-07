@@ -3105,6 +3105,10 @@ static BOOL zoomPickedCard(RingEntry *picked) {
     if (!picked || picked.isShortcut || picked.isSettings || !picked.application) return NO;
     if (!RingZoomAllowed(atomic_load(&g_settingPickZoom))) return NO;
     if (windowIsOnAnotherSpace(picked.windowID, picked.spaceID)) return NO;
+    if (RingZoomWindowIsFrontmostOnDisplay(picked.windowID)) {
+        diagnosticEvent(@"zoom_skipped",@{@"reason":@"already_frontmost",@"entry":diagnosticEntry(picked)});
+        return NO;
+    }
     NSRect from = [g_ringView thumbnailScreenRectForEntry:picked];
     NSRect to = RingZoomVisibleWindowFrame(picked.windowID);
     if (NSIsEmptyRect(from) || NSIsEmptyRect(to)) return NO;

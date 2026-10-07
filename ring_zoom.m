@@ -93,7 +93,7 @@ static NSScreen *screenForQuartzBounds(CGRect bounds, CGRect *displayBoundsOut) 
     return best;
 }
 
-static BOOL windowIsFrontmost(CGWindowID windowID) {
+BOOL RingZoomWindowIsFrontmostOnDisplay(CGWindowID windowID) {
     NSDictionary *target = copyWindowInfo(windowID);
     CGRect targetBounds = CGRectZero, displayBounds = CGRectZero;
     if (!windowBounds(target, &targetBounds) || !screenForQuartzBounds(targetBounds, &displayBounds)) return NO;
@@ -138,7 +138,7 @@ static void followWindowIfReady(CGWindowID windowID, CGPoint gestureStart, CFTim
     if (CGGetDisplaysWithPoint(center, 1, &targetDisplay, &count) != kCGErrorSuccess || count == 0) return;
     if (CGGetDisplaysWithPoint(gestureStart, 1, &startDisplay, &count) != kCGErrorSuccess || count == 0 ||
         targetDisplay == startDisplay) return;
-    if (windowIsFrontmost(windowID)) {
+    if (RingZoomWindowIsFrontmostOnDisplay(windowID)) {
         CGWarpMouseCursorPosition(center);
         return;
     }
@@ -230,7 +230,7 @@ static void fadeOut(uint64_t run) {
 static void fadeWhenWindowIsShown(uint64_t run, CGWindowID windowID, BOOL (^contentShown)(void),
                                   CFTimeInterval deadline) {
     if (run != g_run) return;
-    if (!windowIsFrontmost(windowID) && CACurrentMediaTime() < deadline) {
+    if (!RingZoomWindowIsFrontmostOnDisplay(windowID) && CACurrentMediaTime() < deadline) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
             fadeWhenWindowIsShown(run, windowID, contentShown, deadline);
         });

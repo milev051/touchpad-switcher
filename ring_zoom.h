@@ -8,6 +8,9 @@
 // Zero for a minimized, hidden or unknown window.
 NSRect RingZoomVisibleWindowFrame(CGWindowID windowID);
 
+// YES when the window is already the foremost ordinary window on its display.
+BOOL RingZoomWindowIsFrontmostOnDisplay(CGWindowID windowID);
+
 // After activation, move the cursor to the picked window only when it is on a
 // different physical display. The cursor stays put if the user moved it.
 void RingZoomFollowWindowOnOtherDisplay(CGWindowID windowID, CGPoint gestureStart);
