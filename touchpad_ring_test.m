@@ -1413,6 +1413,14 @@ static NSMutableDictionary<NSString *, NSNumber *> *g_tabLastCaptured;
 static NSMutableDictionary<NSNumber *, NSNumber *> *g_windowLastCaptured;
 static NSMutableDictionary<NSString *, NSString *> *g_tabCachedURL;
 static NSMutableDictionary<NSNumber *, NSString *> *g_chromeCaptureURLs;
+// Background capture takes a window or tab when it first appears and once more
+// a few seconds later, after its page has loaded. Then the picture is kept, so
+// a playing video is not captured over and over. Leaving the app, opening the
+// ring and a new page in the tab capture it again. Holds NSNumber window keys
+// and NSString tab keys.
+static NSMutableSet *g_thumbnailSettled;
+static const NSTimeInterval kThumbnailSettleDelay = 3.0;
+static const NSTimeInterval kThumbnailBackgroundOnly = -1;
 static dispatch_queue_t g_liveCaptureQueue;
 static NSTimeInterval g_shareableContentRetryAfter = 0;
 static NSUInteger g_shareableContentFailureCount = 0;
@@ -3744,6 +3752,7 @@ static void syncChromeTabMediaWithCurrentURL(RingEntry *entry) {
     NSString *previous = g_tabCachedURL[tabKey];
     if (previous && ![previous isEqualToString:url]) {
         [g_tabThumbnailCache removeObjectForKey:tabKey];
+        [g_thumbnailSettled removeObject:tabKey];
         [g_tabLastCaptured removeObjectForKey:tabKey];
         if (entry.windowID != kCGNullWindowID) g_chromeWindowLastCapture[@(entry.windowID)] = @0;
         entry.thumbnailData = nil;
@@ -4822,12 +4831,22 @@ static const size_t kZoomImageScale = 3;
 
 static void configureThumbnailSize(SCStreamConfiguration *configuration, SCWindow *window) {
     CGFloat width = window.frame.size.width, height = window.frame.size.height;
-    size_t pixelHeight = kThumbnailPixelHeight;
+    size_t pixelWidth = kThumbnailPixelWidth, pixelHeight = kThumbnailPixelHeight;
     if (width > 1 && height > 1) {
-        pixelHeight = (size_t)MIN(MAX(lround(kThumbnailPixelWidth * height / width), 120), 960);
+        // A tall window (portrait display) is limited by height, keeping its
+        // proportions instead of a wider frame with black margins.
+        pixelHeight = (size_t)MAX(lround(kThumbnailPixelWidth * height / width), 120);
+        if (pixelHeight > 960) {
+            pixelHeight = 960;
+            pixelWidth = (size_t)MAX(lround(960 * width / height), 120);
+        }
     }
-    configuration.width = kThumbnailPixelWidth * kZoomImageScale;
+    configuration.width = pixelWidth * kZoomImageScale;
     configuration.height = pixelHeight * kZoomImageScale;
+    // Without this a window smaller than the frame (1x display) is copied at
+    // its own size into the top left corner, with the rest left black.
+    configuration.scalesToFit = YES;
+    configuration.preservesAspectRatio = YES;
     configuration.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
 }
 
@@ -4866,8 +4885,9 @@ static NSData *encodedThumbnailFromCGImage(CGImageRef image) {
     if (!image) return nil;
     size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
     if (width <= kThumbnailPixelWidth * 3 / 2) return encodedJPEGFromCGImage(image, 0.72);
-    size_t smallHeight = MAX((size_t)1, (size_t)lround((double)height * kThumbnailPixelWidth / width));
-    CGImageRef small = copyScaledImage(image, kThumbnailPixelWidth, smallHeight);
+    size_t smallWidth = MAX((size_t)1, width / kZoomImageScale);
+    size_t smallHeight = MAX((size_t)1, (size_t)lround((double)height * smallWidth / width));
+    CGImageRef small = copyScaledImage(image, smallWidth, smallHeight);
     NSData *thumbnail = encodedJPEGFromCGImage(small, 0.72);
     if (small) CGImageRelease(small);
     if (!thumbnail) return nil;
@@ -5095,6 +5115,20 @@ static NSMutableSet<NSNumber *> *capturableOnScreenWindowIDs(void) {
 // planner: the app being left (onlyPID) or, when the ring opens, every visible
 // window whose picture is older than minAge. Results are stored in one pass so
 // an open ring redraws once.
+// Whether a background pass should capture this window or tab: once when it
+// appears, once more kThumbnailSettleDelay later, and then not again.
+static BOOL backgroundCaptureWanted(id key, BOOL hasPicture, NSTimeInterval last, NSTimeInterval now) {
+    @synchronized ([NSMutableDictionary class]) {
+        if (!hasPicture || last <= 0) return YES;
+        if ([g_thumbnailSettled containsObject:key] || now - last < kThumbnailSettleDelay) return NO;
+        if (!g_thumbnailSettled) g_thumbnailSettled = [NSMutableSet set];
+        [g_thumbnailSettled addObject:key];
+        return YES;
+    }
+}
+
+// minAge kThumbnailBackgroundOnly captures only what backgroundCaptureWanted
+// asks for; any other value recaptures pictures older than minAge seconds.
 static void refreshThumbnailsNow(pid_t onlyPID, NSTimeInterval minAge) {
     if (!g_thumbnailPreviewsEnabled || !g_liveCaptureQueue || !CGPreflightScreenCaptureAccess()) return;
     NSMutableSet<NSNumber *> *onScreenIDs = capturableOnScreenWindowIDs();
@@ -5124,7 +5158,10 @@ static void refreshThumbnailsNow(pid_t onlyPID, NSTimeInterval minAge) {
             NSString *tabKey = entry.isTab ? tabThumbnailKey(entry) : nil;
             NSTimeInterval last = tabKey ? g_tabLastCaptured[tabKey].doubleValue
                                          : g_windowLastCaptured[windowKey].doubleValue;
-            if (last > 0 && now - last < minAge) continue;
+            if (minAge == kThumbnailBackgroundOnly) {
+                BOOL hasPicture = tabKey ? g_tabThumbnailCache[tabKey] != nil : g_thumbnailCache[windowKey] != nil;
+                if (!backgroundCaptureWanted(tabKey ?: windowKey, hasPicture, last, now)) continue;
+            } else if (last > 0 && now - last < minAge) continue;
             NSMutableDictionary *target = [@{
                 @"window": windowKey,
                 @"pid": @(entry.application.processIdentifier)
@@ -5386,12 +5423,8 @@ static void capturePendingThumbnails(NSArray<RingEntry *> *entries,
             if (canCapture && entry.windowID != kCGNullWindowID &&
                 !thumbnailCaptureIsCoolingDown(key) &&
                 ![g_tabThumbnailRequests containsObject:tabKey]) {
-                BOOL shouldCapture = NO;
-                if (!tabThumbnailSnapshot[tabKey]) {
-                    shouldCapture = YES;
-                } else if (entry.isSelectedTab && (now - lastCap > 3.0)) {
-                    shouldCapture = YES;
-                }
+                BOOL shouldCapture = !tabThumbnailSnapshot[tabKey] ||
+                    (entry.isSelectedTab && backgroundCaptureWanted(tabKey, YES, lastCap, now));
                 if (shouldCapture) {
                     [g_tabThumbnailRequests addObject:tabKey];
                     [wantedTabs addObject:entry];
@@ -5401,9 +5434,8 @@ static void capturePendingThumbnails(NSArray<RingEntry *> *entries,
         if (!entry.isTab && entry.windowID != kCGNullWindowID &&
             !thumbnailCaptureIsCoolingDown(key) &&
             ![g_thumbnailRequests containsObject:key]) {
-            // Visible windows keep changing; the active app refreshes sooner.
-            NSTimeInterval refresh = entry.application.isActive ? 3.0 : 12.0;
-            if (!thumbnailSnapshot[key] || now - g_windowLastCaptured[key].doubleValue >= refresh) {
+            if (backgroundCaptureWanted(key, thumbnailSnapshot[key] != nil,
+                                        g_windowLastCaptured[key].doubleValue, now)) {
                 [wantedIDs addObject:key];
             }
         }
@@ -5580,7 +5612,7 @@ static void schedulePendingThumbnailCapture(NSArray<RingEntry *> *entries) {
     if (!g_thumbnailPlanningQueue) {
         g_thumbnailPlanningQueue = dispatch_queue_create("touchpad.ring.thumbnail-planning", DISPATCH_QUEUE_SERIAL);
     }
-    refreshThumbnailsNow(0, 0.6);
+    refreshThumbnailsNow(0, kThumbnailBackgroundOnly);
     NSArray<RingEntry *> *entrySnapshot = [entries copy];
     dispatch_async(g_thumbnailPlanningQueue, ^{
         if (atomic_load(&g_gestureActive)) return;
@@ -5670,6 +5702,7 @@ static void pruneThumbnailCaches(NSArray<RingEntry *> *entries) {
         for (NSNumber *key in keysToRemove) {
             [g_thumbnailCache removeObjectForKey:key];
             [g_windowLastCaptured removeObjectForKey:key];
+            [g_thumbnailSettled removeObject:key];
             [g_windowLastSeen removeObjectForKey:key];
             [g_windowPIDMap removeObjectForKey:key];
         }
@@ -5703,6 +5736,7 @@ static void pruneThumbnailCaches(NSArray<RingEntry *> *entries) {
             [g_tabLastSeen removeObjectForKey:key];
             [g_tabPIDMap removeObjectForKey:key];
             [g_tabLastCaptured removeObjectForKey:key];
+            [g_thumbnailSettled removeObject:key];
         }
     }
 
@@ -6015,6 +6049,7 @@ static void invalidateThumbnailCaptureTimes(void) {
         [g_windowLastCaptured removeAllObjects];
         [g_tabLastCaptured removeAllObjects];
         [g_chromeWindowLastCapture removeAllObjects];
+        [g_thumbnailSettled removeAllObjects];
     }
 }
 
@@ -6118,7 +6153,7 @@ static void startWindowChangeWatch(void) {
     dispatch_queue_t queue = dispatch_queue_create("touchpad.ring.window-watch", DISPATCH_QUEUE_SERIAL);
     g_windowChangeTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
     dispatch_source_set_timer(g_windowChangeTimer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(NSEC_PER_SEC / 3)),
-                              NSEC_PER_SEC / 3, 50 * NSEC_PER_MSEC);
+                              NSEC_PER_SEC / 3, 150 * NSEC_PER_MSEC);
     dispatch_source_set_event_handler(g_windowChangeTimer, ^{
         if (atomic_load(&g_gestureActive)) return;
         @autoreleasepool {
@@ -7401,9 +7436,10 @@ static void requestGestureConflictNotice(void) {
 
 static void startSystemGestureWatch(void) {
     refreshSystemGestureConflicts();
-    NSTimer *timer = [NSTimer timerWithTimeInterval:1 repeats:YES block:^(NSTimer *timer) {
+    NSTimer *timer = [NSTimer timerWithTimeInterval:3 repeats:YES block:^(NSTimer *timer) {
         refreshSystemGestureConflicts();
     }];
+    timer.tolerance = 1;
     [NSRunLoop.mainRunLoop addTimer:timer forMode:NSRunLoopCommonModes];
 }
 
@@ -7524,9 +7560,10 @@ int main(int argc, const char *argv[]) {
         printf("Press Ctrl-C to stop. Three-finger drag should be disabled for a clean test.\n");
         fflush(stdout);
         updateRecentWindowHistory();
-        g_recentWindowTimer=[NSTimer scheduledTimerWithTimeInterval:0.1 repeats:YES block:^(NSTimer *timer) {
+        g_recentWindowTimer=[NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *timer) {
             if (!atomic_load(&g_gestureActive) && !atomic_load(&g_gestureEnding)) updateRecentWindowHistory();
         }];
+        g_recentWindowTimer.tolerance=0.1;
         // Build the hidden panel at startup so the first three-finger gesture
         // does not pay for creating its window and layer tree.
         ensurePanel(NSScreen.mainScreen);
@@ -7591,8 +7628,8 @@ int main(int argc, const char *argv[]) {
         g_scanTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_windowScanQueue);
         dispatch_source_set_timer(g_scanTimer,
                                   dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                                  (uint64_t)(0.5 * NSEC_PER_SEC),
-                                  (uint64_t)(100 * NSEC_PER_MSEC));
+                                  (uint64_t)(2 * NSEC_PER_SEC),
+                                  (uint64_t)(500 * NSEC_PER_MSEC));
         dispatch_source_set_event_handler(g_scanTimer, ^{ scanWindowsNow(); });
         startWindowChangeWatch();
         dispatch_resume(g_scanTimer);
