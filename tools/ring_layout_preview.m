@@ -534,15 +534,19 @@ static void verifyPreview(LayoutPreview *preview) {
         NSSize screen=preview.ring.bounds.size;
         CGFloat rx,ry;
         NSArray *rects=adaptiveCardLayout(preview.ring.entries,screen,&rx,&ry);
-        NSMutableArray *visible=[NSMutableArray array];
-        for (NSUInteger i=0;i<rects.count;i++)
-            [visible addObject:[NSValue valueWithRect:visibleCardRect(preview.ring.entries[i],[rects[i] rectValue])]];
+        NSRect group=NSZeroRect;
+        for (NSUInteger i=0;i<rects.count;i++) {
+            NSRect rect=visibleCardRect(preview.ring.entries[i],[rects[i] rectValue]);
+            group=i ? NSUnionRect(group,rect) : rect;
+        }
         NSPoint origin=NSMakePoint(screen.width/2,screen.height/2);
-        NSPoint balanced=balancedHubPoint(preview.ring.entries,rects,screen);
-        CGFloat before=hubGapVariation(visible,origin),after=hubGapVariation(visible,balanced);
-        assert(after<=before+0.001);
-        assert(hubClearance(rects,balanced)+0.001>=MIN(28.0,hubClearance(rects,origin)));
-        printf("Balans, oblik %ld: odstupanje razmaka %.1f -> %.1f pt.\n",(long)shape,before,after);
+        NSPoint hub=balancedHubPoint(preview.ring.entries,rects,screen);
+        NSPoint middle=NSMakePoint(NSMidX(group),NSMidY(group));
+        BOOL centered=hypot(hub.x-middle.x,hub.y-middle.y)<0.5;
+        // X je u sredini kartica, osim kad bi tamo bio preblizu nekoj kartici.
+        assert(centered || hubClearance(rects,middle)<MIN(28.0,hubClearance(rects,origin)));
+        assert(hubClearance(rects,hub)+0.001>=MIN(28.0,hubClearance(rects,origin)));
+        printf("Sredina, oblik %ld: X %s.\n",(long)shape,centered ? "u sredini kartica" : "pomeren zbog blizine kartice");
     }
     const NSSize sizes[] = {{800,600},{1100,688},{1440,900},{1600,900},{1996,1248}};
     const NSUInteger counts[] = {1,2,3,4,5,6,7,8,9,10,12,16};
@@ -802,6 +806,7 @@ int main(int argc,const char *argv[]) {
             return 0;
         }
         if ([args containsObject:@"--no-titles"]) atomic_store(&g_settingCardTitles,CardTitlesNone);
+        if ([args containsObject:@"--no-thumbnails"]) atomic_store(&g_settingThumbnails,false);
         CGFloat width=argument(@"--width") ? argument(@"--width").doubleValue : 1100;
         CGFloat height=argument(@"--height") ? argument(@"--height").doubleValue : width/1.6;
         LayoutPreview *preview=[LayoutPreview new];

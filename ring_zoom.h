@@ -31,7 +31,7 @@ BOOL RingZoomAllowed(BOOL settingOn);
 CGImageRef RingZoomCopyDecodedImage(CGImageRef source);
 CGImageRef RingZoomCopyDecodedImageFromData(NSData *data);
 
-// A larger copy of a thumbnail, kept as long as the thumbnail data itself.
+// A larger copy of a thumbnail, kept for the most recent captures only.
 // Safe on any thread.
 void RingZoomAttachLargeImage(NSData *thumbnail, NSData *largeJPEG);
 NSData *RingZoomLargeImageForThumbnail(NSData *thumbnail);

@@ -30,8 +30,8 @@ run-python:
 list-apps: $(TARGET)
 	./$(TARGET) --list-apps
 
-RING_MODULES = ring_media.m ring_favicons.m ring_update.m ring_zoom.m ring_test_recording.m
-RING_HEADERS = $(RING_MODULES:.m=.h)
+RING_MODULES = ring_media.m ring_favicons.m ring_update.m ring_zoom.m ring_test_recording.m ring_window_events.m ring_settings.m
+RING_HEADERS = $(RING_MODULES:.m=.h) ring_shared.h
 RING_SOURCES = touchpad_ring_test.m $(RING_MODULES)
 
 touchpad_ring_test: $(RING_SOURCES) $(RING_HEADERS)

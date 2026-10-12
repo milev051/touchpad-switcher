@@ -47,12 +47,31 @@ CGImageRef RingZoomCopyDecodedImageFromData(NSData *data) {
 
 static char kLargeImageKey;
 
+// Only the most recent captures keep their large copy; an older card zooms
+// from a live capture or its thumbnail. Each copy is a few hundred KB.
+static const NSUInteger kLargeImageLimit = 16;
+
 void RingZoomAttachLargeImage(NSData *thumbnail, NSData *largeJPEG) {
-    if (thumbnail && largeJPEG) objc_setAssociatedObject(thumbnail, &kLargeImageKey, largeJPEG, OBJC_ASSOCIATION_RETAIN);
+    if (!thumbnail || !largeJPEG) return;
+    static NSPointerArray *recent;
+    @synchronized ([NSPointerArray class]) {
+        if (!recent) recent = [NSPointerArray weakObjectsPointerArray];
+        [recent compact];
+        [recent addPointer:(__bridge void *)thumbnail];
+        objc_setAssociatedObject(thumbnail, &kLargeImageKey, largeJPEG, OBJC_ASSOCIATION_RETAIN);
+        while (recent.count > kLargeImageLimit) {
+            NSData *oldest = (__bridge NSData *)[recent pointerAtIndex:0];
+            if (oldest) objc_setAssociatedObject(oldest, &kLargeImageKey, nil, OBJC_ASSOCIATION_RETAIN);
+            [recent removePointerAtIndex:0];
+        }
+    }
 }
 
 NSData *RingZoomLargeImageForThumbnail(NSData *thumbnail) {
-    return thumbnail ? objc_getAssociatedObject(thumbnail, &kLargeImageKey) : nil;
+    if (!thumbnail) return nil;
+    @synchronized ([NSPointerArray class]) {
+        return objc_getAssociatedObject(thumbnail, &kLargeImageKey);
+    }
 }
 
 #pragma mark - Windows
