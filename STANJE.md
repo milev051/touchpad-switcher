@@ -2,7 +2,9 @@
 
 - 2026-10-12: README.md prepisan od nule prema stvarnom kodu: kružni meni sa
   tri prsta kao glavna aplikacija, podešavanja, instalacija, zahtevi i dozvole.
-  Stari prototip sa zonama na ivici trackpada opisan je samo kao napušten. Kod nije menjan.
+  Stari prototip sa zonama na ivici trackpada opisan je samo kao napušten.
+- 2026-10-12: sve izmene (ring_settings, ring_window_events, ring_shared, README
+  sa engleskim uvodom) commitovane kao 92bdaf0, main spojen fast-forward, obe grane na origin.
 - 2026-10-11: thumbnailovi na uspravnom (1x) monitoru čuvaju proporcije prozora
   (`configureThumbnailSize`, `scalesToFit`). Promena veličine prozora pravi nov
   snimak 0,7 s posle poslednje promene (`recaptureResizedWindow`).
